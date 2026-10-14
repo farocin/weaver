@@ -53,11 +53,14 @@ used 14–18% of one core in those trials.
 
 ## Where the memory goes
 
-Process topology, not the renderer, explains most of it. Within GPUI alone,
-three windows cost 18.2 MiB in one process and 43.5 MiB (198 threads) as three
-processes. Weaver's per-Widget process is a steady 11.4 MiB private working set
-and 50.6 MiB private bytes in every trial above. GPUI went from 14.4 MiB at
-one window to 28.5 MiB at ten, about 1.6 MiB per added window.
+Within GPUI, process topology explains most of it: three windows cost
+18.2 MiB in one process and 43.5 MiB (198 threads) as three processes, and
+GPUI went from 14.4 MiB at one window to 28.5 MiB at ten, about 1.6 MiB per
+added window. Weaver's per-Widget process is a steady 11.4 MiB private
+working set and 50.6 MiB private bytes in every trial above, but on Weaver's
+side topology is the smaller part: run as threads of one process, ten Widgets
+still hold 121–124 MiB. Most of a Widget's cost is state it touches at
+startup; see [`spikes/native-one-process`](../native-one-process/README.md).
 
 Those GPUI scaling runs (1, 3 and 10 windows; three single-window processes)
 were taken earlier the same day with the original sampling order, which read

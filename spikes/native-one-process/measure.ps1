@@ -38,6 +38,14 @@ function Start-Hidden([string]$File, [string]$Arguments) {
   $info.CreateNoWindow = $true
   [Diagnostics.Process]::Start($info)
 }
+function Get-Presents {
+  $counts = @{}
+  Get-ChildItem -LiteralPath (Join-Path $scratch 'weaver\logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+    $line = (Select-String -LiteralPath $_.FullName -Pattern 'widget present' | Select-Object -Last 1).Line
+    if ($line -match '(\d+) rendered frames in (\d+) ms') { $counts[$_.BaseName] = @{ frames = [double]$Matches[1]; ms = [double]$Matches[2] } }
+  }
+  $counts
+}
 $saved = @{ LOCALAPPDATA = $env:LOCALAPPDATA; WEAVER_RENDERER_PIPE = $env:WEAVER_RENDERER_PIPE; WEAVER_RENDERER_LOG = $env:WEAVER_RENDERER_LOG }
 try {
   New-Item -ItemType Directory $scratch | Out-Null
@@ -65,6 +73,8 @@ try {
     foreach ($dist in $dists) { $procs += Start-Hidden $widgetExe $dist }
   }
   Start-Sleep -Seconds $Warmup
+  $before = Get-Presents
+  if ($before.Count -ne $Widgets) { throw "expected $Widgets Widgets presenting after warm-up, found $($before.Count)" }
   for ($t = 1; $t -le $Trials; $t++) {
     $live = @($procs | Where-Object { -not $_.HasExited })
     if ($live.Count -ne $procs.Count) { throw "$($procs.Count - $live.Count) started process(es) exited early" }
@@ -130,11 +140,17 @@ public static class SpikeWindows {
   if ($Regions) {
     foreach ($pr in ($procs | Select-Object -First 2)) { "--- regions $($pr.ProcessName) $($pr.Id)"; & (Join-Path $PSScriptRoot 'regions.ps1') -ProcessId $pr.Id -Top 12 -Runs }
   }
-  # Per-Widget frame rate: each Widget logs its rendered presents every 300.
-  Get-ChildItem -LiteralPath (Join-Path $scratch 'weaver\logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
-    $line = (Select-String -LiteralPath $_.FullName -Pattern 'widget present' | Select-Object -Last 1).Line
-    if ($line -match '(\d+) rendered frames in (\d+) ms') { '{0}: {1:N1} fps' -f $_.BaseName, (1000 * [double]$Matches[1] / [double]$Matches[2]) }
-    else { "$($_.BaseName): no present line" }
+  # Per-Widget frame rate over the sampled trials, from the counter each
+  # Widget logs every 300 presents (frames and milliseconds since its first
+  # frame). Every requested Widget must have advanced, so a Widget thread
+  # that died inside a shared process cannot shrink the sample unnoticed.
+  $after = Get-Presents
+  foreach ($name in $before.Keys) {
+    $b = $before[$name]; $a = $after[$name]
+    if (-not $a -or $a.frames -le $b.frames) { throw "$name made no frame progress during sampling" }
+    '{0}: {1:N1} fps over sampling, {2:N1} fps since first frame' -f $name, (1000 * ($a.frames - $b.frames) / ($a.ms - $b.ms)), (1000 * $a.frames / $a.ms)
+  }
+  Get-ChildItem -LiteralPath (Join-Path $scratch 'weaver\logs') -Filter '*.log' | ForEach-Object {
     (Select-String -LiteralPath $_.FullName -Pattern 'memory receipt|spike layout').Line
   }
 } finally {

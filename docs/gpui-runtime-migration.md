@@ -6,10 +6,10 @@ Receipts so far: [`spikes/gpui-host`](../spikes/gpui-host/README.md).
 ## Why
 
 Ten animated Widgets hold 130 MiB private working set on today's stack and
-28 MiB as windows of one GPUI process. On Weaver's side the difference is not
-the process model: each Widget costs about 10.5 MiB whether it is a process
-or a thread of a shared one, mostly state touched at startup
-([`spikes/native-one-process`](../spikes/native-one-process/README.md)). Widget source, the SDK ([`sdk/CONTRACT.md`](../sdk/CONTRACT.md))
+28 MiB as windows of one GPUI process. On Weaver's side the process model is
+a small part of the difference: a Widget costs 11.7–12.1 MiB as a process
+and 10.5–10.8 MiB as a thread of a shared one, mostly state touched at
+startup ([`spikes/native-one-process`](../spikes/native-one-process/README.md)). Widget source, the SDK ([`sdk/CONTRACT.md`](../sdk/CONTRACT.md))
 and `.weave` files stay exactly as they are. Developers and their agents
 should not be able to tell anything changed except the bill.
 
@@ -34,7 +34,8 @@ down the shared runtime, a user's Widget may not.
 1. **GPUI or a consolidated Native?** Measured
    ([`spikes/native-one-process`](../spikes/native-one-process/README.md)):
    ten Widgets in one Native process hold 121–124 MiB against 133–138 MiB as
-   ten processes, so consolidation alone does not close the gap. What is
+   ten processes, about 10% less, so consolidation alone does not close
+   the gap. What is
    still open is how far Native's per-Widget state can shrink with
    process-per-Widget kept: building the Model without copying its default
    image already brings ten Widgets to 93–95 MiB; the large stack frames and

@@ -4,9 +4,10 @@ Question 1 behind [ADR 0019](../../docs/adr/0019-one-gpui-runtime-process.md):
 does running every Widget inside one Native process close the memory gap to
 GPUI, without moving to GPUI?
 
-Answer: no. On Native, a Widget costs about the same whether it has its own
-process or is a thread of a shared one. The cost is state each Widget touches
-at startup, and part of it can be cut without changing the process model.
+Answer: no. Consolidation saves about 10%: with the renderer subtracted, a
+Widget costs 11.7–12.1 MiB as its own process and 10.5–10.8 MiB as a thread
+of a shared one. Most of that is state each Widget touches at startup, and
+part of it can be cut without changing the process model.
 
 ## Machine and builds
 
@@ -56,16 +57,21 @@ Two rounds of two trials each, configurations interleaved. Raw output:
 |---|---|---:|---:|---:|---:|
 | 10 processes (today) | `create` | 133.4–137.7 MiB | 575–579 MiB | 118–131 | 46–53% |
 | 1 process, 10 threads | `create` | 121.4–124.3 MiB | 555–559 MiB | 87–88 | 43–53% |
-| 10 processes | lazy | 93.4–95.2 MiB | 576–579 MiB | 118–132 | 48–51% |
+| 10 processes | lazy | 93.4–95.2 MiB | 576–579 MiB | 118–132 | 48–52% |
 | 1 process, 10 threads | lazy | 77.3–83.3 MiB | 554–558 MiB | 87–88 | 46–56% |
 
 For comparison, one GPUI process with ten windows held 28 MiB at 16–39% CPU
 on the same machine.
 
-Every Widget presented at 60 fps except the one in tile 6 (x=960, y=320),
-which reported 115–400 presents per second in every configuration; that is
-unexplained and not specific to this spike. CPU ranges overlap across all
-four rows.
+Frame rates in the matrix are each Widget's cumulative counter since its
+first frame, read once per run. Every Widget reported about 59–60 fps
+except the one in tile 6 (x=960, y=320), which reported 115–400 presents per
+second in every configuration. That over-presenting predates this spike; a
+likely cause, unconfirmed, is a Native frame timer that can be armed twice.
+Runs that include it are not equal-work CPU comparisons, and CPU ranges
+overlap across all four rows. `measure.ps1` now also reports each Widget's
+rate over the sampled trials and fails if any requested Widget stops
+presenting.
 
 Window-only captures (Windows Graphics Capture of each Widget's HWND) show the
 lazy-setup Widgets in one process drawing the same scene as today's
@@ -77,7 +83,10 @@ processes. The card background is missing in both, as it was in the
 One Widget process, today's build, after warm-up: 11.4 MiB private working
 set, of which 10.3 MiB is private allocations and 1.05 MiB is copy-on-write
 image pages. [`regions.ps1`](regions.ps1) groups resident pages by allocation;
-the field layout comes from `WEAVER_MEMORY_RECEIPT=1`.
+the field layout comes from `WEAVER_MEMORY_RECEIPT=1`. Raw output, with the
+executable's hash: [`regions-create.txt`](regions-create.txt) and
+[`regions-lazy.txt`](regions-lazy.txt). Per-allocation resident totals are
+exact page counts; the printed resident spans merge gaps under 16 KiB.
 
 | Allocation | Committed | Resident |
 |---|---:|---:|
@@ -95,14 +104,18 @@ the field layout comes from `WEAVER_MEMORY_RECEIPT=1`.
   copies a full default image of the 4.3 MB Model. Building the Model field by
   field leaves those arrays untouched: one Widget drops to 7.1 MiB private
   working set and `WidgetApp` to 1.0 MiB resident.
-- **Stack.** [`frames.ps1`](frames.ps1) lists functions whose frames exceed
-  64 KiB. The Windows stack probe touches every page of such a frame on
-  entry. Native's `rebuild` (1071 KiB), `refreshCanvasWidgetDisplayList`
-  (1090 KiB) and `runWithOptions` (666 KiB), and Weaver's `main` (281 KiB),
-  are fixed-capacity scratch arrays on the stack. Moving the display-list
-  scratch into `Runtime` shrank that frame but left resident stack at
-  2.4 MiB, so the deepest chain runs through other large frames; finding and
-  moving all of them is a Native refactor, not done here.
+- **Stack.** 2.4–2.5 MiB of the main thread's stack is resident. The
+  likely source, not yet confirmed, is large fixed-capacity scratch arrays
+  in stack frames: the Windows stack probe touches every page of a frame
+  over one page on entry. [`frames.ps1`](frames.ps1) lists candidates by
+  scanning the executable for that probe sequence
+  ([`frames.txt`](frames.txt)): Native's `rebuild` (1071 KiB),
+  `refreshCanvasWidgetDisplayList` (1090 KiB) and `runWithOptions`
+  (666 KiB), among others. It shows frame sizes, not which frames actually
+  ran. Moving the display-list scratch into `Runtime` shrank that frame but
+  left resident stack at 2.4 MiB (that experiment is not in the patches), so
+  the deepest chain runs through other frames. Tracing it and moving the
+  scratch off the stack is a Native change, not done here.
 - **Private bytes** are dominated by Native's 28.8 MiB `Runtime` struct,
   committed in full by `page_allocator.create` and almost entirely untouched.
   That is commit charge, not RAM in use.
