@@ -12,13 +12,16 @@
 // clock: 220x90 card, text changes once per second (weaver clock analogue).
 // viz:   480x320 card, title text + 32 flex-div bars relaid out every frame.
 // canvas: port of weaver examples/m4b-synthetic (card + 2 texts + 28 bars
-//         drawn with paint_quad), the apples-to-apples m4b comparison.
+//         drawn with paint_quad). The bar math runs in Rust here, in JS in Weaver.
 //
 // Frame counts are render() calls per window, printed every 5 s to stdout as
 // the total plus the slowest and fastest window.
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,8 +31,12 @@ use gpui::{
 };
 use gpui_platform::application;
 
-const MAX_WINDOWS: usize = 64;
-static FRAMES: [AtomicU64; MAX_WINDOWS] = [const { AtomicU64::new(0) }; MAX_WINDOWS];
+// One render counter per window, sized from --windows at startup.
+static FRAMES: OnceLock<Vec<AtomicU64>> = OnceLock::new();
+
+fn frames() -> &'static [AtomicU64] {
+    FRAMES.get().expect("frame counters are created before any window")
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -80,7 +87,7 @@ fn clock_text() -> String {
 
 impl Render for Widget {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        FRAMES[self.index].fetch_add(1, Ordering::Relaxed);
+        frames()[self.index].fetch_add(1, Ordering::Relaxed);
         let card = div()
             .size_full()
             .flex()
@@ -207,9 +214,11 @@ fn main() {
         Mode::Viz | Mode::Canvas => (480.0, 320.0),
     };
 
+    FRAMES
+        .set((0..windows).map(|_| AtomicU64::new(0)).collect())
+        .expect("frame counters are created once");
     application().run(move |cx: &mut App| {
         // Gapless tiling on a 1920x1080 primary so every window is fully visible.
-        assert!(windows as usize <= MAX_WINDOWS, "--windows {windows} exceeds MAX_WINDOWS={MAX_WINDOWS}");
         let cols = (1920.0 / w) as u32;
         for i in 0..windows {
             let slot = first_slot + i;
@@ -246,7 +255,7 @@ fn main() {
 
         cx.spawn(async move |cx| {
             let n = windows as usize;
-            let read = || (0..n).map(|i| FRAMES[i].load(Ordering::Relaxed)).collect::<Vec<_>>();
+            let read = || frames().iter().map(|f| f.load(Ordering::Relaxed)).collect::<Vec<_>>();
             let mut last = read();
             let mut at = Instant::now();
             loop {

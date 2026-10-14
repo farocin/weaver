@@ -48,8 +48,8 @@ are renderer plus Widgets; `weaverd` (0.3–0.5%, 1.8 MiB) is excluded.
 Memory is the robust result: 28 MiB against 130 MiB private working set, and
 120 MiB against 572 MiB private bytes, with no overlap between any trials. CPU
 is lower for GPUI on the median (normal 16.7% vs 36.0%, desktop 31.3% vs
-37.4%), but the desktop-layer ranges overlap. Weaver's renderer alone is
-14–18% of that total.
+37.4%), but the desktop-layer ranges overlap. Weaver's renderer process alone
+used 14–18% of one core in those trials.
 
 ## Where the memory goes
 

@@ -44,11 +44,13 @@ closes.
    delay another Widget's frames, and a Widget emitting huge batches must hit
    a named limit with a fix-it message rather than stall the UI thread.
    Report per-window frame intervals, not averages.
-4. **Crash attribution and quarantine.** The interrupt handler cannot stop a
-   Widget blocked inside a host call, and the memory limit does not cover
-   native allocations made for it. Show that a Widget which repeatedly
-   crashes the runtime is identified and kept from loading, so it cannot take
-   every other Widget down in a loop.
+4. **Crash attribution, quarantine and stuck Widgets.** The interrupt handler
+   cannot stop a Widget blocked inside a host call, and the memory limit does
+   not cover native allocations made for it. Show that a Widget which
+   repeatedly crashes the runtime is identified and kept from loading, so it
+   cannot take every other Widget down in a loop, and that a Widget whose
+   thread is stuck in native code can be removed or reloaded while the others
+   keep running.
 5. **Identity for Providers and capabilities.** Today `weaverd` authenticates
    Provider pipes by process ID and authorizes media control per Widget slot.
    Design and test per-Widget identity on every call from one process.
@@ -87,14 +89,15 @@ until phase 6.
    loads Widget bundles, runs QuickJS per Widget, applies batches to retained
    trees, and renders them as GPUI elements. Canvas maps to GPUI `canvas`
    with the existing command buffer. Gate: `examples/clock` and
-   `examples/m4b-synthetic` within the m4b parity bound (mean channel error
-   no worse than today's 0.71/255 between backends), idle-zero holds, and ten
-   synthetic Widgets stay within 10% of the spike's private working set.
+   `examples/m4b-synthetic` pass the parity check below, idle-zero holds, and
+   ten synthetic Widgets stay within a memory budget set from the phase 1
+   threading prototype's receipt (the Rust-only spike is a floor, not a
+   budget).
 3. **Element and styling parity.** Text, images, icons, shadows, gradients,
    interaction, drag and geometry (ADR 0016), per-monitor DPI. GPUI has linear
    gradients with Oklab interpolation; radial, conic, repeating and mesh
    gradients go into our GPUI fork's shaders. Gate: every `examples/styling-*`
-   and `examples/m4b-parity` within the same parity bound.
+   and `examples/m4b-parity` pass the parity check below.
 4. **Providers, capabilities, billing.** Provider frames arrive in process
    with per-Widget identity. The capability wall binds per QuickJS runtime.
    `weaver status` shows per-Widget rows plus a runtime row. Gate: the
@@ -106,6 +109,15 @@ until phase 6.
    the [skin parity targets](skin-parity-targets.md) on both OSes, then delete
    the Native runtime and renderer paths and mark ADRs 0007, 0008, 0010 and
    0018 superseded.
+
+## Parity check
+
+Native and GPUI captures of the same Widget, same frame and same capture
+conditions, inspected side by side by a person, plus a per-scene numeric
+bound measured in phase 1. The m4b receipt (0.71/255 mean channel error,
+confined to bar edges, in [`m4b-results.md`](m4b-results.md)) is a reference
+point for one static scene, not a tolerance for every Widget: GPUI renders
+text differently from Native, and that difference must be judged by eye.
 
 ## Fork policy
 

@@ -44,9 +44,11 @@ provides". Both halves are real costs here.
   Widget, as today. A native fault in our Rust code, GPUI, QuickJS, or the
   graphics driver now stops every Widget. `weaverd` restarts the runtime, and
   every Widget loses its in-memory state (`useState`, timers, open requests);
-  only `useStorage` values survive, minus writes still inside its 200 ms
-  debounce. ADRs 0010 and 0018 accepted a shorter outage: a renderer crash
-  blanked pixels while Widget logic and state kept running. **This decision
+  only `useStorage` values survive, minus any writes its debounce had not
+  yet flushed (it flushes 200 ms after the last write, so a Widget writing
+  continuously can lose more). ADRs 0010 and 0018 accepted a shorter
+  outage: a renderer crash blanked pixels while Widget logic and state kept
+  running. **This decision
   asks for acceptance of the larger trade.** A Widget that repeatedly
   triggers a native fault must also be identified and quarantined, as the
   supervisor does for a crashing process today.
