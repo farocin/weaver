@@ -24,7 +24,8 @@ are spike code, not product code:
   16 MiB stack reservation committed on demand (the main thread's own
   arrangement), and runs the ordinary Widget entry point on it: its own
   Native host, window, message loop, QuickJS runtime and renderer connection.
-- Process-global runtime state becomes per-thread. The canvas command scratch
+- Process-global runtime state becomes per-thread, including the log path
+  and log-failure flags. The canvas command scratch
   becomes a per-thread heap buffer, so 256 KiB is not copied into every
   thread's TLS. Cross-thread wakes (dev reload, Providers) are not carried
   over; the scene uses neither.
@@ -33,6 +34,9 @@ are spike code, not product code:
 - `WEAVER_SPIKE_LAZY_MODEL=1` builds the Model field by field instead of
   `WidgetApp.create`'s `self.model = .{}` (see below).
 - `WEAVER_MEMORY_RECEIPT=1` also logs the field layout of the large structs.
+
+The log-failure flags were made per-thread after the receipts here were
+taken; no log write failed in those runs.
 
 ## Scene and method
 
@@ -81,8 +85,8 @@ processes. The card background is missing in both, as it was in the
 ## Where a Widget's memory goes
 
 One Widget process, today's build, after warm-up: 11.2 MiB private working
-set in the committed receipt (11.4 MiB in the matrix and in
-`spikes/gpui-host`), of which 10.1 MiB is private allocations and 1.05 MiB is
+set in the committed receipt (11.2–12.6 MiB per Widget process in the
+matrix, 11.4 MiB in `spikes/gpui-host`), of which 10.1 MiB is private allocations and 1.05 MiB is
 copy-on-write image pages. [`regions.ps1`](regions.ps1) groups resident pages by allocation;
 the field layout comes from `WEAVER_MEMORY_RECEIPT=1`. Raw output, with the
 executable's hash: [`regions-create.txt`](regions-create.txt) and

@@ -186,10 +186,10 @@ index 132a001..fb2f599 100644
              std.log.info(
                  "widget memory receipt model_bytes={d} widget_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
 diff --git a/runtime/src/widget_log.zig b/runtime/src/widget_log.zig
-index 8fc8016..1f1171e 100644
+index 8fc8016..ff625ab 100644
 --- a/runtime/src/widget_log.zig
 +++ b/runtime/src/widget_log.zig
-@@ -6,9 +6,9 @@ const platform = @import("platform/root.zig");
+@@ -6,12 +6,12 @@ const platform = @import("platform/root.zig");
  // 128 maximum-size diagnostics; current + rotated files cost at most 2 MiB on
  // disk, while resident memory holds only the line being written.
  const rotate_bytes: u64 = 1024 * 1024;
@@ -200,5 +200,10 @@ index 8fc8016..1f1171e 100644
 +threadlocal var log_path: []u8 = &.{};
 +threadlocal var old_log_path: []u8 = &.{};
  var mutex: std.atomic.Mutex = .unlocked;
- var write_failed = std.atomic.Value(bool).init(false);
- var fallback_reported = std.atomic.Value(bool).init(false);
+-var write_failed = std.atomic.Value(bool).init(false);
+-var fallback_reported = std.atomic.Value(bool).init(false);
++threadlocal var write_failed = std.atomic.Value(bool).init(false);
++threadlocal var fallback_reported = std.atomic.Value(bool).init(false);
+ 
+ pub fn init(runtime_io: std.Io, path: []const u8) !void {
+     const allocator = std.heap.page_allocator;

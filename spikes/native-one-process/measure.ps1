@@ -17,6 +17,9 @@ param(
 # deletes everything it made in finally. Run from a checkout whose runtime
 # and renderer are built with -Doptimize=ReleaseFast.
 $ErrorActionPreference = 'Stop'
+# Each Widget logs a frame checkpoint every 300 presents, about 5 s at 60 fps;
+# the warm-up and every trial must span at least two of them.
+if ($Warmup -lt 10 -or $Window -lt 10) { throw "-Warmup and -Window must each be at least 10 seconds" }
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $run = "native-1p-$PID"
 $scratch = Join-Path $PSScriptRoot ".scratch-$run"
