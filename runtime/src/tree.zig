@@ -353,7 +353,7 @@ pub const Tree = struct {
         const allocator = self.allocator;
         self.transaction_snapshot = null;
         self.deinitNodes();
-        self.* = snapshot.*;
+        self.copyOccupiedFrom(snapshot);
         self.transaction_snapshot = null;
         self.snapshot_storage = snapshot;
         rebaseInternalSlices(snapshot, self);
@@ -363,9 +363,24 @@ pub const Tree = struct {
     pub fn moveFrom(self: *Tree, source: *Tree) void {
         self.deinit();
         const source_allocator = source.allocator;
-        self.* = source.*;
+        self.copyOccupiedFrom(source);
         rebaseInternalSlices(source, self);
         resetEmpty(source, source_allocator);
+    }
+
+    /// `self.* = source.*` would write all 4.3 MB of the node and canvas
+    /// arenas; copying only occupied slots keeps the unused ones a lazy
+    /// reservation. Heap slices move with their nodes, and canvas slices
+    /// still point into `source` until the caller rebases them.
+    fn copyOccupiedFrom(self: *Tree, source: *const Tree) void {
+        inline for (std.meta.fields(Tree)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "nodes") or std.mem.eql(u8, field.name, "canvases")) continue;
+            @field(self, field.name) = @field(source, field.name);
+        }
+        var nodes = source.occupied.iterator(.{});
+        while (nodes.next()) |index| self.nodes[index] = source.nodes[index];
+        var canvases = source.canvas_occupied.iterator(.{});
+        while (canvases.next()) |index| self.canvases[index] = source.canvases[index];
     }
 
     pub fn nodeCount(self: *const Tree) usize {
@@ -1231,6 +1246,39 @@ fn validUtf8Prefix(value: []const u8, maximum: usize) usize {
     var length = maximum;
     while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) : (length -= 1) {}
     return length;
+}
+
+test "empty, moved and rolled-back trees leave unused arena slots unwritten" {
+    const sentinel: u8 = 0xA5;
+    const allocator = std.heap.page_allocator;
+    const tree = try allocator.create(Tree);
+    defer allocator.destroy(tree);
+    @memset(std.mem.asBytes(&tree.nodes), sentinel);
+    @memset(std.mem.asBytes(&tree.canvases), sentinel);
+    resetEmpty(tree, allocator);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&tree.nodes), sentinel));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&tree.canvases), sentinel));
+
+    // Rollback restores the one committed node and writes no other slot
+    // except the one the aborted batch itself used.
+    _ = try tree.createNode(.button);
+    try tree.beginBatch();
+    _ = try tree.createNode(.button);
+    tree.abortBatch();
+    try std.testing.expectEqual(@as(usize, 1), tree.nodeCount());
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.sliceAsBytes(tree.nodes[2..]), sentinel));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&tree.canvases), sentinel));
+
+    const moved = try allocator.create(Tree);
+    defer allocator.destroy(moved);
+    @memset(std.mem.asBytes(&moved.nodes), sentinel);
+    @memset(std.mem.asBytes(&moved.canvases), sentinel);
+    resetEmpty(moved, allocator);
+    moved.moveFrom(tree);
+    defer moved.deinit();
+    try std.testing.expectEqual(@as(usize, 1), moved.nodeCount());
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.sliceAsBytes(moved.nodes[1..]), sentinel));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&moved.canvases), sentinel));
 }
 
 test "resetEmpty matches the default tree outside the arenas" {

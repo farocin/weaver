@@ -400,7 +400,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
     // update callback's stack frame, where it would consume most of
     // QuickJS's recorded C-stack allowance.
     const candidate_tree = try std.heap.page_allocator.create(tree_mod.Tree);
-    candidate_tree.* = .{};
+    tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
     var candidate_tree_moved = false;
     defer {
         if (!candidate_tree_moved) candidate_tree.deinit();
@@ -411,7 +411,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
         error.HotSwapMismatch => block: {
             preserved = false;
             candidate_tree.deinit();
-            candidate_tree.* = .{};
+            tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
             break :block try evaluateCandidate(model, candidate_tree, source, null);
         },
         else => return err,
