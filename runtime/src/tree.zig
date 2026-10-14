@@ -1192,7 +1192,11 @@ fn resetCanvas(canvas: *CanvasState) void {
     canvas.fingerprint = 0;
 }
 
-fn resetEmpty(tree: *Tree, allocator: std.mem.Allocator) void {
+/// Make `tree` an empty tree without writing the node or canvas arenas, so a
+/// freshly allocated tree stays a lazy reservation. Assigning `.{}` instead
+/// copies the type's whole default image (4.3 MB) and makes every page
+/// resident.
+pub fn resetEmpty(tree: *Tree, allocator: std.mem.Allocator) void {
     tree.allocator = allocator;
     tree.occupied = std.StaticBitSet(max_nodes).initEmpty();
     tree.canvas_occupied = std.StaticBitSet(max_canvases).initEmpty();
@@ -1227,6 +1231,16 @@ fn validUtf8Prefix(value: []const u8, maximum: usize) usize {
     var length = maximum;
     while (length > 0 and !std.unicode.utf8ValidateSlice(value[0..length])) : (length -= 1) {}
     return length;
+}
+
+test "resetEmpty matches the default tree outside the arenas" {
+    const expected: Tree = .{};
+    var actual: Tree = undefined;
+    resetEmpty(&actual, expected.allocator);
+    inline for (std.meta.fields(Tree)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "nodes") or std.mem.eql(u8, field.name, "canvases")) continue;
+        try std.testing.expectEqualDeep(@field(expected, field.name), @field(actual, field.name));
+    }
 }
 
 test "node lifetime changes when a removed image id is reused" {

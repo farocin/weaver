@@ -1,0 +1,1 @@
+fix: **Smaller Widget memory**: each Widget process now holds about 7.3 MiB of private working set instead of 11.4 MiB. The runtime no longer copies a 4.3 MB default image of its retained tree into every Widget at startup, so the tree's unused node and canvas capacity stays untouched until a Widget uses it.
