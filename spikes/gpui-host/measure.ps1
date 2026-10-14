@@ -3,7 +3,8 @@ param(
   [int]$Windows = 1,
   [int]$Processes = 1,
   [int]$Warmup = 10,
-  [int]$Window = 15
+  [int]$Window = 15,
+  [string[]]$Extra = @()
 )
 # Same counters as docs/m4a-results.md: private WS from
 # Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate, private bytes from
@@ -12,20 +13,23 @@ $exe = Join-Path $PSScriptRoot 'target\release\gpui-spike.exe'
 $procs = @()
 for ($p = 0; $p -lt $Processes; $p++) {
   $log = Join-Path $PSScriptRoot "run-$Mode-$Windows-$p.log"
-  $procs += Start-Process -FilePath $exe -ArgumentList '--mode', $Mode, '--windows', $Windows, '--slot', ($p * $Windows) `
-    -RedirectStandardOutput $log -PassThru
+  Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+  $spikeArgs = @('--mode', $Mode, '--windows', $Windows, '--slot', ($p * $Windows)) + $Extra
+  $procs += Start-Process -FilePath $exe -ArgumentList $spikeArgs -RedirectStandardOutput $log -PassThru
 }
 Start-Sleep -Seconds $Warmup
 $t0 = @{}; foreach ($pr in $procs) { $pr.Refresh(); $t0[$pr.Id] = $pr.TotalProcessorTime.TotalMilliseconds }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 Start-Sleep -Seconds $Window
+# Read every CPU endpoint and the clock together before any slow counter query,
+# so CIM latency is neither billed to the processes nor left out of the window.
+$t1 = @{}; foreach ($pr in $procs) { $pr.Refresh(); $t1[$pr.Id] = $pr.TotalProcessorTime.TotalMilliseconds }
 $elapsed = $sw.Elapsed.TotalMilliseconds
 $rows = foreach ($pr in $procs) {
-  $pr.Refresh()
   $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess=$($pr.Id)"
   [pscustomobject]@{
     pid        = $pr.Id
-    cpu_pct    = [math]::Round(100 * ($pr.TotalProcessorTime.TotalMilliseconds - $t0[$pr.Id]) / $elapsed, 2)
+    cpu_pct    = [math]::Round(100 * ($t1[$pr.Id] - $t0[$pr.Id]) / $elapsed, 2)
     priv_ws_mb = [math]::Round($perf.WorkingSetPrivate / 1MB, 2)
     priv_mb    = [math]::Round($pr.PrivateMemorySize64 / 1MB, 2)
     threads    = $pr.Threads.Count

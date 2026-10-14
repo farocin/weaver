@@ -6,89 +6,103 @@ what do Weaver-shaped Widgets cost as windows of one
 compared with today's stack (one `weaver-widget` process per Widget plus the
 shared `weaver-renderer`)?
 
-Measured 2026-10-14 on Windows 11 (10.0.26200), 1920x1080 primary, GPUI pinned
-to Zed `2dcc4cc0`, release build. Weaver baseline is `origin/master` at
-`e583ec8`, ReleaseFast.
+## Machine and builds
+
+Measured 2026-10-14. Windows 11 10.0.26200, AMD Ryzen 7 5800X (16 logical
+cores), NVIDIA GeForce RTX 4070 (driver 32.0.16.1088), one 1920x1080 display
+at 143 Hz and 96 DPI. Ordinary desktop load in the background (browsers,
+Spotify, Rainmeter, sync clients), which is why every CPU figure is a range.
+
+- GPUI: Zed `2dcc4cc0`, `cargo build --release`, dependencies pinned by
+  [`Cargo.lock`](Cargo.lock).
+- Weaver: `origin/master` at `e583ec8`, runtime, host and renderer built with
+  `-Doptimize=ReleaseFast`.
 
 ## Scene
 
 `examples/m4b-synthetic`: a 480x320 card, two text labels, and 28 rounded bars
 redrawn at 60 fps. `--mode canvas` in [`src/main.rs`](src/main.rs) ports it to
-GPUI with the same bar math and draws the bars with `paint_quad`. Both stacks
-used normal-layer windows tiled so every window was fully visible, and both ran
-back to back in the same session.
+GPUI with the same bar math and draws the bars with `paint_quad`.
+[`weaver-baseline.ps1`](weaver-baseline.ps1) installs ten tiled copies of the
+real example into a scratch `LOCALAPPDATA`. Both stacks use the same gapless
+4x3 tiling of 480x320 windows. Runs alternated between stacks in one session.
 
 ## Counters
 
 Same as [`docs/m4a-results.md`](../../docs/m4a-results.md): private working
 set is `Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`, private
-bytes is `PrivateMemorySize64`, CPU is a 15-second `TotalProcessorTime` delta as
-a percent of one logical core. Weaver totals are renderer plus Widgets;
-`weaverd` (0.5–0.8%, 1.8 MiB) is excluded.
+bytes is `PrivateMemorySize64`, CPU is a 15-second `TotalProcessorTime` delta
+as a percent of one logical core. Every process's CPU endpoint is read
+together with the clock before any memory counter is queried. Weaver totals
+are renderer plus Widgets; `weaverd` (0.3–0.5%, 1.8 MiB) is excluded.
 
-## Results
+## Results: ten Widgets
 
-| Widgets | Stack | CPU | Private WS | Private bytes | Threads | FPS each |
-|---:|---|---:|---:|---:|---:|---:|
-| 10 | weaver `e583ec8` (2 trials) | 41.0–43.2% | 129.8–130.5 MiB | 572 MiB | 119–123 | 60 |
-| 10 | GPUI, one process (2 trials) | 22.0–28.2% | 28.2–28.3 MiB | 119–122 MiB | 69–71 | ~58 |
-| 10 | GPUI, one process, desktop layer, after Win+D | 30.2% | 28.2 MiB | 122 MiB | 69 | ~58 |
+| Stack | Layer | Trials | CPU | Private WS | Private bytes | Threads | FPS per window |
+|---|---|---:|---:|---:|---:|---:|---:|
+| weaver `e583ec8` | normal | 3 | 33.1–36.5% | 130.4 MiB | 572 MiB | 119–126 | 60 (presents) |
+| weaver `e583ec8` | desktop | 3 | 35.0–41.1% | 130.4 MiB | 572 MiB | 119–124 | 60 (presents) |
+| GPUI, one process | normal | 3 | 16.3–25.7% | 28.3–28.6 MiB | 120–122 MiB | 69–70 | 57.8–58.4 (renders) |
+| GPUI, one process | desktop | 5 | 20.6–38.8% | 28.2–28.6 MiB | 120–121 MiB | 69–70 | 57.4–58.4 (renders) |
 
-Earlier the same day, against weaver binaries built 2026-08-30 from
-`agent/gradient-exploration` (same counters):
+Memory is the robust result: 28 MiB against 130 MiB private working set, and
+120 MiB against 572 MiB private bytes, with no overlap between any trials. CPU
+is lower for GPUI on the median (normal 16.7% vs 36.0%, desktop 31.3% vs
+37.4%), but the desktop-layer ranges overlap. Weaver's renderer alone is
+14–18% of that total.
 
-| Widgets | Stack | CPU | Private WS | Private bytes | Threads |
-|---:|---|---:|---:|---:|---:|
-| 1 | GPUI | 3.8–5.9% | 14.4 MiB | 64 MiB | 66 |
-| 1 | weaver | 5.0% | 25.0 MiB | 108 MiB | 68 |
-| 3 | GPUI, one process | 10.9–17.3% | 18.2 MiB | 77 MiB | 68 |
-| 3 | weaver | 13.5% | 48.9 MiB | 211 MiB | 79 |
-| 10 | GPUI, one process | 23.6–29.9% | 28.5 MiB | 121 MiB | 70 |
-| 10 | weaver (2 trials) | 42.9–49.9% | 130–139 MiB | 571–580 MiB | 120–131 |
+## Where the memory goes
 
-Other runs:
+Process topology, not the renderer, explains most of it. Within GPUI alone,
+three windows cost 18.2 MiB in one process and 43.5 MiB (198 threads) as three
+processes. Weaver's per-Widget process is a steady 11.4 MiB private working set
+and 50.6 MiB private bytes in every trial above. GPUI went from 14.4 MiB at
+one window to 28.5 MiB at ten, about 1.6 MiB per added window.
 
-- One GPUI process per Widget does not pay: three processes with one window
-  each cost 43.5 MiB and 198 threads. A GPUI process costs ~14 MiB and ~66
-  threads before it draws; each extra window costs ~1.4 MiB.
+Those GPUI scaling runs (1, 3 and 10 windows; three single-window processes)
+were taken earlier the same day with the original sampling order, which read
+memory counters before the final CPU sample. Their memory figures are
+unaffected; their CPU figures are not reported here.
+
+## What differs between the two sides
+
+- GPUI computes the bars in Rust inside `render()` and rebuilds its element
+  tree every frame. Weaver runs the same math in a JS `onFrame` callback,
+  validates the command buffer, and keeps layout off canvas-only frames. A
+  real GPUI runtime would carry the JS work over.
+- GPUI frames are timer-driven `render()` calls counted per window; Weaver
+  frames are completed presents.
+- `--desktop` applies `WS_EX_NOACTIVATE`, `WS_EX_TOOLWINDOW` and
+  `HWND_BOTTOM`. Weaver's WorkerW lookup (`attachDesktopWindow` in the Native
+  fork's `webview2_host.cpp`) finds nothing on this Windows build, where the
+  wallpaper WorkerW is a child of Progman, so neither stack was parented to
+  the desktop. In an earlier run with the extended styles only, ten GPUI
+  Widgets stayed on the desktop through Win+D with no taskbar buttons:
+
+  ![GPUI Widgets on the desktop after Win+D](gpui-desktop-after-wind.png)
+
+## Other modes
+
 - `--mode viz` lays out 32 flex `div` bars with Taffy every frame instead of
-  painting quads: 10 windows cost 29.7–36.7% and 29.6 MiB, still below
-  today's stack.
-- `--mode clock` (220x90 card, text changes once a second): 14.1 MiB, 0.62%
-  CPU in its one clean sample. July's weaver clock receipt is 13.5 MiB, 0.31%.
-
-## Desktop layer
-
-`--desktop` applies Weaver's desktop-layer recipe
-(`attachDesktopWindow` in the Native fork's `webview2_host.cpp`) to GPUI's
-HWND from outside the crate, without forking GPUI: `WS_EX_NOACTIVATE`,
-`WS_EX_TOOLWINDOW`, a WorkerW parent, `HWND_BOTTOM`. Ten Widgets stayed on the
-desktop through Win+D with no taskbar buttons, at the cost in the table above.
-
-![GPUI Widgets on the desktop after Win+D](gpui-desktop-after-wind.png)
-
-On this Windows build the wallpaper WorkerW is a child of Progman, so the
-top-level enumeration Weaver uses finds nothing and no parent was attached. The
-Widgets survived Win+D anyway. Weaver's Native host uses the same lookup.
+  painting quads: 10 windows, 29.6 MiB.
+- `--mode clock` (220x90 card, text changes once a second): 14.1 MiB in one
+  process. This is not an idle-zero measurement; the spike also wakes every
+  five seconds to print counters.
 
 ## Not measured
 
-- macOS.
-- Click-through (`WS_EX_TRANSPARENT`).
-- JavaScript. QuickJS is already measured at +0.64 MiB and 16 ms cold start
-  (ADR 0008).
-- FPS is counted differently: GPUI counts `render()` calls (~58/s, timer
-  driven), Weaver counts presents (60/s).
+macOS, click-through, idle-zero, input, multiple monitors, sleep/resume,
+graphics device loss, and per-Widget billing in one process.
 
 ## Reproduce
 
 ```powershell
 cargo build --release
 .\measure.ps1 -Mode canvas -Windows 10
-# For running weaver widgets:
-.\measure-names.ps1
+.\measure.ps1 -Mode canvas -Windows 10 -Extra '--desktop'
+# From a ReleaseFast-built Weaver checkout containing this folder:
+.\weaver-baseline.ps1 -Widgets 10 -Trials 3 -Layer normal
 ```
 
-Pass `--desktop` to `gpui-spike.exe` for the desktop-layer run. Don't drive
-Win+D from a script without saving the window list first: a synthetic Win+D
-lost its toggle state and had to be undone window by window.
+Don't drive Win+D from a script without saving the window list first: a
+synthetic Win+D lost its toggle state and had to be undone window by window.

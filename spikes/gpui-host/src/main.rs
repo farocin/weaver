@@ -6,14 +6,16 @@
 //
 // --desktop applies weaver's desktop-layer recipe to GPUI's HWND from outside
 // (runtime/native-sdk webview2_host.cpp attachDesktopWindow): WS_EX_NOACTIVATE
-// + WS_EX_TOOLWINDOW, SetParent to the wallpaper WorkerW, HWND_BOTTOM.
+// + WS_EX_TOOLWINDOW, SetParent to the wallpaper WorkerW when the classic
+// top-level WorkerW exists, then HWND_BOTTOM. Windows only; a no-op elsewhere.
 //
 // clock: 220x90 card, text changes once per second (weaver clock analogue).
 // viz:   480x320 card, title text + 32 flex-div bars relaid out every frame.
 // canvas: port of weaver examples/m4b-synthetic (card + 2 texts + 28 bars
 //         drawn with paint_quad), the apples-to-apples m4b comparison.
 //
-// Frame counts are render() calls, printed every 5 s to stdout.
+// Frame counts are render() calls per window, printed every 5 s to stdout as
+// the total plus the slowest and fastest window.
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -26,7 +28,8 @@ use gpui::{
 };
 use gpui_platform::application;
 
-static FRAMES: AtomicU64 = AtomicU64::new(0);
+const MAX_WINDOWS: usize = 64;
+static FRAMES: [AtomicU64; MAX_WINDOWS] = [const { AtomicU64::new(0) }; MAX_WINDOWS];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -36,13 +39,14 @@ enum Mode {
 }
 
 struct Widget {
+    index: usize,
     mode: Mode,
     seed: f32,
     started: Instant,
 }
 
 impl Widget {
-    fn new(mode: Mode, seed: f32, fps: u32, cx: &mut Context<Self>) -> Self {
+    fn new(index: usize, mode: Mode, seed: f32, fps: u32, cx: &mut Context<Self>) -> Self {
         let tick = match mode {
             Mode::Clock => Duration::from_secs(1),
             Mode::Viz | Mode::Canvas => Duration::from_secs_f64(1.0 / fps as f64),
@@ -57,6 +61,7 @@ impl Widget {
         })
         .detach();
         Self {
+            index,
             mode,
             seed,
             started: Instant::now(),
@@ -75,7 +80,7 @@ fn clock_text() -> String {
 
 impl Render for Widget {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        FRAMES.fetch_add(1, Ordering::Relaxed);
+        FRAMES[self.index].fetch_add(1, Ordering::Relaxed);
         let card = div()
             .size_full()
             .flex()
@@ -204,6 +209,7 @@ fn main() {
 
     application().run(move |cx: &mut App| {
         // Gapless tiling on a 1920x1080 primary so every window is fully visible.
+        assert!(windows as usize <= MAX_WINDOWS, "--windows {windows} exceeds MAX_WINDOWS={MAX_WINDOWS}");
         let cols = (1920.0 / w) as u32;
         for i in 0..windows {
             let slot = first_slot + i;
@@ -228,26 +234,33 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
+                    #[cfg(windows)]
                     if desktop {
                         desktop_layer::attach(window);
                     }
-                    cx.new(|cx| Widget::new(mode, i as f32 * 1.7, fps, cx))
+                    cx.new(|cx| Widget::new(i as usize, mode, i as f32 * 1.7, fps, cx))
                 },
             )
             .unwrap();
         }
 
         cx.spawn(async move |cx| {
-            let mut last = FRAMES.load(Ordering::Relaxed);
+            let n = windows as usize;
+            let read = || (0..n).map(|i| FRAMES[i].load(Ordering::Relaxed)).collect::<Vec<_>>();
+            let mut last = read();
             let mut at = Instant::now();
             loop {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
-                let now = FRAMES.load(Ordering::Relaxed);
+                let now = read();
                 let dt = at.elapsed().as_secs_f64();
+                let rates: Vec<f64> = (0..n).map(|i| (now[i] - last[i]) as f64 / dt).collect();
+                let min = rates.iter().cloned().fold(f64::MAX, f64::min);
+                let max = rates.iter().cloned().fold(0.0, f64::max);
                 println!(
-                    "renders/s total={:.1} per_window={:.1}",
-                    (now - last) as f64 / dt,
-                    (now - last) as f64 / dt / windows as f64
+                    "renders/s total={:.1} per_window min={:.1} max={:.1}",
+                    rates.iter().sum::<f64>(),
+                    min,
+                    max
                 );
                 last = now;
                 at = Instant::now();
@@ -299,15 +312,17 @@ mod desktop_layer {
             }
             let mut worker: HWND = std::ptr::null_mut();
             EnumWindows(Some(find_worker), &mut worker as *mut HWND as LPARAM);
-            if worker.is_null() {
-                eprintln!("desktop_layer: no wallpaper WorkerW found");
-                return;
-            }
             let mut frame = RECT { left: 0, top: 0, right: 0, bottom: 0 };
             GetWindowRect(hwnd, &mut frame);
             let mut origin = POINT { x: frame.left, y: frame.top };
-            ScreenToClient(worker, &mut origin);
-            SetParent(hwnd, worker);
+            if worker.is_null() {
+                // Windows 11 26200 moved the wallpaper WorkerW under Progman;
+                // this spike does not parent there. Bottom z-order only.
+                eprintln!("desktop_layer: no top-level wallpaper WorkerW; HWND_BOTTOM only");
+            } else {
+                ScreenToClient(worker, &mut origin);
+                SetParent(hwnd, worker);
+            }
             SetWindowPos(hwnd, HWND_BOTTOM, origin.x, origin.y, 0, 0,
                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
