@@ -4,8 +4,7 @@ status: proposed
 
 # All Widgets run in one GPUI runtime process; isolation moves to the QuickJS runtime
 
-Weaver's memory per Widget is dominated by the OS process each Widget runs in.
-On Windows, ten 60 fps copies of `examples/m4b-synthetic` on today's stack
+Weaver pays about 11 MiB of private working set per Widget. On Windows, ten 60 fps copies of `examples/m4b-synthetic` on today's stack
 (one `weaver-widget` process per Widget plus the shared `weaver-renderer`)
 hold 130 MiB private working set and 572 MiB private bytes. A port of the same
 scene to ten windows of one GPUI
@@ -16,10 +15,17 @@ the desktop-layer ranges overlap, and the GPUI port runs the bar math in Rust
 where Weaver runs it in JS. Receipts:
 [`spikes/gpui-host`](../../spikes/gpui-host/README.md).
 
-The memory gap comes from process topology: every Weaver Widget process holds
-11.4 MiB private working set and 50.6 MiB private bytes, and within GPUI
-alone three windows cost 18 MiB in one process against 44 MiB as three
-processes.
+The gap is not the same thing on both sides. Within GPUI, process topology
+matters: three windows cost 18 MiB in one process against 44 MiB as three
+processes, and each added window costs about 1.6 MiB. Within Weaver it barely
+matters: ten Widgets as threads of one Native process hold 121–124 MiB
+against 133–138 MiB as ten processes
+([`spikes/native-one-process`](../../spikes/native-one-process/README.md)).
+A Weaver Widget costs about 10.5 MiB wherever it runs, mostly fixed-capacity
+state touched at startup: a full copy of the Model's default image, 4.3 MB
+including the retained tree's unused node and canvas arrays, and 2.5 MiB of
+stack from large scratch frames. Building the Model without that copy brings
+ten Widgets to 93–95 MiB as processes and 77–83 MiB in one process.
 
 Decision: Weaver runs every Widget inside one runtime process built on GPUI.
 That process owns every Widget window and the GPU device. Each Widget gets its
@@ -80,13 +86,15 @@ changing or removing one Widget must move that Widget's row by what it costs.
 - **One GPUI process per Widget.** Three single-window GPUI processes cost
   44 MiB and 198 threads, more threads than today's stack and only slightly
   less memory. The win requires one process.
-- **One process on the Native fork.** A real alternative. Native already keeps
-  a window map and a shared D3D renderer with one engine and many surfaces, so
-  this is consolidation work, not a new renderer. It is unmeasured. GPUI is
-  proposed because it already runs many windows from one process on D3D11
-  and Metal, with Taffy layout and platform text, maintained upstream; the
-  migration plan measures the Native consolidation before this ADR is
-  accepted.
+- **One process on the Native fork.** Measured: consolidation alone saves
+  about 10% (121–124 MiB against 133–138 MiB for ten Widgets), because the
+  cost is per Widget, not per process.
+- **Keep process-per-Widget and cut Native's per-Widget state.** Not yet a
+  full option. The Model fix above is measured (93–95 MiB for ten, crash
+  isolation kept); the stack frames and Native's default-initialized tables
+  are identified but not fixed. Even with every identified item at zero, a
+  Widget would still cost about 4 MiB against GPUI's 1.6 MiB per window,
+  and CPU has not been attributed on either side.
 
 ## Consequences
 
