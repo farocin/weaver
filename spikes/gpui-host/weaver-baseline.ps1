@@ -3,7 +3,10 @@ param([int]$Widgets = 10, [int]$Trials = 3, [int]$Warmup = 25, [string]$Layer = 
 # into a scratch LOCALAPPDATA so the real registry is never touched. Run from a
 # checkout whose runtime, host and renderer are built with ReleaseFast.
 # Everything it creates is named for this run and removed afterwards; it
-# refuses to start if any of those paths already exist.
+# refuses to start if any of those paths already exist, or if any weaverd is
+# running: the daemon is a per-user singleton (a fixed named mutex), so a
+# scratch LOCALAPPDATA would not isolate it and `weaver down` would stop the
+# user's own Widgets.
 $ErrorActionPreference = 'Stop'
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $run = "gpui-ab-$PID"
@@ -11,6 +14,9 @@ $scratch = Join-Path $PSScriptRoot ".scratch-$run"
 $cli = Join-Path $repo 'cli\bin\weaver.js'
 $source = Get-Content (Join-Path $repo 'examples\m4b-synthetic\widget.tsx') -Raw
 $dirs = 0..($Widgets - 1) | ForEach-Object { Join-Path $repo "examples\$run-$_" }
+if (Get-Process -Name weaverd -ErrorAction SilentlyContinue) {
+  throw 'refusing to run: weaverd is already running. Stop it with "weaver down" first.'
+}
 foreach ($path in @($scratch) + $dirs) {
   if (Test-Path -LiteralPath $path) { throw "refusing to run: $path already exists" }
 }
