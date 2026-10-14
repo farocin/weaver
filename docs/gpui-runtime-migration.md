@@ -26,9 +26,9 @@ should not be able to tell anything changed except the bill.
 
 ## Open questions that can still reject ADR 0019
 
-Each is settled by a receipt in `spikes/gpui-host`, not by argument. The
-crash trade in ADR 0019 also needs Dara's explicit acceptance before phase 1
-closes.
+Each is settled by a receipt in `spikes/gpui-host`, not by argument. Dara
+has ruled on the crash trade (recorded in ADR 0019): platform faults may take
+down the shared runtime, a user's Widget may not.
 
 1. **GPUI or a consolidated Native?** Native already has a window map and a
    shared D3D renderer with many surfaces. Measure ten Widgets in one Native
@@ -44,13 +44,16 @@ closes.
    delay another Widget's frames, and a Widget emitting huge batches must hit
    a named limit with a fix-it message rather than stall the UI thread.
    Report per-window frame intervals, not averages.
-4. **Crash attribution, quarantine and stuck Widgets.** The interrupt handler
-   cannot stop a Widget blocked inside a host call, and the memory limit does
-   not cover native allocations made for it. Show that a Widget which
-   repeatedly crashes the runtime is identified and kept from loading, so it
-   cannot take every other Widget down in a loop, and that a Widget whose
-   thread is stuck in native code can be removed or reloaded while the others
-   keep running.
+4. **A Widget cannot crash the runtime.** Fuzz every call a Widget can make
+   across the boundary (node and prop ops, canvas command buffers, batch
+   sizes, Provider and capability calls) with hostile input and show the
+   process survives, with each rejection reported as that Widget's error. The
+   memory limit does not cover native allocations made for a Widget, so those
+   need their own named limits. Backstop: when a crash happens anyway, show it
+   is attributed to the Widget whose call was in flight and that Widget is
+   quarantined on the first occurrence. Also show that a Widget whose thread is
+   stuck in native code (which the interrupt handler cannot stop) can be
+   removed or reloaded while the others keep running.
 5. **Identity for Providers and capabilities.** Today `weaverd` authenticates
    Provider pipes by process ID and authorizes media control per Widget slot.
    Design and test per-Widget identity on every call from one process.
@@ -83,8 +86,8 @@ Native stack stays.
 Each phase lands as its own PRs with receipts. Nothing switches the default
 until phase 6.
 
-1. **Answer the open questions.** Gate: each has a receipt, Dara has ruled on
-   the crash trade, and ADR 0019 is accepted or rejected.
+1. **Answer the open questions.** Gate: each has a receipt and ADR 0019 is
+   accepted or rejected.
 2. **Runtime skeleton.** A Rust GPUI runtime process supervised by `weaverd`
    loads Widget bundles, runs QuickJS per Widget, applies batches to retained
    trees, and renders them as GPUI elements. Canvas maps to GPUI `canvas`

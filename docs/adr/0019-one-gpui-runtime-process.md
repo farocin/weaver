@@ -48,10 +48,16 @@ provides". Both halves are real costs here.
   yet flushed (it flushes 200 ms after the last write, so a Widget writing
   continuously can lose more). ADRs 0010 and 0018 accepted a shorter
   outage: a renderer crash blanked pixels while Widget logic and state kept
-  running. **This decision
-  asks for acceptance of the larger trade.** A Widget that repeatedly
-  triggers a native fault must also be identified and quarantined, as the
-  supervisor does for a crashing process today.
+  running.
+
+  Dara's ruling (2026-10-14): the larger trade is acceptable when the fault is
+  the platform's, and not when a user's Widget causes it. So no Widget may be
+  able to crash the runtime. Everything a Widget can hand to native code
+  (props, canvas commands, batch sizes, Provider and capability calls) is
+  validated, and misuse becomes that Widget's own error. A Widget that still
+  triggers a native crash has exposed a platform bug: the runtime attributes
+  the crash to it and quarantines it on the first occurrence, so the other
+  Widgets come back without it.
 - **Capabilities.** QuickJS has no ambient authority: Weaver compiles it
   without `quickjs-libc`, so a Widget can only call host functions registered
   into its own runtime, and the capability wall (ADR 0002) stays at that
