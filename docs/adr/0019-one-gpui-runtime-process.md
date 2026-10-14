@@ -25,7 +25,7 @@ With the renderer subtracted, a Weaver Widget costs 11.7–12.1 MiB as a
 process and 10.5–10.8 MiB as a thread. Most of it is fixed-capacity state
 touched at startup: a full copy of the Model's default image, 4.3 MB
 including the retained tree's unused node and canvas arrays, and about
-2.5 MiB of resident stack, probably from large scratch frames. Building the
+2.4 MiB of resident stack, probably from large scratch frames. Building the
 Model without that copy brings ten Widgets to 93–95 MiB as processes and
 77–83 MiB in one process; [#87](https://github.com/unmde/weaver/pull/87)
 makes that change.

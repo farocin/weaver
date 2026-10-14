@@ -42,7 +42,9 @@ function Get-Presents {
   $counts = @{}
   Get-ChildItem -LiteralPath (Join-Path $scratch 'weaver\logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
     $line = (Select-String -LiteralPath $_.FullName -Pattern 'widget present' | Select-Object -Last 1).Line
-    if ($line -match '(\d+) rendered frames in (\d+) ms') { $counts[$_.BaseName] = @{ frames = [double]$Matches[1]; ms = [double]$Matches[2] } }
+    if ($line -match '^\[([^\]]+)\].* (\d+) rendered frames in (\d+) ms') {
+      $counts[$_.BaseName] = @{ at = [datetime]::Parse($Matches[1]).ToUniversalTime(); frames = [double]$Matches[2]; ms = [double]$Matches[3] }
+    }
   }
   $counts
 }
@@ -78,6 +80,7 @@ try {
   for ($t = 1; $t -le $Trials; $t++) {
     $live = @($procs | Where-Object { -not $_.HasExited })
     if ($live.Count -ne $procs.Count) { throw "$($procs.Count - $live.Count) started process(es) exited early" }
+    $p0 = Get-Presents
     $t0 = @{}; foreach ($pr in $procs) { $pr.Refresh(); $t0[$pr.Id] = $pr.TotalProcessorTime.TotalMilliseconds }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     Start-Sleep -Seconds $Window
@@ -85,6 +88,18 @@ try {
     # query, so CIM latency is neither billed to the processes nor left out.
     $t1 = @{}; foreach ($pr in $procs) { $pr.Refresh(); $t1[$pr.Id] = $pr.TotalProcessorTime.TotalMilliseconds }
     $elapsed = $sw.Elapsed.TotalMilliseconds
+    # Every requested Widget must have presented during this trial and still
+    # be presenting at its end: a checkpoint is logged every 300 presents
+    # (5 s at 60 fps), so the newest one must be under 10 s old. A Widget
+    # thread that stops inside a shared process cannot shrink the sample.
+    $p1 = Get-Presents
+    $now = [datetime]::UtcNow
+    $rates = foreach ($name in $before.Keys) {
+      $a = $p1[$name]; $b = $p0[$name]
+      if (-not $a -or $a.frames -le $b.frames) { throw "$name made no frame progress in trial $t" }
+      if (($now - $a.at).TotalSeconds -gt 10) { throw "$name stopped presenting during trial $t (last checkpoint $([math]::Round(($now - $a.at).TotalSeconds)) s ago)" }
+      '{0} {1:N1}' -f $name, (1000 * ($a.frames - $b.frames) / ($a.ms - $b.ms))
+    }
     $rows = foreach ($pr in $procs) {
       $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess=$($pr.Id)"
       [pscustomobject]@{
@@ -98,6 +113,7 @@ try {
     }
     "=== $Topology, $Widgets widgets, layer $Layer, trial $t"
     $rows | Sort-Object name | Format-Table -AutoSize | Out-String | Write-Output
+    "fps this trial (between 300-present checkpoints): $($rates -join ', ')"
     "TOTAL cpu=$([math]::Round(($rows | Measure-Object cpu_pct -Sum).Sum,2))% priv_ws=$([math]::Round(($rows | Measure-Object priv_ws_mb -Sum).Sum,2))MiB priv=$([math]::Round(($rows | Measure-Object priv_mb -Sum).Sum,2))MiB threads=$(($rows | Measure-Object threads -Sum).Sum)"
   }
   if ($CaptureDir) {
@@ -139,16 +155,6 @@ public static class SpikeWindows {
   }
   if ($Regions) {
     foreach ($pr in ($procs | Select-Object -First 2)) { "--- regions $($pr.ProcessName) $($pr.Id)"; & (Join-Path $PSScriptRoot 'regions.ps1') -ProcessId $pr.Id -Top 12 -Runs }
-  }
-  # Per-Widget frame rate over the sampled trials, from the counter each
-  # Widget logs every 300 presents (frames and milliseconds since its first
-  # frame). Every requested Widget must have advanced, so a Widget thread
-  # that died inside a shared process cannot shrink the sample unnoticed.
-  $after = Get-Presents
-  foreach ($name in $before.Keys) {
-    $b = $before[$name]; $a = $after[$name]
-    if (-not $a -or $a.frames -le $b.frames) { throw "$name made no frame progress during sampling" }
-    '{0}: {1:N1} fps over sampling, {2:N1} fps since first frame' -f $name, (1000 * ($a.frames - $b.frames) / ($a.ms - $b.ms)), (1000 * $a.frames / $a.ms)
   }
   Get-ChildItem -LiteralPath (Join-Path $scratch 'weaver\logs') -Filter '*.log' | ForEach-Object {
     (Select-String -LiteralPath $_.FullName -Pattern 'memory receipt|spike layout').Line

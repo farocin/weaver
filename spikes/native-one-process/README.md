@@ -69,9 +69,9 @@ except the one in tile 6 (x=960, y=320), which reported 115–400 presents per
 second in every configuration. That over-presenting predates this spike; a
 likely cause, unconfirmed, is a Native frame timer that can be armed twice.
 Runs that include it are not equal-work CPU comparisons, and CPU ranges
-overlap across all four rows. `measure.ps1` now also reports each Widget's
-rate over the sampled trials and fails if any requested Widget stops
-presenting.
+overlap across all four rows. Since the matrix, `measure.ps1` also reports
+each Widget's rate in every trial and fails the run if any requested Widget
+makes no progress in a trial or has not presented in the last 10 seconds.
 
 Window-only captures (Windows Graphics Capture of each Widget's HWND) show the
 lazy-setup Widgets in one process drawing the same scene as today's
@@ -80,9 +80,10 @@ processes. The card background is missing in both, as it was in the
 
 ## Where a Widget's memory goes
 
-One Widget process, today's build, after warm-up: 11.4 MiB private working
-set, of which 10.3 MiB is private allocations and 1.05 MiB is copy-on-write
-image pages. [`regions.ps1`](regions.ps1) groups resident pages by allocation;
+One Widget process, today's build, after warm-up: 11.2 MiB private working
+set in the committed receipt (11.4 MiB in the matrix and in
+`spikes/gpui-host`), of which 10.1 MiB is private allocations and 1.05 MiB is
+copy-on-write image pages. [`regions.ps1`](regions.ps1) groups resident pages by allocation;
 the field layout comes from `WEAVER_MEMORY_RECEIPT=1`. Raw output, with the
 executable's hash: [`regions-create.txt`](regions-create.txt) and
 [`regions-lazy.txt`](regions-lazy.txt). Per-allocation resident totals are
@@ -91,8 +92,8 @@ exact page counts; the printed resident spans merge gaps under 16 KiB.
 | Allocation | Committed | Resident |
 |---|---:|---:|
 | `WidgetApp` (Model, retained tree, Native UI app state) | 7.3 MiB | 5.1 MiB |
-| Main thread stack | 2.5 MiB | 2.5 MiB |
-| Heap (QuickJS and the rest) | 1.0 MiB | 0.9 MiB |
+| Main thread stack | 2.4 MiB | 2.4 MiB |
+| Heap (QuickJS and the rest) | 0.9 MiB | 0.9 MiB |
 | CPU copy of the Widget's pixels (480x320x4) | 0.6 MiB | 0.6 MiB |
 | Native `Runtime` | 28.8 MiB | 0.4 MiB |
 
@@ -104,7 +105,7 @@ exact page counts; the printed resident spans merge gaps under 16 KiB.
   copies a full default image of the 4.3 MB Model. Building the Model field by
   field leaves those arrays untouched: one Widget drops to 7.1 MiB private
   working set and `WidgetApp` to 1.0 MiB resident.
-- **Stack.** 2.4–2.5 MiB of the main thread's stack is resident. The
+- **Stack.** 2.4 MiB of the main thread's stack is resident. The
   likely source, not yet confirmed, is large fixed-capacity scratch arrays
   in stack frames: the Windows stack probe touches every page of a frame
   over one page on entry. [`frames.ps1`](frames.ps1) lists candidates by
