@@ -325,6 +325,7 @@ const Host = struct {
         const started = try self.startProcess(command);
         slot.platform.process = started.process;
         slot.platform.pid = started.pid;
+        errdefer self.stopSlot(slot, false);
         try self.connectSlot(slot, slot.platform.process, slot.platform.pid, now_ms);
     }
 
@@ -550,6 +551,7 @@ const Host = struct {
         const blamed: ?usize = if (crumb == 0 or crumb > self.shared.member_count) null else self.shared.members[crumb - 1];
         for (self.shared.memberSlots()) |index| {
             const slot = &self.slots[index];
+            if (!slot.platform.hosted) continue;
             self.releaseHostedSlot(slot);
             if (!self.sourceExists(slot.source())) {
                 _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
@@ -575,6 +577,7 @@ const Host = struct {
         _ = c.WaitForSingleObject(process, 1000);
         for (self.shared.memberSlots()) |index| {
             const slot = &self.slots[index];
+            if (!slot.platform.hosted) continue;
             self.releaseHostedSlot(slot);
             if (slot.state == .running) {
                 slot.state = .starting;
@@ -582,6 +585,26 @@ const Host = struct {
             }
         }
         self.closeSharedHost();
+    }
+
+    /// A widget the shared host could not load writes `failed:<error>` to its
+    /// backend status file instead of a renderer. Loading is deterministic
+    /// (a broken bundle or manifest), so the slot stops until it is
+    /// reinstalled or its source changes, rather than restarting every
+    /// other widget on a backoff.
+    fn noteHostedLoadFailures(self: *Host) void {
+        for (self.shared.memberSlots()) |index| {
+            const slot = &self.slots[index];
+            if (!slot.platform.hosted or slot.platform.backend_path_len == 0) continue;
+            var buffer: [96]u8 = undefined;
+            const text = std.Io.Dir.cwd().readFile(self.io, slot.platform.backendPath(), &buffer) catch continue;
+            if (!std.mem.startsWith(u8, text, "failed:")) continue;
+            // Consumed: the status row carries the error from here on.
+            std.Io.Dir.cwd().deleteFile(self.io, slot.platform.backendPath()) catch {};
+            self.releaseHostedSlot(slot);
+            slot.state = .stopped;
+            slot.setReason("widget did not load in the shared host: {s}; see 'weaver logs {s}'", .{ text["failed:".len..], slot.name() });
+        }
     }
 
     fn releaseHostedSlot(self: *Host, slot: *Slot) void {
@@ -794,7 +817,7 @@ const Host = struct {
 
     fn sampleProviders(self: *Host) void {
         var any = false;
-        for (&self.slots) |*slot| if (slot.platform.process != null and (slot.wants_cpu or slot.wants_memory)) {
+        for (&self.slots, 0..) |*slot, index| if (self.running(index) and (slot.wants_cpu or slot.wants_memory)) {
             any = true;
             break;
         };
@@ -1205,6 +1228,7 @@ fn run(init: std.process.Init) !void {
             next_provider_ms = now + 1000;
         }
         if (now >= next_cost_ms) {
+            host.noteHostedLoadFailures();
             host.sampleCosts(now);
             host.writeStatus(now);
             next_cost_ms = now + 2000;

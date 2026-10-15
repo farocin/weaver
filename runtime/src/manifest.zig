@@ -69,6 +69,11 @@ fn resolvedAnchor(value: Manifest) Anchor {
 /// Load the two-file widget contract into the process-lifetime arena. M0 is
 /// intentionally strict: unknown JSON fields and unsupported placement fail
 /// at launch instead of quietly changing the desktop behavior.
+/// Largest manifest font id. The host carries each widget's slot in the
+/// top byte of its runtime font ids, so manifest ids stay well below it;
+/// the CLI numbers faces from 64.
+pub const max_font_id: u64 = std.math.maxInt(u32);
+
 pub fn load(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !Loaded {
     const manifest_path = try std.fs.path.join(allocator, &.{ directory, "widget.json" });
     const bundle_path = try std.fs.path.join(allocator, &.{ directory, "bundle.js" });
@@ -97,7 +102,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !Lo
     }
     if (parsed.fonts.len > native_sdk.runtime.max_registered_canvas_fonts) return error.TooManyFonts;
     for (parsed.fonts) |font| {
-        if (font.id < native_sdk.canvas.min_registered_font_id or font.name.len == 0 or font.stem.len == 0 or font.family.len == 0 or !isLocalFontFile(font.file)) return error.InvalidFont;
+        if (font.id < native_sdk.canvas.min_registered_font_id or font.id > max_font_id or font.name.len == 0 or font.stem.len == 0 or font.family.len == 0 or !isLocalFontFile(font.file)) return error.InvalidFont;
     }
     return .{ .manifest = parsed, .bundle = bundle };
 }

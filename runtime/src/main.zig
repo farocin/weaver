@@ -87,6 +87,9 @@ pub const Model = struct {
     window: WindowSpec = .{},
     /// Where `publishBackendStatus` tells the daemon this widget's renderer.
     backend_status_path: ?[]const u8 = null,
+    /// This widget's declared fonts under its slot's ids, registered with
+    /// the runtime at install.
+    font_registrations: []const HostApp.FontRegistration = &.{},
     /// This widget's log; a Model that never loaded a widget (tests) logs
     /// nowhere.
     log: *widget_log.Sink = &unopened_log,
@@ -163,9 +166,15 @@ fn bridgeTimerCapacity() usize {
 }
 // Image receipt (2026-07-30): executing every shipped example measured six
 // retained images at worst (noro-shell). Sixteen leaves 2.7x slot headroom and
-// pins the Native SDK's runtime-wide registry. Pixel buffers are undefined
-// fixed address space and pages touch only as images register.
+// matches the Native SDK registry's per-window share, so every hosted widget
+// can fill its sixteen. Native allocates pixels as images register.
 const max_images: usize = 16;
+
+comptime {
+    if (native_sdk.max_registered_canvas_images < max_images * max_host_widgets) {
+        @compileError("the Native image registry must hold max_images for every hosted widget");
+    }
+}
 // Alias the Native SDK's receipted 512x512 RGBA registry bound so decoding,
 // upload, and CLI validation cannot acquire independent pixel budgets.
 const max_image_rgba_bytes: usize = native_sdk.max_registered_canvas_image_pixel_bytes;
@@ -245,7 +254,7 @@ const WidgetEffects = struct {
     slot: u16,
 
     fn startTimer(self: WidgetEffects, key: u64, interval_ms: u64, mode: native_sdk.TimerMode) void {
-        self.fx.startTimer(.{ .key = slotted(self.slot, key), .interval_ms = interval_ms, .mode = mode, .on_fire = hostTimerMsg });
+        self.fx.startTimer(.{ .key = slotted(self.slot, key), .interval_ms = @min(interval_ms, max_timer_interval_ms), .mode = mode, .on_fire = hostTimerMsg });
     }
 
     fn cancelTimer(self: WidgetEffects, key: u64) void {
@@ -260,6 +269,11 @@ const WidgetEffects = struct {
         return self.fx.unregisterImage(slotted(self.slot, id));
     }
 };
+
+/// Longest timer interval a widget can arm: 2^31 - 1 ms (24.8 days), the
+/// ceiling browsers give setTimeout/setInterval. Longer authored intervals
+/// fire at the ceiling instead of overflowing Native's nanosecond deadline.
+const max_timer_interval_ms: u64 = std.math.maxInt(i32);
 
 /// Widget-local timer keys (JS timer ids, the fixed poll keys) and image
 /// node ids all sit below this bit.
@@ -1352,12 +1366,14 @@ fn resolveManifestFontId(node: *const tree_mod.Node, fonts: []const manifest_mod
     return if (best) |font| font.id else null;
 }
 
-fn loadFonts(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, fonts: []const manifest_mod.Font) ![]const HostApp.FontRegistration {
+/// A widget's declared faces, read from its directory and registered under
+/// its slot's font ids.
+fn slottedFontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, slot: u16, fonts: []const manifest_mod.Font) ![]const HostApp.FontRegistration {
     const registrations = try allocator.alloc(HostApp.FontRegistration, fonts.len);
     for (fonts, 0..) |font, index| {
         const path = try std.fs.path.join(allocator, &.{ directory, font.file });
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(native_sdk.runtime.max_registered_canvas_font_bytes));
-        registrations[index] = .{ .id = font.id, .name = font.name, .ttf = bytes };
+        registrations[index] = .{ .id = slotted(slot, font.id), .name = font.name, .ttf = bytes };
     }
     return registrations;
 }
@@ -1700,6 +1716,7 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
             // desktop; a lone widget fails the process as it always has.
             if (directories.len == 1) return err;
             std.debug.print("weaver-widget --host: skipping {s}: {s}\n", .{ directory, @errorName(err) });
+            reportLoadFailure(environment, @intCast(argument), err);
             continue;
         };
         try widgets.append(allocator, model);
@@ -1710,13 +1727,7 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     // Every widget's faces register with the one runtime, each under its
     // own slot's ids (`resolveFontId`).
     var fonts: std.ArrayList(HostApp.FontRegistration) = .empty;
-    for (widgets.items, directories[0..widgets.items.len]) |model, directory| {
-        for (try loadFonts(init.io, allocator, directory, model.fonts)) |registration| {
-            var slotted_registration = registration;
-            slotted_registration.id = slotted(model.slot, registration.id);
-            try fonts.append(allocator, slotted_registration);
-        }
-    }
+    for (widgets.items) |model| try fonts.appendSlice(allocator, model.font_registrations);
 
     const first = widgets.items[0];
     widget_log.use(first.log);
@@ -1828,7 +1839,12 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     const capture_state_root = environment.capture_state_root;
     const loaded = try manifest_mod.load(init.io, allocator, directory);
     const model = try createModel();
-    errdefer std.heap.page_allocator.destroy(model);
+    // A failed load must stop the provider reader and free the engine
+    // before the Model goes: the host keeps running the other widgets.
+    errdefer {
+        unloadWidget(model);
+        std.heap.page_allocator.destroy(model);
+    }
     model.slot = slot;
     model.argument = argument;
     crash_breadcrumb.mark(argument);
@@ -1895,10 +1911,13 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         directory,
         if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
     );
+    model.image_resolver = image_resolver;
+    // Fonts load with the widget, so a missing face is this widget's
+    // load failure, not the host's.
+    model.font_registrations = try slottedFontRegistrations(init.io, allocator, directory, slot, loaded.manifest.fonts);
 
     model.geometry = geometry_store;
     model.fonts = loaded.manifest.fonts;
-    model.image_resolver = image_resolver;
     if (dragged) |saved| model.frame_origin = .{ saved.x, saved.y };
     if (capture_provider_fixture) |fixture| {
         const capture_command_fixture = try allocator.create(provider_mod.CaptureCommandFixture);
@@ -2006,13 +2025,24 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     return model;
 }
 
+/// The daemon reads `failed:<error>` from the widget's backend status file
+/// as "this widget did not load"; a running widget writes its renderer there.
+fn reportLoadFailure(environment: HostEnvironment, argument: u16, err: anyerror) void {
+    const path = environment.widgetSetting("WEAVER_BACKEND_FILE", argument) orelse return;
+    var buffer: [96]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "failed:{s}", .{@errorName(err)}) catch "failed:";
+    std.Io.Dir.cwd().writeFile(environment.init.io, .{ .sub_path = path, .data = text }) catch {};
+}
+
 fn unloadWidget(model: *Model) void {
     widget_log.use(model.log);
     if (model.engine) |engine| engine.destroy(std.heap.page_allocator);
+    model.engine = null;
     model.provider.deinit();
     deinitImageStates(model);
     model.tree.deinit();
     if (model.image_resolver) |resolver| @constCast(resolver).deinit();
+    model.image_resolver = null;
 }
 
 /// Route this process's logging to `model` and return it: every host hook
@@ -2023,13 +2053,14 @@ fn enter(model: *Model) *Model {
     return model;
 }
 
-fn widgetFor(host: *const Host, slot: u16) ?*Model {
+fn widgetAt(host: *const Host, slot: u16) ?*Model {
     if (slot >= host.widgets.len) return null;
-    return enter(host.widgets[slot]);
+    return host.widgets[slot];
 }
 
-fn widgetForCanvas(host: *const Host, canvas_label: []const u8) ?*Model {
-    return widgetFor(host, slotForCanvasLabel(canvas_label) orelse return null);
+/// The widget in `slot`, entered: its code is about to run.
+fn widgetFor(host: *const Host, slot: u16) ?*Model {
+    return enter(widgetAt(host, slot) orelse return null);
 }
 
 fn widgetForWindow(host: *const Host, window_label: []const u8) ?*Model {
@@ -2070,15 +2101,15 @@ fn hostWindowView(ui: *WidgetUi, host: *const Host, window_label: []const u8) Wi
 }
 
 fn hostViewRevision(host: *const Host) u64 {
-    return viewRevision(widgetFor(host, 0).?);
+    return viewRevision(widgetAt(host, 0).?);
 }
 
 fn hostWindowViewRevision(host: *const Host, window_label: []const u8) u64 {
-    return viewRevision(widgetForWindow(host, window_label) orelse return 0);
+    return viewRevision(widgetAt(host, slotForWindowLabel(window_label) orelse return 0) orelse return 0);
 }
 
 /// A same-revision update for the widget whose canvas this is; every other
-/// widget's canvas already shows it.
+/// widget's canvas already shows it. The wake Msg reaches every widget.
 fn hostProjectUpdate(
     runtime: *native_sdk.Runtime,
     window_id: native_sdk.platform.WindowId,
@@ -2087,7 +2118,7 @@ fn hostProjectUpdate(
     message: HostMsg,
 ) anyerror!bool {
     const slot = slotForCanvasLabel(canvas_label) orelse return true;
-    if (message.widget != slot) return true;
+    if (message.widget != slot and message.widget != every_widget) return true;
     const model = widgetFor(host, slot) orelse return true;
     return projectSameViewUpdate(runtime, window_id, canvas_label, model, message.msg);
 }
