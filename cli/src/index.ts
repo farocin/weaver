@@ -2090,7 +2090,8 @@ function statusDivergenceWarnings(document: ReturnType<typeof readStatus>): stri
   try {
     const registry = readRegistry();
     const registered = new Set(registry.widgets.map((widget) => widget.name));
-    const reported = new Set(document.widgets.map((widget) => widget.name));
+    // The shared host's own row is a process, not a registered widget.
+    const reported = new Set(document.widgets.filter((widget) => !widget.host).map((widget) => widget.name));
     const missing = [...registered].filter((name) => !reported.has(name));
     const extra = [...reported].filter((name) => !registered.has(name));
     if (missing.length > 0) warnings.push(`registry widgets absent from host status: ${missing.join(", ")}; reload did not converge`);

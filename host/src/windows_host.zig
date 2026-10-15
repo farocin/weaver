@@ -27,6 +27,7 @@ const env_backend_file = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_BACKEND_
 const env_renderer_pipe = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER_PIPE");
 const env_renderer_log = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER_LOG");
 const env_art_cache = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_ART_CACHE");
+const env_crash_breadcrumb = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_CRASH_BREADCRUMB");
 const max_widgets = supervisor.max_widgets;
 const max_path_bytes: usize = 2048;
 const invalid_handle = c.INVALID_HANDLE_VALUE;
@@ -150,9 +151,18 @@ const WindowsSlotState = struct {
     sample_cursor: usize = 0,
     backend_path_buffer: [max_path_bytes]u8 = undefined,
     backend_path_len: usize = 0,
+    pipe_name_buffer: [256]u8 = undefined,
+    pipe_name_len: usize = 0,
+    /// The widget runs inside the shared host (`SharedHost`) rather than
+    /// a process of its own; `process` stays null.
+    hosted: bool = false,
 
     fn backendPath(self: *const WindowsSlotState) []const u8 {
         return self.backend_path_buffer[0..self.backend_path_len];
+    }
+
+    fn pipeName(self: *const WindowsSlotState) []const u8 {
+        return self.pipe_name_buffer[0..self.pipe_name_len];
     }
 
     fn averages(self: *const WindowsSlotState) struct { private_mb: f64, cpu: f64 } {
@@ -195,6 +205,26 @@ const WindowsRendererState = struct {
 
 const RendererState = supervisor.RendererState(WindowsRendererState);
 
+/// Every widget not in `--dev` runs in one `weaver-widget --host` process
+/// (ADR 0020). Hosted slots hold no process of their own: they are
+/// `members` of this process, in `--host` argument order, and a host exit
+/// is settled once for all of them. The breadcrumb names the widget that
+/// was running when the process died, so its crash is charged to it alone.
+const SharedHost = struct {
+    process: WindowsRendererState = .{},
+    started_ms: u64 = 0,
+    launches: u64 = 0,
+    members: [max_widgets]usize = undefined,
+    member_count: usize = 0,
+    breadcrumb_mapping: c.HANDLE = null,
+    breadcrumb: ?*volatile u32 = null,
+    threads: u32 = 0,
+
+    fn memberSlots(self: *const SharedHost) []const usize {
+        return self.members[0..self.member_count];
+    }
+};
+
 const Host = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -210,6 +240,7 @@ const Host = struct {
     art_cache_root: []const u8,
     force_software: bool,
     renderer: RendererState = .{},
+    shared: SharedHost = .{},
     slots: [max_widgets]Slot = [_]Slot{.{}} ** max_widgets,
     sampler: providers.Sampler = .{},
     audio_provider: audio.Provider = .{},
@@ -244,7 +275,7 @@ const Host = struct {
     }
 
     pub fn running(self: *const Host, index: usize) bool {
-        return self.slots[index].platform.process != null;
+        return self.slots[index].platform.process != null or self.slots[index].platform.hosted;
     }
 
     pub fn stop(self: *Host, index: usize, graceful: bool) void {
@@ -253,23 +284,57 @@ const Host = struct {
 
     fn supervise(self: *Host, now_ms: u64) void {
         self.superviseRenderer(now_ms);
+        self.settleSharedHostExit(now_ms);
+        var launch_host = false;
         for (&self.slots) |*slot| {
             if (!slot.used or !slot.enabled) continue;
-            const process_running = slot.platform.process != null;
+            const process_running = slot.platform.process != null or slot.platform.hosted;
             const process_exited = if (slot.platform.process) |process| c.WaitForSingleObject(process, 0) == c.WAIT_OBJECT_0 else false;
             switch (supervisor.nextSlotAction(slot, self.sourceExists(slot.source()), process_running, process_exited, now_ms)) {
                 .none => {},
                 .stop_missing => self.stopSlot(slot, true),
                 .handle_exit => self.handleExit(slot, now_ms),
-                .launch => self.launch(slot, now_ms) catch |err| {
-                    supervisor.recordLaunchFailure(slot, now_ms, err);
+                .launch => if (slot.dev) {
+                    self.launch(slot, now_ms) catch |err| {
+                        self.closePipe(slot);
+                        supervisor.recordLaunchFailure(slot, now_ms, err);
+                    };
+                } else {
+                    launch_host = true;
                 },
             }
         }
+        if (launch_host) self.launchSharedHost(now_ms);
         self.superviseRenderer(now_ms);
     }
 
+    /// A `--dev` widget keeps a process of its own: its hot-swap listener
+    /// and dev reloads touch only it.
     fn launch(self: *Host, slot: *Slot, now_ms: u64) !void {
+        try self.prepareSlot(slot, now_ms);
+        const dist = try self.distPath(slot);
+        defer self.allocator.free(dist);
+        const command = try std.fmt.allocPrint(self.allocator, "\"{s}\" --dev \"{s}\"", .{ self.runtime_exe, dist });
+        defer self.allocator.free(command);
+        if (slot.platform.pipe_name_len > 0) try setEnv(self.allocator, env_pipe_name, slot.platform.pipeName());
+        defer if (slot.platform.pipe_name_len > 0) clearEnv(env_pipe_name);
+        try setEnv(self.allocator, env_backend_file, slot.platform.backendPath());
+        defer clearEnv(env_backend_file);
+        try self.setSharedEnv(slot.wants_gpu, slot.wants_media);
+        defer self.clearSharedEnv();
+        const started = try self.startProcess(command);
+        slot.platform.process = started.process;
+        slot.platform.pid = started.pid;
+        try self.connectSlot(slot, slot.platform.process, slot.platform.pid, now_ms);
+    }
+
+    fn distPath(self: *Host, slot: *const Slot) ![]const u8 {
+        return std.fs.path.join(self.allocator, &.{ slot.source(), "dist" });
+    }
+
+    /// Bundle, read the manifest, and open the slot's provider pipe and
+    /// backend status file: everything a launch needs before a process exists.
+    fn prepareSlot(self: *Host, slot: *Slot, now_ms: u64) !void {
         try self.ensureBundle(slot.source());
         const dist = try std.fs.path.join(self.allocator, &.{ slot.source(), "dist" });
         defer self.allocator.free(dist);
@@ -290,10 +355,10 @@ const Host = struct {
             // retry/backoff. The widget may still start so it can reconnect
             // as soon as the shared renderer recovers.
         };
-        var pipe_name_buffer: [256]u8 = undefined;
-        var pipe_name: []const u8 = &.{};
+        slot.platform.pipe_name_len = 0;
         if (slot.wants_cpu or slot.wants_memory or slot.wants_audio or slot.wants_media or slot.wants_media_transport) {
-            pipe_name = try std.fmt.bufPrint(&pipe_name_buffer, "\\\\.\\pipe\\weaver-{d}-{x}", .{ c.GetCurrentProcessId(), std.hash.Wyhash.hash(now_ms, slot.name()) });
+            const pipe_name = try std.fmt.bufPrint(&slot.platform.pipe_name_buffer, "\\\\.\\pipe\\weaver-{d}-{x}", .{ c.GetCurrentProcessId(), std.hash.Wyhash.hash(now_ms, slot.name()) });
+            slot.platform.pipe_name_len = pipe_name.len;
             const pipe_name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, pipe_name);
             defer self.allocator.free(pipe_name_w);
             slot.platform.pipe = c.CreateNamedPipeW(
@@ -308,31 +373,6 @@ const Host = struct {
             );
             if (slot.platform.pipe == invalid_handle) return error.CreatePipeFailed;
         }
-        errdefer self.closePipe(slot);
-        const command = if (slot.dev)
-            try std.fmt.allocPrint(self.allocator, "\"{s}\" --dev \"{s}\"", .{ self.runtime_exe, dist })
-        else
-            try std.fmt.allocPrint(self.allocator, "\"{s}\" \"{s}\"", .{ self.runtime_exe, dist });
-        defer self.allocator.free(command);
-        const command_w_const = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, command);
-        defer self.allocator.free(command_w_const);
-        const command_w = try self.allocator.dupeZ(u16, command_w_const);
-        defer self.allocator.free(command_w);
-        if (pipe_name.len > 0) {
-            const value_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, pipe_name);
-            defer self.allocator.free(value_w);
-            if (c.SetEnvironmentVariableW(env_pipe_name, value_w.ptr) == 0) return error.SetEnvironmentFailed;
-        }
-        if (slot.wants_gpu) {
-            const renderer_pipe_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, self.renderer_pipe_name);
-            defer self.allocator.free(renderer_pipe_w);
-            if (c.SetEnvironmentVariableW(env_renderer_pipe, renderer_pipe_w.ptr) == 0) return error.SetEnvironmentFailed;
-        }
-        if (slot.wants_media) {
-            const art_cache_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, self.art_cache_root);
-            defer self.allocator.free(art_cache_w);
-            if (c.SetEnvironmentVariableW(env_art_cache, art_cache_w.ptr) == 0) return error.SetEnvironmentFailed;
-        }
         const backend_hash = std.hash.Wyhash.hash(0, slot.name());
         const backend_path = try std.fmt.bufPrint(&slot.platform.backend_path_buffer, "{s}.backend-{x}", .{ self.status_path, backend_hash });
         slot.platform.backend_path_len = backend_path.len;
@@ -340,28 +380,38 @@ const Host = struct {
             error.FileNotFound => {},
             else => return err,
         };
-        const backend_path_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, backend_path);
-        defer self.allocator.free(backend_path_w);
-        if (c.SetEnvironmentVariableW(env_backend_file, backend_path_w.ptr) == 0) return error.SetEnvironmentFailed;
-        defer {
-            if (pipe_name.len > 0) _ = c.SetEnvironmentVariableW(env_pipe_name, null);
-            if (slot.wants_gpu) _ = c.SetEnvironmentVariableW(env_renderer_pipe, null);
-            if (slot.wants_media) _ = c.SetEnvironmentVariableW(env_art_cache, null);
-            _ = c.SetEnvironmentVariableW(env_backend_file, null);
-        }
+    }
+
+    /// Process-wide environment every widget of a launch shares.
+    fn setSharedEnv(self: *Host, wants_gpu: bool, wants_media: bool) !void {
+        if (wants_gpu) try setEnv(self.allocator, env_renderer_pipe, self.renderer_pipe_name);
+        if (wants_media) try setEnv(self.allocator, env_art_cache, self.art_cache_root);
+    }
+
+    fn clearSharedEnv(_: *Host) void {
+        clearEnv(env_renderer_pipe);
+        clearEnv(env_art_cache);
+    }
+
+    const Started = struct { process: c.HANDLE, pid: u32 };
+
+    fn startProcess(self: *Host, command: []const u8) !Started {
+        const command_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, command);
+        defer self.allocator.free(command_w);
         var startup: c.STARTUPINFOW = std.mem.zeroes(c.STARTUPINFOW);
         startup.cb = @sizeOf(c.STARTUPINFOW);
         var process_info: c.PROCESS_INFORMATION = std.mem.zeroes(c.PROCESS_INFORMATION);
         if (c.CreateProcessW(null, command_w.ptr, null, null, 0, c.CREATE_NO_WINDOW, null, null, &startup, &process_info) == 0) return error.CreateProcessFailed;
         _ = c.CloseHandle(process_info.hThread);
-        slot.platform.process = process_info.hProcess;
-        slot.platform.pid = process_info.dwProcessId;
         self.thread_sample_ms = 0;
+        return .{ .process = process_info.hProcess, .pid = process_info.dwProcessId };
+    }
+
+    /// Accept the slot's provider pipe from `process` and start serving it,
+    /// then mark the slot running.
+    fn connectSlot(self: *Host, slot: *Slot, process: c.HANDLE, pid: u32, now_ms: u64) !void {
         if (slot.platform.pipe != invalid_handle) {
-            if (!connectPipe(slot.platform.pipe, slot.platform.process, slot.platform.pid, 5_000)) {
-                _ = c.TerminateProcess(slot.platform.process, 1);
-                return error.ConnectPipeFailed;
-            }
+            if (!connectPipe(slot.platform.pipe, process, pid, 5_000)) return error.ConnectPipeFailed;
             slot.platform.write_event = c.CreateEventW(null, 0, 0, null) orelse return error.CreateEventFailed;
             slot.platform.command_shutdown_event = c.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
             slot.platform.command_stopping.store(0, .release);
@@ -379,10 +429,173 @@ const Host = struct {
             }
         }
         supervisor.markRunning(slot, now_ms, self.artifactMtime(slot.source()));
-        slot.platform.previous_process_ticks = processTicks(slot.platform.process);
+        slot.platform.previous_process_ticks = processTicks(process);
         slot.platform.previous_sample_ms = now_ms;
         slot.platform.sample_count = 0;
         slot.platform.sample_cursor = 0;
+    }
+
+    /// (Re)start the shared host with every hosted slot that should run:
+    /// the running members and the ones whose (re)start is due. Slots that
+    /// fail to prepare or connect are charged a launch failure; the rest
+    /// run.
+    fn launchSharedHost(self: *Host, now_ms: u64) void {
+        if (self.shared.process.process != null) self.stopSharedHost(true);
+        var members: [max_widgets]usize = undefined;
+        var member_count: usize = 0;
+        var wants_gpu = false;
+        var wants_media = false;
+        for (&self.slots, 0..) |*slot, index| {
+            if (!slot.used or !slot.enabled or slot.dev) continue;
+            const due = slot.state == .starting or slot.state == .running or (slot.state == .backoff and now_ms >= slot.next_restart_ms);
+            if (!due or !self.sourceExists(slot.source())) continue;
+            self.prepareSlot(slot, now_ms) catch |err| {
+                self.closePipe(slot);
+                supervisor.recordLaunchFailure(slot, now_ms, err);
+                continue;
+            };
+            members[member_count] = index;
+            member_count += 1;
+            wants_gpu = wants_gpu or slot.wants_gpu;
+            wants_media = wants_media or slot.wants_media;
+        }
+        if (member_count == 0) return;
+        const started = self.startSharedHost(members[0..member_count], wants_gpu, wants_media) catch |err| {
+            for (members[0..member_count]) |index| {
+                self.closePipe(&self.slots[index]);
+                supervisor.recordLaunchFailure(&self.slots[index], now_ms, err);
+            }
+            self.closeBreadcrumb();
+            return;
+        };
+        self.shared.process = .{ .process = started.process, .pid = started.pid, .previous_process_ticks = processTicks(started.process), .previous_sample_ms = now_ms };
+        self.shared.started_ms = now_ms;
+        self.shared.members = members;
+        self.shared.member_count = member_count;
+        // The host loads widgets in argument order, so their pipes connect
+        // in that order too.
+        for (members[0..member_count]) |index| {
+            const slot = &self.slots[index];
+            self.connectSlot(slot, started.process, started.pid, now_ms) catch |err| {
+                self.closePipe(slot);
+                supervisor.recordLaunchFailure(slot, now_ms, err);
+                continue;
+            };
+            slot.platform.hosted = true;
+            slot.platform.pid = started.pid;
+        }
+    }
+
+    fn startSharedHost(self: *Host, members: []const usize, wants_gpu: bool, wants_media: bool) !Started {
+        var command: std.Io.Writer.Allocating = .init(self.allocator);
+        defer command.deinit();
+        try command.writer.print("\"{s}\" --host", .{self.runtime_exe});
+        for (members, 0..) |index, argument| {
+            const slot = &self.slots[index];
+            const dist = try self.distPath(slot);
+            defer self.allocator.free(dist);
+            try command.writer.print(" \"{s}\"", .{dist});
+            var name_buffer: [64]u8 = undefined;
+            if (slot.platform.pipe_name_len > 0) try setEnvUtf8(self.allocator, try std.fmt.bufPrint(&name_buffer, "WEAVER_HOST_PIPE_{d}", .{argument}), slot.platform.pipeName());
+            try setEnvUtf8(self.allocator, try std.fmt.bufPrint(&name_buffer, "WEAVER_BACKEND_FILE_{d}", .{argument}), slot.platform.backendPath());
+        }
+        defer for (0..members.len) |argument| {
+            var name_buffer: [64]u8 = undefined;
+            clearEnvUtf8(self.allocator, std.fmt.bufPrint(&name_buffer, "WEAVER_HOST_PIPE_{d}", .{argument}) catch unreachable);
+            clearEnvUtf8(self.allocator, std.fmt.bufPrint(&name_buffer, "WEAVER_BACKEND_FILE_{d}", .{argument}) catch unreachable);
+        };
+        try self.setSharedEnv(wants_gpu, wants_media);
+        defer self.clearSharedEnv();
+        try self.openBreadcrumb();
+        defer clearEnv(env_crash_breadcrumb);
+        return self.startProcess(command.written());
+    }
+
+    /// A fresh 4-byte mapping per launch: the host writes the running
+    /// widget's argument position into it; zero means none yet.
+    fn openBreadcrumb(self: *Host) !void {
+        self.closeBreadcrumb();
+        self.shared.launches += 1;
+        var name_buffer: [96]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "Local\\WeaverHostBreadcrumb-{d}-{d}", .{ c.GetCurrentProcessId(), self.shared.launches });
+        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, name);
+        defer self.allocator.free(name_w);
+        const mapping = c.CreateFileMappingW(invalid_handle, null, c.PAGE_READWRITE, 0, @sizeOf(u32), name_w.ptr) orelse return error.CreateBreadcrumbFailed;
+        const view = c.MapViewOfFile(mapping, c.FILE_MAP_ALL_ACCESS, 0, 0, @sizeOf(u32)) orelse {
+            _ = c.CloseHandle(mapping);
+            return error.CreateBreadcrumbFailed;
+        };
+        self.shared.breadcrumb_mapping = mapping;
+        self.shared.breadcrumb = @ptrCast(@alignCast(view));
+        self.shared.breadcrumb.?.* = 0;
+        try setEnv(self.allocator, env_crash_breadcrumb, name);
+    }
+
+    fn closeBreadcrumb(self: *Host) void {
+        if (self.shared.breadcrumb) |view| _ = c.UnmapViewOfFile(@volatileCast(view));
+        if (self.shared.breadcrumb_mapping) |mapping| _ = c.CloseHandle(mapping);
+        self.shared.breadcrumb = null;
+        self.shared.breadcrumb_mapping = null;
+    }
+
+    /// The shared host exited: charge the crash to the widget the
+    /// breadcrumb names and restart the others at once. With no widget
+    /// named, the fault was the platform's and every member pays it.
+    fn settleSharedHostExit(self: *Host, now_ms: u64) void {
+        const process = self.shared.process.process orelse return;
+        if (c.WaitForSingleObject(process, 0) != c.WAIT_OBJECT_0) return;
+        var exit_code: c.DWORD = 1;
+        _ = c.GetExitCodeProcess(process, &exit_code);
+        const crumb = if (self.shared.breadcrumb) |view| view.* else 0;
+        const blamed: ?usize = if (crumb == 0 or crumb > self.shared.member_count) null else self.shared.members[crumb - 1];
+        for (self.shared.memberSlots()) |index| {
+            const slot = &self.slots[index];
+            self.releaseHostedSlot(slot);
+            if (!self.sourceExists(slot.source())) {
+                _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
+            } else if (blamed == null or blamed.? == index) {
+                supervisor.recordCrash(slot, now_ms, exit_code);
+            } else {
+                slot.state = .starting;
+                slot.next_restart_ms = 0;
+            }
+        }
+        if (blamed) |index| std.log.warn("shared widget host exited with code {d} while running '{s}'", .{ exit_code, self.slots[index].name() });
+        self.closeSharedHost();
+    }
+
+    /// Stop the shared host. Members still due to run restart with the next
+    /// launch; the caller decides the state of the slot it is stopping.
+    fn stopSharedHost(self: *Host, graceful: bool) void {
+        const process = self.shared.process.process orelse return;
+        if (graceful) {
+            closeWindowsForProcess(self.shared.process.pid);
+            if (c.WaitForSingleObject(process, 1500) != c.WAIT_OBJECT_0) _ = c.TerminateProcess(process, 0);
+        } else _ = c.TerminateProcess(process, 0);
+        _ = c.WaitForSingleObject(process, 1000);
+        for (self.shared.memberSlots()) |index| {
+            const slot = &self.slots[index];
+            self.releaseHostedSlot(slot);
+            if (slot.state == .running) {
+                slot.state = .starting;
+                slot.next_restart_ms = 0;
+            }
+        }
+        self.closeSharedHost();
+    }
+
+    fn releaseHostedSlot(self: *Host, slot: *Slot) void {
+        self.closePipe(slot);
+        slot.platform.hosted = false;
+        slot.platform.pid = 0;
+    }
+
+    fn closeSharedHost(self: *Host) void {
+        if (self.shared.process.process) |process| _ = c.CloseHandle(process);
+        self.shared.process = .{};
+        self.shared.member_count = 0;
+        self.thread_sample_ms = 0;
+        self.closeBreadcrumb();
     }
 
     fn rendererDesired(self: *const Host) bool {
@@ -501,6 +714,8 @@ const Host = struct {
     }
 
     fn stopSlot(self: *Host, slot: *Slot, graceful: bool) void {
+        // One widget leaves the shared host by restarting it without them.
+        if (slot.platform.hosted) return self.stopSharedHost(graceful);
         if (slot.platform.process) |process| {
             if (graceful) {
                 closeWindowsForProcess(slot.platform.pid);
@@ -542,6 +757,7 @@ const Host = struct {
     }
 
     fn sampleCosts(self: *Host, now_ms: u64) void {
+        sampleProcess(&self.shared.process, now_ms);
         for (&self.slots) |*slot| {
             const process = slot.platform.process orelse continue;
             var counters: c.PROCESS_MEMORY_COUNTERS_EX = std.mem.zeroes(c.PROCESS_MEMORY_COUNTERS_EX);
@@ -734,13 +950,30 @@ const Host = struct {
         if (self.thread_sample_ms == 0 or now_ms -| self.thread_sample_ms >= 30_000) {
             self.slot_threads = [_]u32{0} ** max_widgets;
             self.renderer_threads = 0;
+            self.shared.threads = 0;
             collectThreadCounts(self, &self.slot_threads, &self.renderer_threads);
             self.thread_sample_ms = now_ms;
         }
-        var entries: [max_widgets + 1]supervisor.StatusEntry = undefined;
+        var entries: [max_widgets + 2]supervisor.StatusEntry = undefined;
         var entry_count: usize = 0;
         var backend_allocations = [_]?[]u8{null} ** max_widgets;
         defer for (backend_allocations) |value| if (value) |bytes| self.allocator.free(bytes);
+        if (self.shared.process.process != null) {
+            const average = self.shared.process.averages();
+            entries[entry_count] = .{
+                .name = "host",
+                .pid = self.shared.process.pid,
+                .private_mb = average.private_mb,
+                .cpu_percent = average.cpu,
+                .threads = self.shared.threads,
+                .backend = "-",
+                .uptime_seconds = (now_ms -| self.shared.started_ms) / 1000,
+                .state = .running,
+                .reason = "",
+                .host_row = true,
+            };
+            entry_count += 1;
+        }
         if (self.renderer.platform.process != null) {
             const average = self.renderer.platform.averages();
             entries[entry_count] = .{
@@ -760,7 +993,7 @@ const Host = struct {
             if (!slot.used) continue;
             const average = slot.platform.averages();
             var backend: []const u8 = "-";
-            if (slot.platform.process != null and slot.platform.backend_path_len > 0) {
+            if ((slot.platform.process != null or slot.platform.hosted) and slot.platform.backend_path_len > 0) {
                 backend_allocations[slot_index] = std.Io.Dir.cwd().readFileAlloc(self.io, slot.platform.backendPath(), self.allocator, .limited(16)) catch null;
                 if (backend_allocations[slot_index]) |value| backend = value;
             }
@@ -776,11 +1009,12 @@ const Host = struct {
                 .pid = slot.platform.pid,
                 .private_mb = average.private_mb,
                 .cpu_percent = average.cpu,
-                .threads = self.slot_threads[slot_index],
+                .threads = if (slot.platform.hosted) 0 else self.slot_threads[slot_index],
                 .backend = backend,
-                .uptime_seconds = if (slot.platform.process != null) (now_ms -| slot.started_ms) / 1000 else 0,
+                .uptime_seconds = if (slot.platform.process != null or slot.platform.hosted) (now_ms -| slot.started_ms) / 1000 else 0,
                 .state = slot.state,
                 .reason = reason,
+                .hosted = slot.platform.hosted,
             };
             entry_count += 1;
         }
@@ -976,6 +1210,7 @@ fn run(init: std.process.Init) !void {
             next_cost_ms = now + 2000;
         }
     }
+    host.stopSharedHost(true);
     for (&host.slots) |*slot| if (slot.platform.process != null) host.stopSlot(slot, true);
     if (host.renderer.platform.process) |process| {
         _ = c.TerminateProcess(process, 0);
@@ -1046,6 +1281,45 @@ fn repositoryRoot(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, repo);
 }
 
+fn sampleProcess(state: *WindowsRendererState, now_ms: u64) void {
+    const process = state.process orelse return;
+    var counters: c.PROCESS_MEMORY_COUNTERS_EX = std.mem.zeroes(c.PROCESS_MEMORY_COUNTERS_EX);
+    counters.cb = @sizeOf(c.PROCESS_MEMORY_COUNTERS_EX);
+    if (c.GetProcessMemoryInfo(process, @ptrCast(&counters), @sizeOf(c.PROCESS_MEMORY_COUNTERS_EX)) == 0) return;
+    const ticks = processTicks(process);
+    const elapsed_ms = now_ms -| state.previous_sample_ms;
+    const tick_delta = ticks -| state.previous_process_ticks;
+    const cpu = if (elapsed_ms == 0) 0 else 100.0 * @as(f64, @floatFromInt(tick_delta)) / 10_000.0 / @as(f64, @floatFromInt(elapsed_ms));
+    state.private_samples[state.sample_cursor] = counters.PrivateUsage;
+    state.cpu_samples[state.sample_cursor] = @round(cpu * 10.0) / 10.0;
+    state.sample_cursor = (state.sample_cursor + 1) % state.private_samples.len;
+    state.sample_count = @min(state.sample_count + 1, state.private_samples.len);
+    state.previous_process_ticks = ticks;
+    state.previous_sample_ms = now_ms;
+}
+
+fn setEnv(allocator: std.mem.Allocator, name: [*:0]const u16, value: []const u8) !void {
+    const value_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, value);
+    defer allocator.free(value_w);
+    if (c.SetEnvironmentVariableW(name, value_w.ptr) == 0) return error.SetEnvironmentFailed;
+}
+
+fn clearEnv(name: [*:0]const u16) void {
+    _ = c.SetEnvironmentVariableW(name, null);
+}
+
+fn setEnvUtf8(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    const name_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, name);
+    defer allocator.free(name_w);
+    try setEnv(allocator, name_w.ptr, value);
+}
+
+fn clearEnvUtf8(allocator: std.mem.Allocator, name: []const u8) void {
+    const name_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, name) catch return;
+    defer allocator.free(name_w);
+    clearEnv(name_w.ptr);
+}
+
 fn processTicks(process: c.HANDLE) u64 {
     var created: c.FILETIME = undefined;
     var exited: c.FILETIME = undefined;
@@ -1059,7 +1333,7 @@ fn fileTime(value: c.FILETIME) u64 {
     return (@as(u64, value.dwHighDateTime) << 32) | value.dwLowDateTime;
 }
 
-fn collectThreadCounts(host: *const Host, slot_counts: *[max_widgets]u32, renderer_count: *u32) void {
+fn collectThreadCounts(host: *Host, slot_counts: *[max_widgets]u32, renderer_count: *u32) void {
     const snapshot = c.CreateToolhelp32Snapshot(c.TH32CS_SNAPTHREAD, 0);
     if (snapshot == invalid_handle) return;
     defer _ = c.CloseHandle(snapshot);
@@ -1068,6 +1342,7 @@ fn collectThreadCounts(host: *const Host, slot_counts: *[max_widgets]u32, render
     if (c.Thread32First(snapshot, &entry) == 0) return;
     while (true) {
         if (entry.th32OwnerProcessID == host.renderer.platform.pid) renderer_count.* += 1;
+        if (host.shared.process.pid != 0 and entry.th32OwnerProcessID == host.shared.process.pid) host.shared.threads += 1;
         for (&host.slots, 0..) |slot, index| {
             if (slot.platform.pid != 0 and entry.th32OwnerProcessID == slot.platform.pid) slot_counts[index] += 1;
         }

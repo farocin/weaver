@@ -227,6 +227,15 @@ test("status table is aligned and includes crash reasons", () => {
   assert.match(table, /Broken\s+-\s+-\s+0\.0 MB\s+0\.0%\s+0\s+0s\s+stopped: crashed 3 times/);
 });
 
+test("status shows hosted widgets' costs on the shared host row", () => {
+  const table = hostTools.formatStatus({ hostPid: 1, widgets: [
+    { name: "host", pid: 7, backend: "-", privateMb: 14.6, cpuPercent: 0.4, threads: 4, uptimeSeconds: 65, state: "running", reason: "", host: true },
+    { name: "Clock", pid: 7, backend: "software", privateMb: 0, cpuPercent: 0, uptimeSeconds: 65, state: "running", reason: "", hosted: true },
+  ] });
+  assert.match(table, /host\s+7\s+-\s+14\.6 MB\s+0\.4%\s+4/);
+  assert.match(table, /Clock\s+7\s+software\s+in host\s+in host\s+0\s+1m05s\s+running/);
+});
+
 test("path helpers follow Windows case rules without weakening POSIX containment", () => {
   const root = "C:\\Users\\Dara\\AppData\\Local\\weaver\\widgets";
   assert.equal(hostTools.pathsEqual(`${root}\\Clock`, "c:/users/dara/appdata/local/weaver/widgets/clock", "win32"), true);

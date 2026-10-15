@@ -308,6 +308,11 @@ pub const StatusEntry = struct {
     uptime_seconds: u64,
     state: RunState,
     reason: []const u8,
+    /// The widget runs inside the shared host process: its memory and CPU
+    /// are the host row's, not its own.
+    hosted: bool = false,
+    /// This row is the shared widget host process itself.
+    host_row: bool = false,
 };
 
 pub fn writeStatus(writer: *std.Io.Writer, host_pid: u32, provider_status: ProviderStatus, entries: []const StatusEntry) !void {
@@ -366,13 +371,21 @@ pub fn writeStatus(writer: *std.Io.Writer, host_pid: u32, provider_status: Provi
         try json.write(entry.uptime_seconds);
         try json.objectField("state");
         try json.write(runStateLabel(entry.state));
+        if (entry.hosted) {
+            try json.objectField("hosted");
+            try json.write(true);
+        }
+        if (entry.host_row) {
+            try json.objectField("host");
+            try json.write(true);
+        }
         try json.objectField("reason");
-        // A running process that has never reported a renderer backend is
+        // A running widget that has never reported a renderer backend is
         // presenting nothing — the window shows no frames. Saying so here
         // is the difference between "running" reading as healthy and the
         // one real tell (backend '-') going unnoticed. Ten seconds skips
         // ordinary startup latency.
-        if (entry.state == .running and entry.reason.len == 0 and entry.uptime_seconds >= 10 and std.mem.eql(u8, entry.backend, "-")) {
+        if (!entry.host_row and entry.state == .running and entry.reason.len == 0 and entry.uptime_seconds >= 10 and std.mem.eql(u8, entry.backend, "-")) {
             try json.write("no frames presented (renderer surface not created); check 'weaver logs <name>'");
         } else {
             try json.write(entry.reason);

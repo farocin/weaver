@@ -14,6 +14,10 @@ export interface WidgetStatus {
   uptimeSeconds: number;
   state: "disabled" | "starting" | "running" | "backoff" | "stopped" | "source missing";
   reason: string;
+  /** Runs inside the shared host process; its memory and CPU are the host row's. */
+  hosted?: boolean;
+  /** This row is the shared widget host process itself. */
+  host?: boolean;
 }
 export interface ProviderStatus {
   systemSubscribers: number;
@@ -165,8 +169,8 @@ export function formatStatus(document: StatusDocument): string {
     widget.name,
     widget.pid === 0 ? "-" : String(widget.pid),
     widget.backend ?? "-",
-    `${widget.privateMb.toFixed(1)} MB`,
-    `${widget.cpuPercent.toFixed(1)}%`,
+    widget.hosted ? "in host" : `${widget.privateMb.toFixed(1)} MB`,
+    widget.hosted ? "in host" : `${widget.cpuPercent.toFixed(1)}%`,
     String(widget.threads ?? 0),
     formatUptime(widget.uptimeSeconds),
     widget.reason ? `${widget.state}: ${widget.reason}` : widget.state,
