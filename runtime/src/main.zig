@@ -822,8 +822,9 @@ fn emitsChildren(kind: tree_mod.Kind) bool {
 
 /// Native levels `buildNode` emits for this subtree. Painted layouts and
 /// `<panel>` lower to a panel around a layout node (two levels), as does a
-/// failed image's labelled box. Mirrored by `weaver check`'s lowering in
-/// cli/src/index.ts (`LoweredWidgetDepthLimit`).
+/// failed image's labelled box. `weaver check` estimates this statically
+/// (`LoweredWidgetDepthLimit` in cli/src/index.ts); this count is the
+/// authoritative one.
 fn loweredDepth(model: *const Model, id: tree_mod.NodeId) usize {
     const node = model.tree.nodeConst(id) catch return 1;
     const own: usize = switch (node.kind) {
