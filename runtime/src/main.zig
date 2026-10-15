@@ -18,6 +18,7 @@ const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
 const crash_breadcrumb = @import("crash_breadcrumb.zig");
+const small_fs = @import("small_fs.zig");
 
 comptime {
     if (native_sdk.platform.max_windows != max_host_widgets or
@@ -1712,7 +1713,6 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         .dev = dev,
         .hosted = hosted,
     };
-    try std.Io.Dir.cwd().createDirPath(init.io, environment.log_directory);
     // That capture log is deleted with the state root, so widget diagnostics
     // also go to a file the CLI copies into the capture receipt.
     if (capture_state_root) |root| {
@@ -1720,19 +1720,8 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
 
-    var widgets: std.ArrayList(*Model) = .empty;
-    for (directories, 0..) |directory, argument| {
-        const slot: u16 = @intCast(widgets.items.len);
-        const model = loadWidget(environment, directory, slot, @intCast(argument)) catch |err| {
-            // One widget's broken install must not keep the others off the
-            // desktop; a lone widget fails the process as it always has.
-            if (directories.len == 1) return err;
-            std.debug.print("weaver-widget --host: skipping {s}: {s}\n", .{ directory, @errorName(err) });
-            reportLoadFailure(environment, @intCast(argument), err);
-            continue;
-        };
-        try widgets.append(allocator, model);
-    }
+    var loader: Loader = .{ .environment = environment, .directories = directories };
+    const widgets = try loader.run();
     if (widgets.items.len == 0) return error.NoWidgetLoaded;
     defer for (widgets.items) |model| unloadWidget(model);
 
@@ -1841,6 +1830,54 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         return err;
     };
 }
+
+/// Loads every widget on a short-lived thread. Loading reads manifests,
+/// bundles, fonts, images and stores through std.Io, whose Windows file
+/// calls take 256-512 KiB stack frames; a thread's stack is released when it
+/// exits, where the UI thread's high-water mark would stay resident for the
+/// host's whole life. The thread gets the UI thread's stack reservation
+/// (runtime/build.zig) because bundles evaluate on it under the same
+/// QuickJS recursion guard.
+const Loader = struct {
+    environment: HostEnvironment,
+    directories: []const []const u8,
+    widgets: std.ArrayList(*Model) = .empty,
+    failure: ?anyerror = null,
+
+    fn run(self: *Loader) !std.ArrayList(*Model) {
+        const thread = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, load, .{self});
+        thread.join();
+        if (self.failure) |err| return err;
+        return self.widgets;
+    }
+
+    fn load(self: *Loader) void {
+        const allocator = self.environment.init.arena.allocator();
+        std.Io.Dir.cwd().createDirPath(self.environment.init.io, self.environment.log_directory) catch |err| {
+            self.failure = err;
+            return;
+        };
+        for (self.directories, 0..) |directory, argument| {
+            const slot: u16 = @intCast(self.widgets.items.len);
+            const model = loadWidget(self.environment, directory, slot, @intCast(argument)) catch |err| {
+                // One widget's broken install must not keep the others off
+                // the desktop; a lone widget fails the process as it always
+                // has.
+                if (self.directories.len == 1) {
+                    self.failure = err;
+                    return;
+                }
+                std.debug.print("weaver-widget --host: skipping {s}: {s}\n", .{ directory, @errorName(err) });
+                reportLoadFailure(self.environment, @intCast(argument), err);
+                continue;
+            };
+            self.widgets.append(allocator, model) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    }
+};
 
 /// Load one widget into `slot`: its manifest, log, storage, placement,
 /// provider channel, and engine, then evaluate its bundle. Everything it
@@ -2047,7 +2084,7 @@ fn reportLoadFailure(environment: HostEnvironment, argument: u16, err: anyerror)
     const path = environment.widgetSetting("WEAVER_BACKEND_FILE", argument) orelse return;
     var buffer: [96]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, "failed:{s}", .{@errorName(err)}) catch "failed:";
-    std.Io.Dir.cwd().writeFile(environment.init.io, .{ .sub_path = path, .data = text }) catch {};
+    small_fs.write(environment.init.io, path, text) catch {};
 }
 
 fn unloadWidget(model: *Model) void {
@@ -2505,7 +2542,7 @@ fn draggedOriginVisible(saved: geometry_mod.Saved, size: [2]f32) bool {
 fn publishBackendStatus(model: *const Model, backend: native_sdk.platform.GpuSurfaceBackend) void {
     const io = backend_status_io orelse return;
     const path = model.backend_status_path orelse return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = backendStatusLabel(backend) }) catch |err| {
+    small_fs.write(io, path, backendStatusLabel(backend)) catch |err| {
         std.log.warn("widget could not publish renderer status: {s}", .{@errorName(err)});
     };
 }
@@ -2587,6 +2624,7 @@ test {
     _ = @import("provider.zig");
     _ = @import("widget_diagnostic.zig");
     _ = @import("widget_log.zig");
+    _ = @import("small_fs.zig");
     const automatic_software_backend: native_sdk.app_manifest.GpuSurfaceBackend =
         if (@import("builtin").os.tag == .macos) .metal else .software;
     try std.testing.expectEqual(automatic_software_backend, declaredGpuBackend("software", false));

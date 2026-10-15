@@ -1,4 +1,5 @@
 const std = @import("std");
+const small_fs = @import("small_fs.zig");
 const platform = @import("platform/root.zig");
 
 // Log receipt (2026-07-29): one runtime diagnostic is capped at 6,000 detail
@@ -35,11 +36,7 @@ pub fn init(sink: *Sink, runtime_io: std.Io, path: []const u8) !void {
     sink.io = runtime_io;
     sink.write_failed.store(false, .release);
     sink.fallback_reported.store(false, .release);
-    var file = std.Io.Dir.cwd().createFile(runtime_io, path, .{ .read = true, .truncate = false }) catch |err| {
-        noteFailure(sink, err);
-        return;
-    };
-    file.close(runtime_io);
+    small_fs.append(runtime_io, path, "") catch |err| noteFailure(sink, err);
 }
 
 /// Route `std.log` to `sink` until the next call.
@@ -133,21 +130,15 @@ fn writeLineFallible(sink: *Sink, line: []const u8) !void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
 
-    var cwd = std.Io.Dir.cwd();
+    // Every log line runs this on the UI thread: small_fs keeps it to small
+    // stack frames.
     const path = sink.path;
     const old_path = sink.old_path;
-    const size = if (cwd.statFile(runtime_io, path, .{})) |stat| stat.size else |_| 0;
-    if (shouldRotate(size, line.len)) {
-        cwd.deleteFile(runtime_io, old_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        try cwd.rename(path, cwd, old_path, runtime_io);
+    if (shouldRotate(small_fs.size(runtime_io, path) orelse 0, line.len)) {
+        try small_fs.delete(runtime_io, old_path);
+        try small_fs.rename(runtime_io, path, old_path);
     }
-    var file = try cwd.createFile(runtime_io, path, .{ .read = true, .truncate = false });
-    defer file.close(runtime_io);
-    const stat = try file.stat(runtime_io);
-    try file.writePositionalAll(runtime_io, line, stat.size);
+    try small_fs.append(runtime_io, path, line);
 }
 
 fn noteFailure(sink: *Sink, err: anyerror) void {
