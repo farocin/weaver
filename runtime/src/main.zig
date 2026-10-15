@@ -1371,8 +1371,20 @@ fn resolveManifestFontId(node: *const tree_mod.Node, fonts: []const manifest_mod
 fn slottedFontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, slot: u16, fonts: []const manifest_mod.Font) ![]const HostApp.FontRegistration {
     const registrations = try allocator.alloc(HostApp.FontRegistration, fonts.len);
     for (fonts, 0..) |font, index| {
+        for (fonts[0..index]) |earlier| {
+            if (earlier.id == font.id) {
+                std.log.err("font \"{s}\" reuses font id {d} of \"{s}\"; every face needs its own id", .{ font.name, font.id, earlier.name });
+                return error.DuplicateFontId;
+            }
+        }
         const path = try std.fs.path.join(allocator, &.{ directory, font.file });
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(native_sdk.runtime.max_registered_canvas_font_bytes));
+        // Parse here so an unreadable face fails this widget's load, not
+        // the host's shared font registration.
+        _ = native_sdk.canvas.font_ttf.Face.parse(bytes) catch {
+            std.log.err("font \"{s}\" ({s}) failed to parse: {s}", .{ font.name, font.file, native_sdk.canvas.font_ttf.parseFailureReason(bytes) orelse "not a parseable TrueType face" });
+            return error.FontParseFailed;
+        };
         registrations[index] = .{ .id = slotted(slot, font.id), .name = font.name, .ttf = bytes };
     }
     return registrations;

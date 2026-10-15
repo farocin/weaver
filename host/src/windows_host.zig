@@ -479,7 +479,10 @@ const Host = struct {
             const slot = &self.slots[index];
             self.connectSlot(slot, started.process, started.pid, now_ms) catch |err| {
                 self.closePipe(slot);
-                supervisor.recordLaunchFailure(slot, now_ms, err);
+                // A widget that failed to load never connects its pipe; its
+                // status file says why, and it stops like any load failure
+                // instead of restarting the host on a backoff.
+                if (!self.stopOnReportedLoadFailure(slot)) supervisor.recordLaunchFailure(slot, now_ms, err);
                 continue;
             };
             slot.platform.hosted = true;
@@ -595,16 +598,23 @@ const Host = struct {
     fn noteHostedLoadFailures(self: *Host) void {
         for (self.shared.memberSlots()) |index| {
             const slot = &self.slots[index];
-            if (!slot.platform.hosted or slot.platform.backend_path_len == 0) continue;
-            var buffer: [96]u8 = undefined;
-            const text = std.Io.Dir.cwd().readFile(self.io, slot.platform.backendPath(), &buffer) catch continue;
-            if (!std.mem.startsWith(u8, text, "failed:")) continue;
-            // Consumed: the status row carries the error from here on.
-            std.Io.Dir.cwd().deleteFile(self.io, slot.platform.backendPath()) catch {};
-            self.releaseHostedSlot(slot);
-            slot.state = .stopped;
-            slot.setReason("widget did not load in the shared host: {s}; see 'weaver logs {s}'", .{ text["failed:".len..], slot.name() });
+            if (!slot.platform.hosted) continue;
+            _ = self.stopOnReportedLoadFailure(slot);
         }
+    }
+
+    /// Stop `slot` if the host reported that it could not load it.
+    fn stopOnReportedLoadFailure(self: *Host, slot: *Slot) bool {
+        if (slot.platform.backend_path_len == 0) return false;
+        var buffer: [96]u8 = undefined;
+        const text = std.Io.Dir.cwd().readFile(self.io, slot.platform.backendPath(), &buffer) catch return false;
+        if (!std.mem.startsWith(u8, text, "failed:")) return false;
+        // Consumed: the status row carries the error from here on.
+        std.Io.Dir.cwd().deleteFile(self.io, slot.platform.backendPath()) catch {};
+        self.releaseHostedSlot(slot);
+        slot.state = .stopped;
+        slot.setReason("widget did not load in the shared host: {s}; see 'weaver logs {s}'", .{ text["failed:".len..], slot.name() });
+        return true;
     }
 
     fn releaseHostedSlot(self: *Host, slot: *Slot) void {
