@@ -17,10 +17,11 @@ const tree_mod = @import("tree.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
+const crash_breadcrumb = @import("crash_breadcrumb.zig");
 
 comptime {
-    if (native_sdk.platform.max_windows != 1 or
-        native_sdk.platform.max_views != 1 or
+    if (native_sdk.platform.max_windows != max_host_widgets or
+        native_sdk.platform.max_views != max_host_widgets or
         native_sdk.platform.max_webviews != 1 or
         native_sdk.runtime.max_canvas_commands_per_view != 2048 or
         native_sdk.runtime.max_canvas_path_elements_per_view != 2048 or
@@ -29,6 +30,12 @@ comptime {
         @compileError("Weaver runtime must be built with the Native SDK widget profile");
     }
 }
+
+/// Widgets one runtime process hosts: one Native window and canvas each.
+/// Matches the daemon's registry (host/src/supervisor.zig max_widgets), so
+/// every registered widget fits one host. Pinned by runtime/build.zig's
+/// widget-windows.
+pub const max_host_widgets: usize = 32;
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 pub const std_options: std.Options = .{ .logFn = widget_log.logFn };
@@ -68,7 +75,87 @@ pub const Model = struct {
     /// until the first platform frame report names the launch position.
     frame_origin: ?[2]f32 = null,
     pending_frame: ?geometry_mod.Saved = null,
+    /// This widget's place in the host: its window and canvas labels, the
+    /// `HostMsg.widget` of its messages, and the namespace of its Native
+    /// timer keys, image ids, and font ids.
+    slot: u16 = 0,
+    /// Position of this widget's directory on the `--host` command line:
+    /// how the daemon names it in per-widget environment variables and
+    /// the crash breadcrumb. Equal to `slot` unless a widget before it
+    /// failed to load.
+    argument: u16 = 0,
+    window: WindowSpec = .{},
+    /// Where `publishBackendStatus` tells the daemon this widget's renderer.
+    backend_status_path: ?[]const u8 = null,
+    /// This widget's log; a Model that never loaded a widget (tests) logs
+    /// nowhere.
+    log: *widget_log.Sink = &unopened_log,
+    rendered_presents: u64 = 0,
+    first_render_ns: u64 = 0,
+    logged_backend: bool = false,
+    logged_present_path: bool = false,
+    last_backend: native_sdk.platform.GpuSurfaceBackend = .none,
+    projection_failure_latched: bool = false,
+    /// The current view was refused by `depthLimitPanel`; capture fails on
+    /// it like a render exception so the receipt names the problem.
+    depth_limit_exceeded: bool = false,
+    /// Its own latch, so another projection failure cannot swallow the report.
+    depth_limit_reported: bool = false,
 };
+
+var unopened_log: widget_log.Sink = .{};
+
+/// Where a widget's window opens and how it behaves, from its manifest and
+/// any persisted drag.
+const WindowSpec = struct {
+    name: []const u8 = "",
+    frame: native_sdk.geometry.RectF = native_sdk.geometry.RectF.init(0, 0, 1, 1),
+    layer: NativeWindowLayers = .{ .shell = .normal, .startup = .normal },
+    click_through: bool = false,
+    backend: native_sdk.app_manifest.GpuSurfaceBackend = .software,
+    /// A persisted drag placed the window, not the manifest anchor.
+    dragged: bool = false,
+    primary_display_anchor: ?native_sdk.PrimaryDisplayAnchor = null,
+};
+
+/// Slot 0 renders in the scene's main window; the others are declared
+/// windows. Labels are fixed per slot so a slot's identity survives
+/// rebuilds and automation can address it.
+const main_window_label = "main";
+const main_canvas_label = "widget-canvas";
+const slot_window_labels = slotLabels("widget-");
+const slot_canvas_labels = slotLabels("widget-canvas-");
+
+fn slotLabels(comptime prefix: []const u8) [max_host_widgets][]const u8 {
+    @setEvalBranchQuota(100_000);
+    var labels: [max_host_widgets][]const u8 = undefined;
+    for (&labels, 0..) |*label, slot| label.* = std.fmt.comptimePrint("{s}{d}", .{ prefix, slot });
+    return labels;
+}
+
+fn windowLabel(slot: u16) []const u8 {
+    return if (slot == 0) main_window_label else slot_window_labels[slot];
+}
+
+fn canvasLabel(slot: u16) []const u8 {
+    return if (slot == 0) main_canvas_label else slot_canvas_labels[slot];
+}
+
+fn slotForWindowLabel(label: []const u8) ?u16 {
+    if (std.mem.eql(u8, label, main_window_label)) return 0;
+    for (slot_window_labels[1..], 1..) |candidate, slot| {
+        if (std.mem.eql(u8, candidate, label)) return @intCast(slot);
+    }
+    return null;
+}
+
+fn slotForCanvasLabel(label: []const u8) ?u16 {
+    if (std.mem.eql(u8, label, main_canvas_label)) return 0;
+    for (slot_canvas_labels[1..], 1..) |candidate, slot| {
+        if (std.mem.eql(u8, candidate, label)) return @intCast(slot);
+    }
+    return null;
+}
 
 const ArmedTimer = struct { id: u64 = 0, interval_ms: u64 = 0 };
 fn bridgeTimerCapacity() usize {
@@ -129,30 +216,77 @@ pub const Msg = union(enum) {
     frame_moved: geometry_mod.Saved,
 };
 
-const WidgetApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = false });
-const WidgetUi = WidgetApp.Ui;
-const Effects = WidgetApp.Effects;
-var rendered_presents: u64 = 0;
-var first_render_ns: u64 = 0;
-var logged_backend: bool = false;
-var logged_present_path: bool = false;
-var last_backend: native_sdk.platform.GpuSurfaceBackend = .none;
-var requested_software_backend: bool = false;
+/// One widget's Msg, addressed to it. Every widget in the process shares
+/// one Native app, so each message names the widget slot it belongs to.
+pub const HostMsg = struct {
+    widget: u16,
+    msg: Msg,
+};
+
+/// `HostMsg.widget` for the external-wake Msg: every widget checks its own
+/// pending provider and dev-reload wakes.
+const every_widget: u16 = std.math.maxInt(u16);
+
+/// Every widget this process runs, by slot.
+pub const Host = struct {
+    widgets: []const *Model = &.{},
+};
+
+const HostApp = native_sdk.UiAppWithFeatures(Host, HostMsg, .{ .runtime_markup = false });
+const WidgetUi = HostApp.Ui;
+const Effects = HostApp.Effects;
+
+/// One widget's handle on the shared effects channel. Native timer keys and
+/// image ids are runtime-wide, so a widget's own keys and ids carry its
+/// slot in the bits above `slot_shift`; its timers fire back as Msgs
+/// addressed to it.
+const WidgetEffects = struct {
+    fx: *Effects,
+    slot: u16,
+
+    fn startTimer(self: WidgetEffects, key: u64, interval_ms: u64, mode: native_sdk.TimerMode) void {
+        self.fx.startTimer(.{ .key = slotted(self.slot, key), .interval_ms = interval_ms, .mode = mode, .on_fire = hostTimerMsg });
+    }
+
+    fn cancelTimer(self: WidgetEffects, key: u64) void {
+        self.fx.cancelTimer(slotted(self.slot, key));
+    }
+
+    fn registerImageBytes(self: WidgetEffects, id: u64, bytes: []const u8) !void {
+        _ = try self.fx.registerImageBytes(slotted(self.slot, id), bytes);
+    }
+
+    fn unregisterImage(self: WidgetEffects, id: u64) bool {
+        return self.fx.unregisterImage(slotted(self.slot, id));
+    }
+};
+
+/// Widget-local timer keys (JS timer ids, the fixed poll keys) and image
+/// node ids all sit below this bit.
+const slot_shift: u6 = 56;
+
+fn slotted(slot: u16, local: u64) u64 {
+    std.debug.assert(local < (@as(u64, 1) << slot_shift));
+    return (@as(u64, slot) << slot_shift) | local;
+}
+
+fn hostTimerMsg(timer: native_sdk.EffectTimer) HostMsg {
+    var local = timer;
+    local.key = timer.key & ((@as(u64, 1) << slot_shift) - 1);
+    return .{ .widget = @intCast(timer.key >> slot_shift), .msg = .{ .timer = local } };
+}
+
 var diagnostic_runtime: ?*native_sdk.Runtime = null;
 var wake_runtime = std.atomic.Value(usize).init(0);
-var dev_reload_pending = std.atomic.Value(bool).init(false);
-var provider_wake_pending = std.atomic.Value(bool).init(false);
+/// Set off the loop thread by each widget's provider and dev-reload
+/// listeners; drained by the `every_widget` wake Msg.
+var dev_reload_pending: [max_host_widgets]std.atomic.Value(bool) = @splat(.init(false));
+var provider_wake_pending: [max_host_widgets]std.atomic.Value(bool) = @splat(.init(false));
 var backend_status_io: ?std.Io = null;
-var backend_status_path: ?[]const u8 = null;
+/// Set by a failed projection during the view build in progress.
 var projection_failed_this_view: bool = false;
-var projection_failure_latched: bool = false;
-/// The current view was refused by `depthLimitPanel`; capture fails on it
-/// like a render exception so the receipt names the problem.
-var depth_limit_exceeded: bool = false;
-/// Its own latch, so another projection failure cannot swallow the report.
-var depth_limit_reported: bool = false;
 
-fn initEffects(model: *Model, effects: *Effects) void {
+fn initEffects(model: *Model, effects: WidgetEffects) void {
     for (model.images[0..model.image_count]) |image| {
         _ = effects.registerImageBytes(image.id, image.bytes) catch |err| {
             if (findImageState(model, @intCast(image.id))) |state| {
@@ -172,7 +306,7 @@ fn initEffects(model: *Model, effects: *Effects) void {
 
 /// One SDK timer delivery is one JS batch. All retained-tree ops complete
 /// before update returns, after which UiApp derives and presents once.
-fn update(model: *Model, msg: Msg, effects: *Effects) void {
+fn update(model: *Model, msg: Msg, effects: WidgetEffects) void {
     // A per-launch provider endpoint has no reconnection protocol. A runtime-
     // detected macOS command write failure is therefore process-fatal: exit
     // after the current JS/native batch and let host crash supervision create
@@ -248,12 +382,7 @@ fn update(model: *Model, msg: Msg, effects: *Effects) void {
             // OS drags report continuously. Re-starting the same key
             // REPLACES the pending one-shot, so the disk write lands
             // once, after the gesture settles.
-            effects.startTimer(.{
-                .key = geometry_save_key,
-                .interval_ms = 400,
-                .mode = .one_shot,
-                .on_fire = Effects.timerMsg(.timer),
-            });
+            effects.startTimer(geometry_save_key, 400, .one_shot);
         },
         .canvas_layout => {},
         .canvas_frame => |timestamp_ns| {
@@ -285,7 +414,7 @@ fn exitOnFatalProviderChannel(model: *const Model) void {
     std.process.exit(1);
 }
 
-fn dispatchPressEvent(model: *Model, effects: *Effects, kind: []const u8, event: native_sdk.canvas.WidgetPressEvent) void {
+fn dispatchPressEvent(model: *Model, effects: WidgetEffects, kind: []const u8, event: native_sdk.canvas.WidgetPressEvent) void {
     const id = retainedPressNodeId(&model.tree, event.target_id) orelse {
         std.log.warn("widget {s} target {d} has no retained node", .{ kind, event.target_id });
         return;
@@ -347,10 +476,7 @@ fn persistGeometry(model: *Model) void {
     std.log.info("widget position persisted x={d} y={d}", .{ pending.x, pending.y });
 }
 
-/// Every frame report maps to a Msg; the model decides what is a real
-/// move. During the drag itself the OS owns the window — nothing here
-/// touches JS or invalidates the presented surface.
-fn onWindowFrame(event: native_sdk.runtime.WindowFrameEvent) ?Msg {
+fn onWindowFrame(event: native_sdk.runtime.WindowFrameEvent) Msg {
     return Msg{ .frame_moved = .{
         .x = event.frame.x,
         .y = event.frame.y,
@@ -358,7 +484,7 @@ fn onWindowFrame(event: native_sdk.runtime.WindowFrameEvent) ?Msg {
     } };
 }
 
-fn drainProviderFrames(model: *Model, _: *Effects) !void {
+fn drainProviderFrames(model: *Model, _: WidgetEffects) !void {
     const count = try (model.engine orelse return).drainProviders();
     if (count == 0) return;
     model.provider_frames += count;
@@ -370,7 +496,7 @@ fn drainProviderFrames(model: *Model, _: *Effects) !void {
     if (count > 1) model.provider_batch_logged = true;
 }
 
-fn dispatchProviderFrames(model: *Model, effects: *Effects, trigger: []const u8) void {
+fn dispatchProviderFrames(model: *Model, effects: WidgetEffects, trigger: []const u8) void {
     drainProviderFrames(model, effects) catch |err| {
         model.provider_dispatch_failures += 1;
         if (model.provider_dispatch_failures == 1) {
@@ -387,7 +513,7 @@ fn dispatchProviderFrames(model: *Model, effects: *Effects, trigger: []const u8)
     }
 }
 
-fn reloadIfChanged(model: *Model, effects: *Effects) !void {
+fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
     const io = model.io orelse return;
     const stat = try std.Io.Dir.cwd().statFile(io, model.bundle_path, .{});
     const mtime = stat.mtime.nanoseconds;
@@ -455,7 +581,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
     return candidate;
 }
 
-fn syncTimers(model: *Model, effects: *Effects) void {
+fn syncTimers(model: *Model, effects: WidgetEffects) void {
     const engine = model.engine orelse return;
     for (&model.armed_timers) |*armed| {
         if (armed.id == 0) continue;
@@ -483,21 +609,11 @@ fn syncTimers(model: *Model, effects: *Effects) void {
         }
         const armed = slot orelse continue;
         if (armed.id == timer.id and armed.interval_ms == timer.interval_ms) continue;
-        effects.startTimer(.{
-            .key = timer.id,
-            .interval_ms = timer.interval_ms,
-            .mode = .repeating,
-            .on_fire = Effects.timerMsg(.timer),
-        });
+        effects.startTimer(timer.id, timer.interval_ms, .repeating);
         armed.* = .{ .id = timer.id, .interval_ms = timer.interval_ms };
     }
     if (engine.hasActiveFetches() and !model.fetch_poll_armed) {
-        effects.startTimer(.{
-            .key = fetch_poll_key,
-            .interval_ms = 25,
-            .mode = .repeating,
-            .on_fire = Effects.timerMsg(.timer),
-        });
+        effects.startTimer(fetch_poll_key, 25, .repeating);
         model.fetch_poll_armed = true;
     } else if (!engine.hasActiveFetches() and model.fetch_poll_armed) {
         effects.cancelTimer(fetch_poll_key);
@@ -522,12 +638,7 @@ fn syncTimers(model: *Model, effects: *Effects) void {
     // the canvas clock and provider delivery returns to its 30 Hz path.
     const provider_interval_ms = if (model.provider_poll_interval_ms <= 33 and !has_fast_clock) @as(u64, 1000) else model.provider_poll_interval_ms;
     if (needs_provider_timer and !model.provider_poll_armed) {
-        effects.startTimer(.{
-            .key = provider_poll_key,
-            .interval_ms = provider_interval_ms,
-            .mode = .repeating,
-            .on_fire = Effects.timerMsg(.timer),
-        });
+        effects.startTimer(provider_poll_key, provider_interval_ms, .repeating);
         model.provider_poll_armed = true;
     } else if (!needs_provider_timer and model.provider_poll_armed) {
         effects.cancelTimer(provider_poll_key);
@@ -537,12 +648,7 @@ fn syncTimers(model: *Model, effects: *Effects) void {
     if (deadline_ms) |deadline| {
         if (model.media_deadline_ms != deadline) {
             const now_ms = model.provider.nowMilliseconds();
-            effects.startTimer(.{
-                .key = media_deadline_key,
-                .interval_ms = mediaDeadlineDelay(deadline, now_ms),
-                .mode = .one_shot,
-                .on_fire = Effects.timerMsg(.timer),
-            });
+            effects.startTimer(media_deadline_key, mediaDeadlineDelay(deadline, now_ms), .one_shot);
             model.media_deadline_ms = deadline;
         }
     } else if (model.media_deadline_ms != 0) {
@@ -601,28 +707,28 @@ fn syncNativeState(model: *Model, layout: native_sdk.canvas.WidgetLayoutTree) vo
     }
 }
 
-fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
-    if (!logged_backend) {
-        logged_backend = true;
+fn onFrame(model: *Model, frame: native_sdk.platform.GpuFrame) ?Msg {
+    if (!model.logged_backend) {
+        model.logged_backend = true;
         std.log.info("widget host surface backend={s}", .{@tagName(frame.backend)});
-        publishBackendStatus(frame.backend);
-    } else if (frame.backend != last_backend) {
-        if ((last_backend == .d3d11 or last_backend == .metal) and frame.backend == .software) {
-            std.log.warn("widget renderer demoted {s} -> software", .{@tagName(last_backend)});
-        } else if (last_backend == .software and (frame.backend == .d3d11 or frame.backend == .metal)) {
+        publishBackendStatus(model, frame.backend);
+    } else if (frame.backend != model.last_backend) {
+        if ((model.last_backend == .d3d11 or model.last_backend == .metal) and frame.backend == .software) {
+            std.log.warn("widget renderer demoted {s} -> software", .{@tagName(model.last_backend)});
+        } else if (model.last_backend == .software and (frame.backend == .d3d11 or frame.backend == .metal)) {
             std.log.info("widget renderer promoted software -> {s}", .{@tagName(frame.backend)});
         } else {
-            std.log.info("widget renderer backend changed {s} -> {s}", .{ @tagName(last_backend), @tagName(frame.backend) });
+            std.log.info("widget renderer backend changed {s} -> {s}", .{ @tagName(model.last_backend), @tagName(frame.backend) });
         }
-        publishBackendStatus(frame.backend);
+        publishBackendStatus(model, frame.backend);
     }
-    last_backend = frame.backend;
-    if (!logged_present_path) {
+    model.last_backend = frame.backend;
+    if (!model.logged_present_path) {
         if (diagnostic_runtime) |runtime| {
             var view_buffer: [1]native_sdk.platform.ViewInfo = undefined;
             for (runtime.listViews(frame.window_id, &view_buffer)) |view_info| {
                 if (!std.mem.eql(u8, view_info.label, frame.label)) continue;
-                logged_present_path = true;
+                model.logged_present_path = true;
                 std.log.info("widget presenter path={s}", .{@tagName(view_info.gpu_present_path)});
             }
         }
@@ -635,20 +741,15 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     // reaches the renderer. The completion event itself is the 60 Hz canvas
     // clock, so do not suppress it by comparing the pre-present revision in
     // the platform event; doing so parks max-rate canvases after frame one.
-    if (first_render_ns == 0) first_render_ns = frame.timestamp_ns;
-    rendered_presents += 1;
-    if (rendered_presents % 300 == 0) {
-        const elapsed_ns = frame.timestamp_ns -| first_render_ns;
-        std.log.info("widget present: {d} rendered frames in {d} ms", .{ rendered_presents, elapsed_ns / std.time.ns_per_ms });
+    if (model.first_render_ns == 0) model.first_render_ns = frame.timestamp_ns;
+    model.rendered_presents += 1;
+    if (model.rendered_presents % 300 == 0) {
+        const elapsed_ns = frame.timestamp_ns -| model.first_render_ns;
+        std.log.info("widget present: {d} rendered frames in {d} ms", .{ model.rendered_presents, elapsed_ns / std.time.ns_per_ms });
     }
     return Msg{ .canvas_frame = frame.timestamp_ns };
 }
 
-/// The dev bundle listener runs off-thread. It only publishes the atomic
-/// pending bit and requests a platform frame; this loop-thread hook turns
-/// that frame boundary into the ordinary update/rebuild path. Static widgets
-/// therefore hot-swap without borrowing a GPU completion from animation,
-/// input, or resize.
 /// Layout sizes a canvas after the retained tree is built, but the SDK learns
 /// that size only through `syncNativeState`, which Native runs at the start of
 /// the next dispatch. A widget with nothing else to dispatch (a fixed-clock
@@ -672,15 +773,8 @@ fn canvasLayoutStale(model: *const Model, frame: native_sdk.platform.GpuFrame) b
     return false;
 }
 
-fn onFrameRequested(_: *const Model) ?Msg {
-    const provider = provider_wake_pending.swap(false, .acq_rel);
-    const dev = dev_reload_pending.swap(false, .acq_rel);
-    if (!provider and !dev) return null;
-    return .{ .external_wake = .{ .provider = provider, .dev_reload = dev } };
-}
-
-fn view(ui: *WidgetUi, model: *const Model) WidgetUi.Node {
-    if (widget_log.failed()) {
+fn view(ui: *WidgetUi, model: *Model) WidgetUi.Node {
+    if (widget_log.failed(model.log)) {
         const foreground = native_sdk.canvas.Color.rgba8(255, 226, 230, 255);
         const label = ui.text(.{
             .text_scale = 0.86,
@@ -703,13 +797,13 @@ fn view(ui: *WidgetUi, model: *const Model) WidgetUi.Node {
     projection_failed_this_view = false;
     const root_id = model.tree.root orelse return projectionFailurePanel(ui, true);
     const depth = loweredDepth(model, root_id);
-    depth_limit_exceeded = depth > native_sdk.canvas.max_widget_depth;
-    if (depth_limit_exceeded) return depthLimitPanel(ui, depth);
-    depth_limit_reported = false;
+    model.depth_limit_exceeded = depth > native_sdk.canvas.max_widget_depth;
+    if (model.depth_limit_exceeded) return depthLimitPanel(ui, model, depth);
+    model.depth_limit_reported = false;
     const result = buildNode(ui, model, root_id, true);
-    if (!projection_failed_this_view and projection_failure_latched) {
+    if (!projection_failed_this_view and model.projection_failure_latched) {
         std.log.info("widget native projection recovered after a degraded frame", .{});
-        projection_failure_latched = false;
+        model.projection_failure_latched = false;
     }
     return result;
 }
@@ -718,7 +812,7 @@ fn view(ui: *WidgetUi, model: *const Model) WidgetUi.Node {
 /// log-failure fallback. Immediate Canvas pixels deliberately use their own
 /// generation and are projected by `projectSameViewUpdate` below.
 fn viewRevision(model: *const Model) u64 {
-    return model.tree.generation *% 2 +% @intFromBool(widget_log.failed());
+    return model.tree.generation *% 2 +% @intFromBool(widget_log.failed(model.log));
 }
 
 /// Native surface requests are one-shot. A registered canvas callback owns
@@ -795,10 +889,10 @@ fn projectSameViewUpdate(
     return true;
 }
 
-fn noteProjectionFailure(comptime format: []const u8, args: anytype) void {
+fn noteProjectionFailure(model: *Model, comptime format: []const u8, args: anytype) void {
     projection_failed_this_view = true;
-    if (projection_failure_latched) return;
-    projection_failure_latched = true;
+    if (model.projection_failure_latched) return;
+    model.projection_failure_latched = true;
     std.log.err(format ++ "; marking this frame degraded and suppressing repeats until recovery", args);
 }
 
@@ -843,17 +937,17 @@ fn loweredDepth(model: *const Model, id: tree_mod.NodeId) usize {
 /// the widget blank with no error, and building a tree a few hundred levels
 /// deep overflowed the native stack first (~70 KiB per level) and killed the
 /// process. Refuse the whole view by name before building any of it.
-fn depthLimitPanel(ui: *WidgetUi, depth: usize) WidgetUi.Node {
+fn depthLimitPanel(ui: *WidgetUi, model: *Model, depth: usize) WidgetUi.Node {
     const limit = native_sdk.canvas.max_widget_depth;
-    if (!depth_limit_reported) {
-        depth_limit_reported = true;
+    if (!model.depth_limit_reported) {
+        model.depth_limit_reported = true;
         widget_diagnostic.report(
             "WidgetDepthExceeded: the widget tree nests {d} levels; the limit is max_widget_depth={d}, asked for {d}. Painted <row>/<column>/<stack> elements and <panel> count as two levels. Flatten nested containers or move deep content into a <canvas>.",
             .{ depth, limit, depth },
         );
     }
     projection_failed_this_view = true;
-    projection_failure_latched = true;
+    model.projection_failure_latched = true;
     const foreground = native_sdk.canvas.Color.rgba8(255, 226, 230, 255);
     const message = std.fmt.allocPrint(ui.arena, "WidgetDepthExceeded\nThis widget nests {d} levels; the limit is {d}. Flatten nested containers.", .{ depth, limit }) catch
         "WidgetDepthExceeded\nThis widget nests too many levels. Flatten nested containers.";
@@ -904,7 +998,7 @@ fn nativeInteractionStyle(style: tree_mod.InteractionStyle) ?native_sdk.canvas.W
     };
 }
 
-fn attachEffects(ui: *WidgetUi, retained: *const tree_mod.Node, font_id: ?native_sdk.canvas.FontId, source: WidgetUi.Node) WidgetUi.Node {
+fn attachEffects(ui: *WidgetUi, model: *Model, retained: *const tree_mod.Node, font_id: ?native_sdk.canvas.FontId, source: WidgetUi.Node) WidgetUi.Node {
     var icon_elements: ?[]const native_sdk.canvas.PathElement = null;
     const corner_radii: native_sdk.canvas.WidgetCornerRadii = .{
         .top_left = nativeCornerRadius(retained.radius_top_left),
@@ -913,7 +1007,7 @@ fn attachEffects(ui: *WidgetUi, retained: *const tree_mod.Node, font_id: ?native
         .bottom_left = nativeCornerRadius(retained.radius_bottom_left),
     };
     const gradient_commands = gradient_mod.decode(ui.arena, retained.backgroundGradientSlice()) catch |err| block: {
-        if (retained.backgroundGradientSlice().len > 0) noteProjectionFailure("widget gradient projection failed: cause={s}", .{@errorName(err)});
+        if (retained.backgroundGradientSlice().len > 0) noteProjectionFailure(model, "widget gradient projection failed: cause={s}", .{@errorName(err)});
         break :block &.{};
     };
     if (retained.iconPathSlice().len > 0) {
@@ -941,7 +1035,7 @@ fn attachEffects(ui: *WidgetUi, retained: *const tree_mod.Node, font_id: ?native
     if (count == 0) return source;
     const existing = source.widget.immediate_commands;
     const combined = ui.arena.alloc(native_sdk.canvas.ImmediateCanvasCommand, existing.len + count) catch |err| {
-        noteProjectionFailure("widget effect projection failed: cause={s}", .{@errorName(err)});
+        noteProjectionFailure(model, "widget effect projection failed: cause={s}", .{@errorName(err)});
         return source;
     };
     @memcpy(combined[0..existing.len], existing);
@@ -984,9 +1078,9 @@ fn attachEffects(ui: *WidgetUi, retained: *const tree_mod.Node, font_id: ?native
     return result;
 }
 
-fn buildNode(ui: *WidgetUi, model: *const Model, id: tree_mod.NodeId, is_root: bool) WidgetUi.Node {
+fn buildNode(ui: *WidgetUi, model: *Model, id: tree_mod.NodeId, is_root: bool) WidgetUi.Node {
     const retained = model.tree.nodeConst(id) catch |err| {
-        noteProjectionFailure("widget retained-node projection failed: node={d}, cause={s}", .{ id, @errorName(err) });
+        noteProjectionFailure(model, "widget retained-node projection failed: node={d}, cause={s}", .{ id, @errorName(err) });
         return projectionFailurePanel(ui, is_root);
     };
     var options: WidgetUi.ElementOptions = .{
@@ -1054,10 +1148,10 @@ fn buildNode(ui: *WidgetUi, model: *const Model, id: tree_mod.NodeId, is_root: b
         },
         .hover_style = nativeInteractionStyle(retained.hover_style),
         .pressed_style = nativeInteractionStyle(retained.pressed_style),
-        .on_press_event = if (retained.handles_press) WidgetUi.pressMsg(.press) else null,
-        .on_double_press_event = if (retained.handles_double_press) WidgetUi.pressMsg(.double_press) else null,
-        .on_right_press_event = if (retained.handles_right_press) WidgetUi.pressMsg(.right_press) else null,
-        .on_change = if (retained.handles_change) Msg{ .slider = id } else null,
+        .on_press_event = if (retained.handles_press) press_msgs[model.slot] else null,
+        .on_double_press_event = if (retained.handles_double_press) double_press_msgs[model.slot] else null,
+        .on_right_press_event = if (retained.handles_right_press) right_press_msgs[model.slot] else null,
+        .on_change = if (retained.handles_change) HostMsg{ .widget = model.slot, .msg = .{ .slider = id } } else null,
     };
     // Weaver buttons use Native's panel primitive so TSX utility styling is
     // the complete visual contract. Preserve the control semantics explicitly:
@@ -1091,7 +1185,7 @@ fn buildNode(ui: *WidgetUi, model: *const Model, id: tree_mod.NodeId, is_root: b
                 .medium => .medium,
                 .semibold, .bold => .bold,
             };
-            return attachEffects(ui, retained, resolveFontId(retained, model.fonts), ui.text(options, retained.textSlice()));
+            return attachEffects(ui, model, retained, resolveFontId(model, retained), ui.text(options, retained.textSlice()));
         }
         const span = [_]native_sdk.canvas.TextSpan{.{
             .text = retained.textSlice(),
@@ -1102,13 +1196,14 @@ fn buildNode(ui: *WidgetUi, model: *const Model, id: tree_mod.NodeId, is_root: b
             },
             .scale = retained.font_scale,
         }};
-        return attachEffects(ui, retained, resolveFontId(retained, model.fonts), ui.paragraph(options, &span));
+        return attachEffects(ui, model, retained, resolveFontId(model, retained), ui.paragraph(options, &span));
     }
     // Leaves drop their retained children; building them anyway would only
     // spend stack (and, deep enough, overflow it) for nodes nobody draws.
     const child_count: usize = if (emitsChildren(retained.kind)) retained.child_count else 0;
     const children = ui.arena.alloc(WidgetUi.Node, child_count) catch |err| {
         noteProjectionFailure(
+            model,
             "widget child projection capacity exhausted: node={d}, asked for {d}, cause={s}",
             .{ id, retained.child_count, @errorName(err) },
         );
@@ -1192,16 +1287,34 @@ fn buildNode(ui: *WidgetUi, model: *const Model, id: tree_mod.NodeId, is_root: b
                     break :block ui.panel(options, .{ui.text(label_options, imageFailureLabel(image_state))});
                 }
             }
-            options.image = id;
+            options.image = slotted(model.slot, id);
             break :block ui.image(options);
         },
         .canvas => ui.immediateCanvas(options, (model.tree.canvasStateConst(id) catch |err| {
-            noteProjectionFailure("widget canvas projection failed: node={d}, cause={s}", .{ id, @errorName(err) });
+            noteProjectionFailure(model, "widget canvas projection failed: node={d}, cause={s}", .{ id, @errorName(err) });
             return projectionFailurePanel(ui, is_root);
         }).slice()),
         .text => unreachable,
     };
-    return attachEffects(ui, retained, null, result);
+    return attachEffects(ui, model, retained, null, result);
+}
+
+/// Press handlers take only the event, so each slot gets its own comptime
+/// constructor that addresses the Msg to that widget.
+const press_msgs = pressMsgs(.press);
+const double_press_msgs = pressMsgs(.double_press);
+const right_press_msgs = pressMsgs(.right_press);
+
+fn pressMsgs(comptime tag: std.meta.Tag(Msg)) [max_host_widgets]WidgetUi.PressMsgFn {
+    var fns: [max_host_widgets]WidgetUi.PressMsgFn = undefined;
+    for (&fns, 0..) |*make_fn, slot| {
+        make_fn.* = struct {
+            fn make(press: native_sdk.canvas.WidgetPressEvent) HostMsg {
+                return .{ .widget = slot, .msg = @unionInit(Msg, @tagName(tag), press) };
+            }
+        }.make;
+    }
+    return fns;
 }
 
 fn firstDescendantText(tree: *const tree_mod.Tree, id: tree_mod.NodeId) []const u8 {
@@ -1214,7 +1327,12 @@ fn firstDescendantText(tree: *const tree_mod.Tree, id: tree_mod.NodeId) []const 
     return "";
 }
 
-fn resolveFontId(node: *const tree_mod.Node, fonts: []const manifest_mod.Font) ?native_sdk.canvas.FontId {
+fn resolveFontId(model: *const Model, node: *const tree_mod.Node) ?native_sdk.canvas.FontId {
+    const id = resolveManifestFontId(node, model.fonts) orelse return null;
+    return if (id == native_sdk.canvas.default_mono_font_id) id else slotted(model.slot, id);
+}
+
+fn resolveManifestFontId(node: *const tree_mod.Node, fonts: []const manifest_mod.Font) ?native_sdk.canvas.FontId {
     const requested = node.fontFamilySlice();
     // Null means "use Native's ordinary sans + weight resolution" and
     // keeps the overwhelmingly common path free of a metadata command.
@@ -1234,8 +1352,8 @@ fn resolveFontId(node: *const tree_mod.Node, fonts: []const manifest_mod.Font) ?
     return if (best) |font| font.id else null;
 }
 
-fn loadFonts(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, fonts: []const manifest_mod.Font) ![]const WidgetApp.FontRegistration {
-    const registrations = try allocator.alloc(WidgetApp.FontRegistration, fonts.len);
+fn loadFonts(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, fonts: []const manifest_mod.Font) ![]const HostApp.FontRegistration {
+    const registrations = try allocator.alloc(HostApp.FontRegistration, fonts.len);
     for (fonts, 0..) |font, index| {
         const path = try std.fs.path.join(allocator, &.{ directory, font.file });
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(native_sdk.runtime.max_registered_canvas_font_bytes));
@@ -1300,7 +1418,7 @@ fn addImageState(model: *Model, id: tree_mod.NodeId, lifetime: u64) !*ImageState
     return state;
 }
 
-fn removeImageState(model: *Model, effects: *Effects, index: usize) void {
+fn removeImageState(model: *Model, effects: WidgetEffects, index: usize) void {
     const state = &model.image_states[index];
     if (state.registered) _ = effects.unregisterImage(state.id);
     if (state.observed) |observed| std.heap.page_allocator.free(observed);
@@ -1346,7 +1464,7 @@ fn invalidImageSourceError(err: anyerror) bool {
     };
 }
 
-fn synchronizeImageNode(model: *Model, effects: *Effects, id: tree_mod.NodeId, node: *const tree_mod.Node) !void {
+fn synchronizeImageNode(model: *Model, effects: WidgetEffects, id: tree_mod.NodeId, node: *const tree_mod.Node) !void {
     const resolver = model.image_resolver orelse return;
     const state = findImageState(model, id) orelse try addImageState(model, id, node.lifetime);
     const resolved = resolver.resolve(node.sourceSlice()) catch |err| {
@@ -1420,7 +1538,7 @@ test "image reload failures retry twice then settle until the source changes" {
 /// Runs after every app-loop turn, but the generation equality is the static
 /// fast path. A changed image is decoded before its same-ID resource is
 /// replaced; invalid/dead/reused nodes are unregistered explicitly.
-fn synchronizeImages(model: *Model, effects: *Effects) !void {
+fn synchronizeImages(model: *Model, effects: WidgetEffects) !void {
     if (model.tree.generation == model.image_tree_generation) return;
     const synchronized_generation = model.tree.generation;
 
@@ -1456,22 +1574,20 @@ fn nativeWindowLayers(manifest_layer: []const u8) NativeWindowLayers {
     return .{ .shell = .normal, .startup = .normal };
 }
 
-/// `WidgetApp.create` default-initializes the Model with `self.model = .{}`,
-/// which copies its whole default image: 4.3 MB, almost all of it the retained
-/// tree's node and canvas arenas, made resident in every Widget before the
-/// tree uses a slot. Setting the Model one field at a time, and the tree
-/// through `resetEmpty`, leaves the arenas untouched until nodes occupy them.
-fn createWidgetApp(options: WidgetApp.Options) !*WidgetApp {
-    const app = try std.heap.page_allocator.create(WidgetApp);
-    WidgetApp.initInPlace(app, std.heap.page_allocator, options);
+/// A widget's Model, allocated and set one field at a time: `.{}` would copy
+/// the whole default image (4.3 MB, almost all of it the retained tree's
+/// node and canvas arenas) and make it resident before the tree uses a slot.
+/// The tree starts through `resetEmpty`, which leaves the arenas untouched.
+fn createModel() !*Model {
+    const model = try std.heap.page_allocator.create(Model);
     inline for (std.meta.fields(Model)) |field| {
         if (comptime std.mem.eql(u8, field.name, "tree")) {
-            tree_mod.resetEmpty(&app.model.tree, std.heap.page_allocator);
+            tree_mod.resetEmpty(&model.tree, std.heap.page_allocator);
         } else {
-            @field(app.model, field.name) = field.defaultValue().?;
+            @field(model, field.name) = field.defaultValue().?;
         }
     }
-    return app;
+    return model;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1492,55 +1608,252 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const capture_state_root = init.environ_map.get("WEAVER_CAPTURE_STATE_ROOT");
+    if (capture_state_root == null and args.len >= 3 and std.mem.eql(u8, args[1], "--host")) {
+        return runHost(init, args[2..], false, true);
+    }
     const dev = capture_state_root == null and args.len == 3 and std.mem.eql(u8, args[1], "--dev");
     if ((!dev and args.len != 2) or (dev and args.len != 3)) {
         // The render-host form is parsed only on macOS; advertise it only
         // where it is accepted.
         std.debug.print(if (weaver_build_options.render_host_enabled)
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --render-host <bootstrap-name>\n"
+            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
         else
-            "usage: weaver-widget [--dev] <widget-directory>\n", .{});
+            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>...\n", .{});
         return error.InvalidArguments;
     }
-    const directory = args[if (dev) 2 else 1];
-    const loaded = try manifest_mod.load(init.io, allocator, directory);
-    const capture_provider_fixture = if (init.environ_map.get("WEAVER_CAPTURE_PROVIDER_FIXTURE")) |path|
-        try loadCaptureProviderFixture(init.io, allocator, path, loaded.manifest.subscribe, loaded.manifest.capabilities)
-    else
-        null;
-    var capture_command_fixture: provider_mod.CaptureCommandFixture = .{};
-    const force_software = if (init.environ_map.get("WEAVER_FORCE_SOFTWARE")) |value|
-        std.mem.eql(u8, value, "1")
-    else
-        false;
-    const renderer_backend = declaredGpuBackend(loaded.manifest.renderBackend, force_software);
+    const directory_arg: usize = if (dev) 2 else 1;
+    return runHost(init, args[directory_arg .. directory_arg + 1], dev, false);
+}
+
+/// Process-wide inputs every widget load shares.
+const HostEnvironment = struct {
+    init: std.process.Init,
+    data_root: []const u8,
+    log_directory: []const u8,
+    capture_state_root: ?[]const u8,
+    force_software: bool,
+    dev: bool,
+    /// Launched as `--host`: per-widget settings arrive as
+    /// `<NAME>_<argument>` environment variables.
+    hosted: bool,
+
+    /// A per-widget environment setting: `name` for a one-widget launch,
+    /// `name_<argument>` for the widget at that `--host` position.
+    fn widgetSetting(self: HostEnvironment, comptime name: []const u8, argument: u16) ?[]const u8 {
+        if (!self.hosted) return self.init.environ_map.get(name);
+        var buffer: [name.len + 8]u8 = undefined;
+        const key = std.fmt.bufPrint(&buffer, name ++ "_{d}", .{argument}) catch unreachable;
+        return self.init.environ_map.get(key);
+    }
+};
+
+/// Run every widget in `directories` in this one process: one Native app,
+/// one window per widget. Slot 0 is the scene's main window. A single
+/// directory is the ordinary one-widget runtime.
+fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool) !void {
+    const allocator = init.arena.allocator();
+    if (directories.len > max_host_widgets) {
+        std.debug.print("weaver-widget --host: {d} widget directories; the limit is max_host_widgets={d}, asked for {d}\n", .{ directories.len, max_host_widgets, directories.len });
+        return error.TooManyWidgets;
+    }
+    if (builtin.os.tag != .windows and directories.len > 1) {
+        // Declared windows take an explicit origin; macOS widgets anchor to
+        // the primary display through the startup window only.
+        std.debug.print("weaver-widget --host runs one widget per process on this platform\n", .{});
+        return error.MultiWidgetHostUnsupported;
+    }
+    const capture_state_root = init.environ_map.get("WEAVER_CAPTURE_STATE_ROOT");
     backend_status_io = init.io;
-    backend_status_path = init.environ_map.get("WEAVER_BACKEND_FILE");
+    if (hosted) {
+        if (init.environ_map.get("WEAVER_CRASH_BREADCRUMB")) |name| crash_breadcrumb.open(name);
+    }
     const local_app_data = init.environ_map.get("LOCALAPPDATA");
     const home = init.environ_map.get("HOME");
     // Capture receives its own empty state root from the CLI. Keeping the
     // branch here, beside the ordinary bootstrap, makes it impossible for a
     // headless run to inherit live storage, geometry, or per-widget logs.
-    const data_root = if (capture_state_root) |root| root else try platform.dataRoot(allocator, local_app_data, home);
-    const log_directory = if (capture_state_root) |root|
-        try std.fs.path.join(allocator, &.{ root, "logs" })
-    else
-        try platform.logsRoot(allocator, local_app_data, home);
-    try std.Io.Dir.cwd().createDirPath(init.io, log_directory);
-    const log_name = try safeLogName(allocator, loaded.manifest.name);
-    const log_path = try std.fs.path.join(allocator, &.{ log_directory, log_name });
-    try widget_log.init(init.io, log_path);
+    const environment: HostEnvironment = .{
+        .init = init,
+        .data_root = if (capture_state_root) |root| root else try platform.dataRoot(allocator, local_app_data, home),
+        .log_directory = if (capture_state_root) |root|
+            try std.fs.path.join(allocator, &.{ root, "logs" })
+        else
+            try platform.logsRoot(allocator, local_app_data, home),
+        .capture_state_root = capture_state_root,
+        .force_software = if (init.environ_map.get("WEAVER_FORCE_SOFTWARE")) |value| std.mem.eql(u8, value, "1") else false,
+        .dev = dev,
+        .hosted = hosted,
+    };
+    try std.Io.Dir.cwd().createDirPath(init.io, environment.log_directory);
     // That capture log is deleted with the state root, so widget diagnostics
     // also go to a file the CLI copies into the capture receipt.
     if (capture_state_root) |root| {
         widget_diagnostic.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "diagnostic.txt" }));
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
-    std.log.info("widget runtime starting pid={d}{s}", .{ platform.currentProcessId(), if (dev) " dev=true" else "" });
-    var storage = try storage_mod.Store.init(init.io, allocator, data_root, loaded.manifest.name);
+
+    var widgets: std.ArrayList(*Model) = .empty;
+    for (directories, 0..) |directory, argument| {
+        const slot: u16 = @intCast(widgets.items.len);
+        const model = loadWidget(environment, directory, slot, @intCast(argument)) catch |err| {
+            // One widget's broken install must not keep the others off the
+            // desktop; a lone widget fails the process as it always has.
+            if (directories.len == 1) return err;
+            std.debug.print("weaver-widget --host: skipping {s}: {s}\n", .{ directory, @errorName(err) });
+            continue;
+        };
+        try widgets.append(allocator, model);
+    }
+    if (widgets.items.len == 0) return error.NoWidgetLoaded;
+    defer for (widgets.items) |model| unloadWidget(model);
+
+    // Every widget's faces register with the one runtime, each under its
+    // own slot's ids (`resolveFontId`).
+    var fonts: std.ArrayList(HostApp.FontRegistration) = .empty;
+    for (widgets.items, directories[0..widgets.items.len]) |model, directory| {
+        for (try loadFonts(init.io, allocator, directory, model.fonts)) |registration| {
+            var slotted_registration = registration;
+            slotted_registration.id = slotted(model.slot, registration.id);
+            try fonts.append(allocator, slotted_registration);
+        }
+    }
+
+    const first = widgets.items[0];
+    widget_log.use(first.log);
+    const shell_views = [_]native_sdk.ShellView{.{
+        .label = main_canvas_label,
+        .kind = .gpu_surface,
+        .fill = true,
+        .role = "Weaver widget canvas",
+        .accessibility_label = first.window.name,
+        .gpu_backend = first.window.backend,
+        .gpu_pixel_format = .bgra8_unorm,
+        .gpu_present_mode = .timer,
+        .gpu_alpha_mode = .premultiplied,
+        .gpu_color_space = .srgb,
+        .gpu_vsync = true,
+    }};
+    const shell_windows = [_]native_sdk.ShellWindow{.{
+        .label = main_window_label,
+        .title = first.window.name,
+        .width = first.window.frame.width,
+        .height = first.window.frame.height,
+        .x = first.window.frame.x,
+        .y = first.window.frame.y,
+        .resizable = false,
+        .restore_state = false,
+        .titlebar = .chromeless,
+        .transparent = true,
+        .layer = first.window.layer.shell,
+        .click_through = first.window.click_through,
+        .no_activate = true,
+        .views = &shell_views,
+    }};
+    var tokens = native_sdk.canvas.DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark });
+    tokens.colors.background = native_sdk.canvas.Color.rgba8(0, 0, 0, 0);
+    const app_state = try std.heap.page_allocator.create(HostApp);
+    HostApp.initInPlace(app_state, std.heap.page_allocator, .{
+        .name = first.window.name,
+        .scene = .{ .windows = &shell_windows },
+        .canvas_label = main_canvas_label,
+        .tokens = tokens,
+        .fonts = fonts.items,
+        .update_fx = hostUpdate,
+        .view_revision = hostViewRevision,
+        .window_view_revision = hostWindowViewRevision,
+        .project_update = hostProjectUpdate,
+        .init_fx = hostInitEffects,
+        .view = hostView,
+        .window_view = hostWindowView,
+        .windows_fn = hostWindows,
+        .sync = hostSync,
+        .window_sync = hostWindowSync,
+        .on_frame = hostOnFrame,
+        .window_on_frame = hostWindowOnFrame,
+        .on_frame_requested = hostOnFrameRequested,
+        .on_window_frame = hostOnWindowFrame,
+    });
+    defer app_state.destroy();
+    app_state.model = .{ .widgets = widgets.items };
+
+    // `--dev` is a one-widget mode: its listener hot-swaps slot 0.
+    const dev_signal_path = try std.fs.path.join(allocator, &.{ directories[0], dev_reload.signal_file_name });
+    var dev_reload_server: dev_reload.Server = .{};
+    if (dev) try dev_reload_server.start(init.io, dev_signal_path, wakeFns(&dev_reload_pending)[0]);
+    defer if (dev) {
+        dev_reload_server.deinit();
+        dev_reload_pending[0].store(false, .release);
+    };
+    defer {
+        wake_runtime.store(0, .release);
+        for (&provider_wake_pending) |*pending| pending.store(false, .release);
+    }
+    var app = app_state.app();
+    app.start_fn = startRendererDiagnostics;
+    if (capture_state_root != null) {
+        app.capture_clock_advance_fn = advanceCaptureClock;
+        app.capture_pending_fn = capturePendingWork;
+        app.capture_validate_fn = validateCapture;
+    }
+    runner.runWithOptions(app, .{
+        .app_name = "weaver-widget",
+        .window_title = first.window.name,
+        .bundle_id = "com.weaver.widget",
+        .default_frame = first.window.frame,
+        // A dragged origin places the window explicitly (macOS reads the
+        // frame only when restore is set, then clamps it in AppKit); the
+        // manifest anchor stays the placement until that first drag.
+        .restore_state = first.window.dragged,
+        // Weaver owns placement persistence (debounced, per-widget,
+        // atomic). The substrate's bundle-id-keyed store would make
+        // every widget process rewrite one shared windows.zon on each
+        // move tick.
+        .persist_window_state = false,
+        .primary_display_anchor = if (builtin.os.tag == .macos and !first.window.dragged) first.window.primary_display_anchor else null,
+        .startup_window_layer = first.window.layer.startup,
+        .startup_click_through = first.window.click_through,
+        .js_window_api = false,
+    }, init) catch |err| {
+        std.log.err("widget runtime stopped after platform callback failure: {s}", .{@errorName(err)});
+        return err;
+    };
+}
+
+/// Load one widget into `slot`: its manifest, log, storage, placement,
+/// provider channel, and engine, then evaluate its bundle. Everything it
+/// allocates lives as long as the process.
+fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, argument: u16) !*Model {
+    const init = environment.init;
+    const allocator = init.arena.allocator();
+    const capture_state_root = environment.capture_state_root;
+    const loaded = try manifest_mod.load(init.io, allocator, directory);
+    const model = try createModel();
+    errdefer std.heap.page_allocator.destroy(model);
+    model.slot = slot;
+    model.argument = argument;
+    crash_breadcrumb.mark(argument);
+    model.backend_status_path = environment.widgetSetting("WEAVER_BACKEND_FILE", argument);
+    const log_name = try safeLogName(allocator, loaded.manifest.name);
+    model.log = try allocator.create(widget_log.Sink);
+    model.log.* = .{};
+    try widget_log.init(model.log, init.io, try std.fs.path.join(allocator, &.{ environment.log_directory, log_name }));
+    widget_log.use(model.log);
+    std.log.info("widget runtime starting pid={d}{s}{s}", .{
+        platform.currentProcessId(),
+        if (environment.dev) " dev=true" else "",
+        if (slot != 0) " hosted=true" else "",
+    });
+
+    const capture_provider_fixture = if (init.environ_map.get("WEAVER_CAPTURE_PROVIDER_FIXTURE")) |path|
+        try loadCaptureProviderFixture(init.io, allocator, path, loaded.manifest.subscribe, loaded.manifest.capabilities)
+    else
+        null;
+    const storage = try allocator.create(storage_mod.Store);
+    storage.* = try storage_mod.Store.init(init.io, allocator, environment.data_root, loaded.manifest.name);
     const bundle_path = try std.fs.path.join(allocator, &.{ directory, "bundle.js" });
     const bundle_stat = try std.Io.Dir.cwd().statFile(init.io, bundle_path, .{});
-    var geometry_store = try geometry_mod.Store.init(init.io, allocator, data_root, loaded.manifest.name);
+    const geometry_store = try allocator.create(geometry_mod.Store);
+    geometry_store.* = try geometry_mod.Store.init(init.io, allocator, environment.data_root, loaded.manifest.name);
     // A dragged position outranks the manifest anchor, but only while it
     // still lands on an attached display; a stale record (monitor
     // unplugged) falls back to the anchor. macOS validates in AppKit at
@@ -1566,103 +1879,59 @@ pub fn main(init: std.process.Init) !void {
         // place it"; nudge the exact corner case off the sentinel.
         if (builtin.os.tag == .windows and frame.x == 0 and frame.y == 0) frame.x = 0.01;
     }
-    const shell_views = [_]native_sdk.ShellView{.{
-        .label = "widget-canvas",
-        .kind = .gpu_surface,
-        .fill = true,
-        .role = "Weaver widget canvas",
-        .accessibility_label = loaded.manifest.name,
-        .gpu_backend = renderer_backend,
-        .gpu_pixel_format = .bgra8_unorm,
-        .gpu_present_mode = .timer,
-        .gpu_alpha_mode = .premultiplied,
-        .gpu_color_space = .srgb,
-        .gpu_vsync = true,
-    }};
-    const window_layers = nativeWindowLayers(loaded.manifest.layer);
-    const shell_windows = [_]native_sdk.ShellWindow{.{
-        .label = "main",
-        .title = loaded.manifest.name,
-        .width = loaded.manifest.size[0],
-        .height = loaded.manifest.size[1],
-        .x = frame.x,
-        .y = frame.y,
-        .resizable = false,
-        .restore_state = false,
-        .titlebar = .chromeless,
-        .transparent = true,
-        .layer = window_layers.shell,
+    model.window = .{
+        .name = loaded.manifest.name,
+        .frame = frame,
+        .layer = nativeWindowLayers(loaded.manifest.layer),
         .click_through = loaded.manifest.clickThrough,
-        .no_activate = true,
-        .views = &shell_views,
-    }};
-    const scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
-    const fonts = try loadFonts(init.io, allocator, directory, loaded.manifest.fonts);
-    var image_resolver = try image_paths.Resolver.init(
+        .backend = declaredGpuBackend(loaded.manifest.renderBackend, environment.force_software),
+        .dragged = dragged != null,
+        .primary_display_anchor = manifest_mod.primaryDisplayAnchor(loaded.manifest),
+    };
+    const image_resolver = try allocator.create(image_paths.Resolver);
+    image_resolver.* = try image_paths.Resolver.init(
         init.io,
         std.heap.page_allocator,
         directory,
         if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
     );
-    defer image_resolver.deinit();
 
-    var tokens = native_sdk.canvas.DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark });
-    tokens.colors.background = native_sdk.canvas.Color.rgba8(0, 0, 0, 0);
-    const app_state = try createWidgetApp(.{
-        .name = loaded.manifest.name,
-        .scene = scene,
-        .canvas_label = "widget-canvas",
-        .tokens = tokens,
-        .fonts = fonts,
-        .update_fx = update,
-        .view_revision = viewRevision,
-        .project_update = projectSameViewUpdate,
-        .init_fx = initEffects,
-        .view = view,
-        .sync = syncNativeState,
-        .on_frame = onFrame,
-        .on_frame_requested = onFrameRequested,
-        .on_window_frame = onWindowFrame,
-    });
-    defer app_state.destroy();
-    defer app_state.model.tree.deinit();
-    defer deinitImageStates(&app_state.model);
-    app_state.model.geometry = &geometry_store;
-    app_state.model.fonts = loaded.manifest.fonts;
-    app_state.model.image_resolver = &image_resolver;
-    if (dragged) |saved| app_state.model.frame_origin = .{ saved.x, saved.y };
+    model.geometry = geometry_store;
+    model.fonts = loaded.manifest.fonts;
+    model.image_resolver = image_resolver;
+    if (dragged) |saved| model.frame_origin = .{ saved.x, saved.y };
     if (capture_provider_fixture) |fixture| {
-        capture_command_fixture.commands = fixture.commands;
-        app_state.model.provider.initCaptureFixture(init.io, &capture_command_fixture);
+        const capture_command_fixture = try allocator.create(provider_mod.CaptureCommandFixture);
+        capture_command_fixture.* = .{ .commands = fixture.commands };
+        model.provider.initCaptureFixture(init.io, capture_command_fixture);
     } else {
-        try app_state.model.provider.init(init.io, if (capture_state_root == null)
+        try model.provider.init(init.io, if (capture_state_root == null)
             platform.providerEndpoint(
-                init.environ_map.get("WEAVER_HOST_PIPE"),
-                init.environ_map.get("WEAVER_HOST_ENDPOINT"),
+                environment.widgetSetting("WEAVER_HOST_PIPE", argument),
+                environment.widgetSetting("WEAVER_HOST_ENDPOINT", argument),
             )
         else
             null);
     }
-    defer app_state.model.provider.deinit();
     if (builtin.os.tag == .macos and weaver_build_options.automation_seam) {
         const automation = init.environ_map.get("WEAVER_AUTOMATION");
         const failure_path = init.environ_map.get("WEAVER_PROVIDER_TEST_FAIL_SEND");
         if (automation != null and std.mem.eql(u8, automation.?, "1") and failure_path != null) {
-            app_state.model.provider.setAutomationSendFailurePath(failure_path.?);
+            model.provider.setAutomationSendFailurePath(failure_path.?);
         }
     }
-    app_state.model.provider.setWake(notifyProviderWake);
-    app_state.model.has_provider_subscriptions = hasHostProviderSubscription(loaded.manifest.subscribe);
-    app_state.model.media_transport_enabled = for (loaded.manifest.capabilities) |capability| {
+    model.provider.setWake(wakeFns(&provider_wake_pending)[slot]);
+    model.has_provider_subscriptions = hasHostProviderSubscription(loaded.manifest.subscribe);
+    model.media_transport_enabled = for (loaded.manifest.capabilities) |capability| {
         if (std.mem.eql(u8, capability, "media-transport")) break true;
     } else false;
     const engine = try js_engine.Engine.create(
         std.heap.page_allocator,
-        &app_state.model.tree,
-        &storage,
+        &model.tree,
+        storage,
         loaded.manifest.origins,
-        &app_state.model.provider,
-        app_state.model.media_transport_enabled,
+        &model.provider,
+        model.media_transport_enabled,
         capture_state_root != null,
     );
     if (capture_state_root != null) {
@@ -1671,15 +1940,14 @@ pub fn main(init: std.process.Init) !void {
             try engine.setCaptureClock(epoch_ms);
         }
     }
-    app_state.model.engine = engine;
-    defer if (app_state.model.engine) |current| current.destroy(std.heap.page_allocator);
-    app_state.model.io = init.io;
-    app_state.model.storage = &storage;
-    app_state.model.origins = loaded.manifest.origins;
-    app_state.model.bundle_path = bundle_path;
-    app_state.model.dev_seen_mtime = bundle_stat.mtime.nanoseconds;
+    model.engine = engine;
+    model.io = init.io;
+    model.storage = storage;
+    model.origins = loaded.manifest.origins;
+    model.bundle_path = bundle_path;
+    model.dev_seen_mtime = bundle_stat.mtime.nanoseconds;
     for (loaded.manifest.subscribe) |provider| {
-        if (std.mem.eql(u8, provider, "audio")) app_state.model.provider_poll_interval_ms = 33;
+        if (std.mem.eql(u8, provider, "audio")) model.provider_poll_interval_ms = 33;
     }
     try engine.evaluate(loaded.bundle, "bundle.js");
     if (capture_provider_fixture) |fixture| {
@@ -1694,10 +1962,10 @@ pub fn main(init: std.process.Init) !void {
         if (value.len != 0 and !std.mem.eql(u8, value, "0")) {
             const usage = engine.memoryUsage();
             std.log.info(
-                "widget memory receipt model_bytes={d} widget_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
+                "widget memory receipt model_bytes={d} host_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
                 .{
                     @sizeOf(Model),
-                    @sizeOf(WidgetApp),
+                    @sizeOf(HostApp),
                     @sizeOf(tree_mod.Tree),
                     @sizeOf(tree_mod.Node),
                     @sizeOf(tree_mod.CanvasState),
@@ -1715,110 +1983,242 @@ pub fn main(init: std.process.Init) !void {
             );
         }
     }
-    if (app_state.model.tree.root == null) {
+    if (model.tree.root == null) {
         std.log.err("widget bundle completed without rendering a root; expected the default widget() registration to render synchronously", .{});
-        app_state.model.tree.showError("WidgetDidNotRenderRoot\nThe bundle completed without rendering a widget root.");
+        model.tree.showError("WidgetDidNotRenderRoot\nThe bundle completed without rendering a widget root.");
     }
-    if (app_state.model.provider.fatalChannelFailure()) return error.FatalProviderChannelFailure;
-    if (loadLocalImages(init.io, allocator, directory, &app_state.model)) |_| {
-        seedImageStates(&app_state.model) catch |err| {
+    if (model.provider.fatalChannelFailure()) return error.FatalProviderChannelFailure;
+    if (loadLocalImages(init.io, allocator, directory, model)) |_| {
+        seedImageStates(model) catch |err| {
             std.log.err("initial widget image state failed: {s}", .{@errorName(err)});
             var buffer: [tree_mod.max_text_bytes]u8 = undefined;
             const visible = std.fmt.bufPrint(&buffer, "image initialization failed\n{s}", .{@errorName(err)}) catch "image initialization failed; see the per-widget log";
-            app_state.model.tree.showError(visible);
-            app_state.model.image_count = 0;
+            model.tree.showError(visible);
+            model.image_count = 0;
         };
     } else |err| {
         std.log.err("initial widget image load failed: {s}", .{@errorName(err)});
         var buffer: [tree_mod.max_text_bytes]u8 = undefined;
         const visible = std.fmt.bufPrint(&buffer, "image load failed\n{s}", .{@errorName(err)}) catch "image load failed; see the per-widget log";
-        app_state.model.tree.showError(visible);
-        app_state.model.image_count = 0;
+        model.tree.showError(visible);
+        model.image_count = 0;
     }
+    return model;
+}
 
-    requested_software_backend = renderer_backend == .software;
-    const dev_signal_path = try std.fs.path.join(allocator, &.{ directory, dev_reload.signal_file_name });
-    var dev_reload_server: dev_reload.Server = .{};
-    if (dev) try dev_reload_server.start(init.io, dev_signal_path, notifyDevReload);
-    defer if (dev) {
-        dev_reload_server.deinit();
-        dev_reload_pending.store(false, .release);
-    };
-    defer {
-        wake_runtime.store(0, .release);
-        provider_wake_pending.store(false, .release);
+fn unloadWidget(model: *Model) void {
+    widget_log.use(model.log);
+    if (model.engine) |engine| engine.destroy(std.heap.page_allocator);
+    model.provider.deinit();
+    deinitImageStates(model);
+    model.tree.deinit();
+    if (model.image_resolver) |resolver| @constCast(resolver).deinit();
+}
+
+/// Route this process's logging to `model` and return it: every host hook
+/// enters the widget it is about to run.
+fn enter(model: *Model) *Model {
+    widget_log.use(model.log);
+    crash_breadcrumb.mark(model.argument);
+    return model;
+}
+
+fn widgetFor(host: *const Host, slot: u16) ?*Model {
+    if (slot >= host.widgets.len) return null;
+    return enter(host.widgets[slot]);
+}
+
+fn widgetForCanvas(host: *const Host, canvas_label: []const u8) ?*Model {
+    return widgetFor(host, slotForCanvasLabel(canvas_label) orelse return null);
+}
+
+fn widgetForWindow(host: *const Host, window_label: []const u8) ?*Model {
+    return widgetFor(host, slotForWindowLabel(window_label) orelse return null);
+}
+
+fn hostInitEffects(host: *Host, effects: *Effects) void {
+    for (host.widgets) |model| initEffects(enter(model), .{ .fx = effects, .slot = model.slot });
+}
+
+fn hostUpdate(host: *Host, message: HostMsg, effects: *Effects) void {
+    if (message.widget == every_widget) {
+        // The provider and dev-reload listeners run off-thread. They only
+        // publish their widget's pending bit and request a platform frame;
+        // this turns that frame boundary into the ordinary update/rebuild
+        // path for each widget with a wake. Static widgets therefore
+        // hot-swap without borrowing a GPU completion from animation,
+        // input, or resize.
+        for (host.widgets) |model| {
+            const provider = provider_wake_pending[model.slot].swap(false, .acq_rel);
+            const dev = dev_reload_pending[model.slot].swap(false, .acq_rel);
+            if (!provider and !dev) continue;
+            update(enter(model), .{ .external_wake = .{ .provider = provider, .dev_reload = dev } }, .{ .fx = effects, .slot = model.slot });
+        }
+        return;
     }
-    var app = app_state.app();
-    app.start_fn = startRendererDiagnostics;
-    if (capture_state_root != null) {
-        app.capture_clock_advance_fn = advanceCaptureClock;
-        app.capture_pending_fn = capturePendingWork;
-        app.capture_validate_fn = validateCapture;
+    const model = widgetFor(host, message.widget) orelse return;
+    update(model, message.msg, .{ .fx = effects, .slot = message.widget });
+}
+
+fn hostView(ui: *WidgetUi, host: *const Host) WidgetUi.Node {
+    return view(ui, widgetFor(host, 0).?);
+}
+
+fn hostWindowView(ui: *WidgetUi, host: *const Host, window_label: []const u8) WidgetUi.Node {
+    const model = widgetForWindow(host, window_label) orelse return projectionFailurePanel(ui, true);
+    return view(ui, model);
+}
+
+fn hostViewRevision(host: *const Host) u64 {
+    return viewRevision(widgetFor(host, 0).?);
+}
+
+fn hostWindowViewRevision(host: *const Host, window_label: []const u8) u64 {
+    return viewRevision(widgetForWindow(host, window_label) orelse return 0);
+}
+
+/// A same-revision update for the widget whose canvas this is; every other
+/// widget's canvas already shows it.
+fn hostProjectUpdate(
+    runtime: *native_sdk.Runtime,
+    window_id: native_sdk.platform.WindowId,
+    canvas_label: []const u8,
+    host: *const Host,
+    message: HostMsg,
+) anyerror!bool {
+    const slot = slotForCanvasLabel(canvas_label) orelse return true;
+    if (message.widget != slot) return true;
+    const model = widgetFor(host, slot) orelse return true;
+    return projectSameViewUpdate(runtime, window_id, canvas_label, model, message.msg);
+}
+
+fn hostSync(host: *Host, layout: native_sdk.canvas.WidgetLayoutTree) void {
+    syncNativeState(widgetFor(host, 0).?, layout);
+}
+
+fn hostWindowSync(host: *Host, window_label: []const u8, layout: native_sdk.canvas.WidgetLayoutTree) void {
+    syncNativeState(widgetForWindow(host, window_label) orelse return, layout);
+}
+
+fn hostOnFrame(host: *const Host, frame: native_sdk.platform.GpuFrame) ?HostMsg {
+    const msg = onFrame(widgetFor(host, 0).?, frame) orelse return null;
+    return .{ .widget = 0, .msg = msg };
+}
+
+fn hostWindowOnFrame(host: *const Host, window_label: []const u8, frame: native_sdk.platform.GpuFrame) ?HostMsg {
+    const model = widgetForWindow(host, window_label) orelse return null;
+    const msg = onFrame(model, frame) orelse return null;
+    return .{ .widget = model.slot, .msg = msg };
+}
+
+fn hostOnFrameRequested(host: *const Host) ?HostMsg {
+    for (host.widgets) |model| {
+        if (provider_wake_pending[model.slot].load(.acquire) or dev_reload_pending[model.slot].load(.acquire)) {
+            return .{ .widget = every_widget, .msg = .{ .external_wake = .{ .provider = false, .dev_reload = false } } };
+        }
     }
-    runner.runWithOptions(app, .{
-        .app_name = "weaver-widget",
-        .window_title = loaded.manifest.name,
-        .bundle_id = "com.weaver.widget",
-        .default_frame = frame,
-        // A dragged origin places the window explicitly (macOS reads the
-        // frame only when restore is set, then clamps it in AppKit); the
-        // manifest anchor stays the placement until that first drag.
-        .restore_state = dragged != null,
-        // Weaver owns placement persistence (debounced, per-widget,
-        // atomic). The substrate's bundle-id-keyed store would make
-        // every widget process rewrite one shared windows.zon on each
-        // move tick.
-        .persist_window_state = false,
-        .primary_display_anchor = if (builtin.os.tag == .macos and dragged == null) manifest_mod.primaryDisplayAnchor(loaded.manifest) else null,
-        .startup_window_layer = window_layers.startup,
-        .startup_click_through = loaded.manifest.clickThrough,
-        .js_window_api = false,
-    }, init) catch |err| {
-        std.log.err("widget runtime stopped after platform callback failure: {s}", .{@errorName(err)});
-        return err;
-    };
+    return null;
+}
+
+/// Every frame report maps to a Msg; the model decides what is a real
+/// move. During the drag itself the OS owns the window — nothing here
+/// touches JS or invalidates the presented surface.
+fn hostOnWindowFrame(event: native_sdk.runtime.WindowFrameEvent) ?HostMsg {
+    const runtime = diagnostic_runtime orelse return null;
+    var buffer: [native_sdk.platform.max_windows]native_sdk.platform.WindowInfo = undefined;
+    for (runtime.listWindows(&buffer)) |info| {
+        if (info.id != event.id) continue;
+        const slot = slotForWindowLabel(info.label) orelse return null;
+        return .{ .widget = slot, .msg = onWindowFrame(event) };
+    }
+    return null;
+}
+
+/// Slots 1 and up open as declared windows: placed, layered and rendered
+/// exactly like slot 0's startup window.
+fn hostWindows(host: *const Host, scratch: *HostApp.WindowsScratch) []const HostApp.WindowDescriptor {
+    var count: usize = 0;
+    for (host.widgets[1..]) |model| {
+        scratch.windows[count] = .{
+            .label = windowLabel(model.slot),
+            .canvas_label = canvasLabel(model.slot),
+            .title = model.window.name,
+            .width = model.window.frame.width,
+            .height = model.window.frame.height,
+            .x = model.window.frame.x,
+            .y = model.window.frame.y,
+            .resizable = false,
+            .titlebar = .chromeless,
+            .transparent = true,
+            .layer = model.window.layer.shell,
+            .click_through = model.window.click_through,
+            .no_activate = true,
+            .gpu_backend = model.window.backend,
+        };
+        count += 1;
+    }
+    return scratch.windows[0..count];
+}
+
+/// One comptime wake callback per slot: the provider and dev-reload
+/// listeners take a context-free function.
+fn wakeFns(comptime pending: *[max_host_widgets]std.atomic.Value(bool)) [max_host_widgets]*const fn () void {
+    var fns: [max_host_widgets]*const fn () void = undefined;
+    inline for (0..max_host_widgets) |slot| {
+        fns[slot] = struct {
+            fn wake() void {
+                pending[slot].store(true, .release);
+                requestExternalWake("widget");
+            }
+        }.wake;
+    }
+    return fns;
+}
+
+fn captureWidget(context: *anyopaque) *Model {
+    const app_state: *HostApp = @ptrCast(@alignCast(context));
+    return enter(app_state.model.widgets[0]);
 }
 
 fn advanceCaptureClock(context: *anyopaque, milliseconds: u64) !void {
-    const app_state: *WidgetApp = @ptrCast(@alignCast(context));
-    const engine = app_state.model.engine orelse return error.CaptureClockUnavailable;
+    const engine = captureWidget(context).engine orelse return error.CaptureClockUnavailable;
     try engine.advanceCaptureClock(milliseconds);
 }
 
 fn capturePendingWork(context: *anyopaque) native_sdk.CapturePendingWork {
-    const app_state: *WidgetApp = @ptrCast(@alignCast(context));
+    const model = captureWidget(context);
     var pending_images: usize = 0;
-    for (app_state.model.image_states[0..app_state.model.image_state_count]) |state| {
+    for (model.image_states[0..model.image_state_count]) |state| {
         if (!state.registered and state.failure == null) pending_images += 1;
     }
     return .{
-        .fetches = if (app_state.model.engine) |engine| engine.activeFetchCount() else 0,
+        .fetches = if (model.engine) |engine| engine.activeFetchCount() else 0,
         .images = pending_images,
     };
 }
 
 fn validateCapture(context: *anyopaque) !void {
-    const app_state: *WidgetApp = @ptrCast(@alignCast(context));
-    switch (app_state.model.provider.captureCommandValidation()) {
+    const model = captureWidget(context);
+    switch (model.provider.captureCommandValidation()) {
         .valid => {},
         .unexpected => {
-            app_state.model.provider.logCaptureCommandFailure();
+            model.provider.logCaptureCommandFailure();
             return error.CaptureMediaCommandUnexpected;
         },
         .mismatch => {
-            app_state.model.provider.logCaptureCommandFailure();
+            model.provider.logCaptureCommandFailure();
             return error.CaptureMediaCommandMismatch;
         },
         .missing => {
-            app_state.model.provider.logCaptureCommandFailure();
+            model.provider.logCaptureCommandFailure();
             return error.CaptureMediaCommandMissing;
         },
     }
-    if (app_state.model.engine) |engine| {
+    if (model.engine) |engine| {
         if (engine.renderFailed()) return error.CaptureWidgetFailed;
     }
-    if (depth_limit_exceeded) return error.CaptureWidgetFailed;
-    reportCanvasLayoutMismatches(&app_state.model);
+    if (model.depth_limit_exceeded) return error.CaptureWidgetFailed;
+    reportCanvasLayoutMismatches(model);
 }
 
 /// A canvas whose retained commands were published for a different layout
@@ -2055,9 +2455,9 @@ fn draggedOriginVisible(saved: geometry_mod.Saved, size: [2]f32) bool {
     return overlap_x >= 24 and overlap_y >= 24;
 }
 
-fn publishBackendStatus(backend: native_sdk.platform.GpuSurfaceBackend) void {
+fn publishBackendStatus(model: *const Model, backend: native_sdk.platform.GpuSurfaceBackend) void {
     const io = backend_status_io orelse return;
-    const path = backend_status_path orelse return;
+    const path = model.backend_status_path orelse return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = backendStatusLabel(backend) }) catch |err| {
         std.log.warn("widget could not publish renderer status: {s}", .{@errorName(err)});
     };
@@ -2087,27 +2487,21 @@ fn declaredGpuBackend(render_backend: []const u8, force_software: bool) native_s
 
 /// Capture the live runtime for one present-path diagnostic. Presentation
 /// selection itself belongs to Native SDK and follows the declared backend.
-fn startRendererDiagnostics(_: *anyopaque, runtime: *native_sdk.Runtime) !void {
+fn startRendererDiagnostics(context: *anyopaque, runtime: *native_sdk.Runtime) !void {
+    const app_state: *HostApp = @ptrCast(@alignCast(context));
     diagnostic_runtime = runtime;
     wake_runtime.store(@intFromPtr(runtime), .release);
-    if (dev_reload_pending.load(.acquire) or provider_wake_pending.load(.acquire)) {
-        try runtime.options.platform.services.requestFrame();
+    var wake_pending = false;
+    for (app_state.model.widgets) |model| {
+        wake_pending = wake_pending or dev_reload_pending[model.slot].load(.acquire) or provider_wake_pending[model.slot].load(.acquire);
+        _ = enter(model);
+        if (model.window.backend != .software) {
+            std.log.info("widget renderer selected={s} presenter=host", .{if (@import("builtin").os.tag == .macos) "metal-composite" else "gpu"});
+        } else {
+            std.log.info("widget renderer selected=software presenter=pixels", .{});
+        }
     }
-    if (!requested_software_backend) {
-        std.log.info("widget renderer selected={s} presenter=host", .{if (@import("builtin").os.tag == .macos) "metal-composite" else "gpu"});
-        return;
-    }
-    std.log.info("widget renderer selected=software presenter=pixels", .{});
-}
-
-fn notifyDevReload() void {
-    dev_reload_pending.store(true, .release);
-    requestExternalWake("dev hot-swap");
-}
-
-fn notifyProviderWake() void {
-    provider_wake_pending.store(true, .release);
-    requestExternalWake("provider");
+    if (wake_pending) try runtime.options.platform.services.requestFrame();
 }
 
 fn requestExternalWake(label: []const u8) void {
@@ -2262,7 +2656,7 @@ test "registering a display callback from an idle provider update starts its fra
 
 test "dev reload crosses requestFrame into the frame-requested hook exactly once" {
     const TestApp = struct {
-        model: Model = .{},
+        host: Host = .{},
         reloads: usize = 0,
 
         fn app(self: *@This()) native_sdk.App {
@@ -2276,32 +2670,36 @@ test "dev reload crosses requestFrame into the frame-requested hook exactly once
 
         fn frameRequested(context: *anyopaque, _: *native_sdk.Runtime) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            if (onFrameRequested(&self.model)) |msg| {
-                switch (msg) {
-                    .external_wake => |wake| if (wake.dev_reload) {
-                        self.reloads += 1;
-                    },
-                    else => {},
-                }
+            // The wake Msg addresses every widget; `hostUpdate` then takes
+            // each widget's own pending bit, as this does for slot 0.
+            if (hostOnFrameRequested(&self.host)) |msg| {
+                if (msg.widget == every_widget and dev_reload_pending[0].swap(false, .acq_rel)) self.reloads += 1;
             }
         }
     };
 
     const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{});
     defer harness.destroy(std.testing.allocator);
-    var app_state: TestApp = .{};
+    const model = try createModel();
+    defer std.heap.page_allocator.destroy(model);
+    const widgets = [_]*Model{model};
+    var app_state: TestApp = .{ .host = .{ .widgets = &widgets } };
     const app = app_state.app();
     try harness.start(app);
 
-    dev_reload_pending.store(false, .release);
-    provider_wake_pending.store(false, .release);
+    dev_reload_pending[0].store(false, .release);
+    provider_wake_pending[0].store(false, .release);
     wake_runtime.store(@intFromPtr(&harness.runtime), .release);
     defer {
         wake_runtime.store(0, .release);
-        dev_reload_pending.store(false, .release);
-        provider_wake_pending.store(false, .release);
+        dev_reload_pending[0].store(false, .release);
+        provider_wake_pending[0].store(false, .release);
     }
-    const notifier = try std.Thread.spawn(.{}, notifyDevReload, .{});
+    const notifier = try std.Thread.spawn(.{}, struct {
+        fn wake() void {
+            wakeFns(&dev_reload_pending)[0]();
+        }
+    }.wake, .{});
     notifier.join();
     try std.testing.expectEqual(@as(usize, 1), harness.null_platform.pendingFrameRequestCount());
 
@@ -2309,7 +2707,7 @@ test "dev reload crosses requestFrame into the frame-requested hook exactly once
     try std.testing.expect(frame_event == .frame_requested);
     try harness.runtime.dispatchPlatformEvent(app, frame_event);
     try std.testing.expectEqual(@as(usize, 1), app_state.reloads);
-    try std.testing.expect(onFrameRequested(&app_state.model) == null);
+    try std.testing.expect(hostOnFrameRequested(&app_state.host) == null);
 }
 
 test "transport-only capability arms no repeating provider timer" {
@@ -2398,17 +2796,12 @@ test "a tree deeper than max_widget_depth shows a named error instead of buildin
     try model.tree.setRoot(try nestColumns(&model, 300, false));
     // Pre-latch so the one-time diagnostic (a std.log.err, which fails a
     // Zig test) is skipped here; `weaver capture` covers that line.
-    depth_limit_reported = true;
-    defer {
-        projection_failure_latched = false;
-        projection_failed_this_view = false;
-        depth_limit_exceeded = false;
-        depth_limit_reported = false;
-    }
+    model.depth_limit_reported = true;
+    defer projection_failed_this_view = false;
     var ui = WidgetUi.init(arena_state.allocator());
     const built = try ui.finalize(view(&ui, &model));
     try std.testing.expect(projection_failed_this_view);
-    try std.testing.expect(depth_limit_exceeded);
+    try std.testing.expect(model.depth_limit_exceeded);
     try std.testing.expectEqual(native_sdk.canvas.WidgetKind.panel, built.root.kind);
     try std.testing.expectEqual(@as(usize, 1), built.root.children.len);
     try std.testing.expect(std.mem.startsWith(u8, built.root.children[0].text, "WidgetDepthExceeded"));
@@ -2645,14 +3038,14 @@ test "bundled font resolution honors exact stems families and nearest weights" {
     };
     try tree.setFontFamily(id, "Display");
     try tree.setFontWeight(id, "semibold");
-    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, 65), resolveFontId(try tree.nodeConst(id), &fonts));
+    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, 65), resolveManifestFontId(try tree.nodeConst(id), &fonts));
     try tree.setFontFamily(id, "Display-Regular");
     try tree.setFontWeight(id, "bold");
-    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, 64), resolveFontId(try tree.nodeConst(id), &fonts));
+    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, 64), resolveManifestFontId(try tree.nodeConst(id), &fonts));
     try tree.setFontFamily(id, "sans");
-    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, null), resolveFontId(try tree.nodeConst(id), &fonts));
+    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, null), resolveManifestFontId(try tree.nodeConst(id), &fonts));
     try tree.setFontFamily(id, "mono");
-    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, native_sdk.canvas.default_mono_font_id), resolveFontId(try tree.nodeConst(id), &fonts));
+    try std.testing.expectEqual(@as(?native_sdk.canvas.FontId, native_sdk.canvas.default_mono_font_id), resolveManifestFontId(try tree.nodeConst(id), &fonts));
 }
 
 test "painted retained stack keeps overlay children under rounded inset shadow" {

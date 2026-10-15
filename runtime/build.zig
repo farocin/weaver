@@ -3,11 +3,16 @@ const native_sdk = @import("native_sdk");
 
 pub fn build(b: *std.Build) void {
     const automation_seam = b.option(bool, "automation-seam", "Compile deterministic runtime failure injection (automation builds only)") orelse false;
+    // One process hosts every widget (`weaver-widget --host`), each in its
+    // own Native window: the window capacity is src/main.zig's
+    // max_host_widgets, which a comptime check there pins.
     const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{
         .@"widget-profile" = true,
+        .@"widget-windows" = @as(usize, 32),
     }), .{
         .name = "weaver-widget",
         .widget_profile = true,
+        .widget_windows = 32,
         // One runtime event per 30 Hz Canvas completion otherwise opens,
         // stats, appends, and closes native-sdk.jsonl on every frame. Widget
         // diagnostics live in the dedicated per-widget log; explicit
