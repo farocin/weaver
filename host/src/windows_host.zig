@@ -422,7 +422,10 @@ const Host = struct {
     /// then mark the slot running.
     fn connectSlot(self: *Host, slot: *Slot, process: c.HANDLE, pid: u32, now_ms: u64) !void {
         if (slot.platform.pipe != invalid_handle) {
-            if (!connectPipe(slot.platform.pipe, process, pid, 5_000)) return error.ConnectPipeFailed;
+            // A hosted widget that fails to load reports it in its status
+            // file and never connects; stop waiting as soon as it says so.
+            const failure_report: ?FailureReport = if (slot.dev) null else .{ .io = self.io, .path = slot.platform.backendPath() };
+            if (!connectPipe(slot.platform.pipe, process, pid, 5_000, failure_report)) return error.ConnectPipeFailed;
             slot.platform.write_event = c.CreateEventW(null, 0, 0, null) orelse return error.CreateEventFailed;
             slot.platform.command_shutdown_event = c.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
             slot.platform.command_stopping.store(0, .release);
@@ -489,6 +492,14 @@ const Host = struct {
             const slot = &self.slots[index];
             self.connectSlot(slot, started.process, started.pid, now_ms) catch |err| {
                 self.closePipe(slot);
+                // The host died while starting: the slot stays a member so
+                // the exit is settled once and the breadcrumb decides who
+                // pays, instead of every unconnected widget being charged.
+                if (c.WaitForSingleObject(started.process, 0) == c.WAIT_OBJECT_0) {
+                    slot.platform.hosted = true;
+                    slot.platform.pid = started.pid;
+                    continue;
+                }
                 // A widget that failed to load never connects its pipe; its
                 // status file says why, and it stops like any load failure
                 // instead of restarting the host on a backoff.
@@ -1496,11 +1507,24 @@ fn writePipe(platform: *WindowsSlotState, bytes: []const u8) bool {
     return written == bytes.len;
 }
 
-fn connectPipe(pipe: c.HANDLE, process: c.HANDLE, expected_pid: u32, timeout_ms: u64) bool {
+/// The status file a hosted widget writes `failed:<error>` to when it does
+/// not load.
+const FailureReport = struct {
+    io: std.Io,
+    path: []const u8,
+
+    fn reported(self: FailureReport) bool {
+        var buffer: [16]u8 = undefined;
+        const text = std.Io.Dir.cwd().readFile(self.io, self.path, &buffer) catch return false;
+        return std.mem.startsWith(u8, text, "failed:");
+    }
+};
+
+fn connectPipe(pipe: c.HANDLE, process: c.HANDLE, expected_pid: u32, timeout_ms: u64, failure_report: ?FailureReport) bool {
     const deadline = c.GetTickCount64() +| timeout_ms;
     while (true) {
         const now = c.GetTickCount64();
-        if (now >= deadline or !connectPipeOnce(pipe, process, deadline - now)) return false;
+        if (now >= deadline or !connectPipeOnce(pipe, process, deadline - now, failure_report)) return false;
         const actual_pid = namedPipeClientPid(pipe) orelse {
             _ = c.DisconnectNamedPipe(pipe);
             return false;
@@ -1517,7 +1541,7 @@ fn connectPipe(pipe: c.HANDLE, process: c.HANDLE, expected_pid: u32, timeout_ms:
     }
 }
 
-fn connectPipeOnce(pipe: c.HANDLE, process: c.HANDLE, timeout_ms: u64) bool {
+fn connectPipeOnce(pipe: c.HANDLE, process: c.HANDLE, timeout_ms: u64, failure_report: ?FailureReport) bool {
     const event = c.CreateEventW(null, 0, 0, null) orelse return false;
     defer _ = c.CloseHandle(event);
     var overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
@@ -1528,7 +1552,18 @@ fn connectPipeOnce(pipe: c.HANDLE, process: c.HANDLE, timeout_ms: u64) bool {
             _ = c.SetEvent(event);
         } else if (pipe_error == c.ERROR_IO_PENDING) {
             const handles = [_]c.HANDLE{ event, process };
-            const wait = c.WaitForMultipleObjects(handles.len, &handles, 0, @intCast(timeout_ms));
+            // Wait in 100 ms slices when a failure report can end the wait
+            // early, otherwise in one.
+            const slice_ms: u64 = if (failure_report != null) 100 else timeout_ms;
+            var waited_ms: u64 = 0;
+            var wait: c.DWORD = c.WAIT_TIMEOUT;
+            while (true) {
+                const this_slice = @min(slice_ms, timeout_ms - waited_ms);
+                wait = c.WaitForMultipleObjects(handles.len, &handles, 0, @intCast(this_slice));
+                waited_ms += this_slice;
+                if (wait != c.WAIT_TIMEOUT or waited_ms >= timeout_ms) break;
+                if (failure_report) |report| if (report.reported()) break;
+            }
             if (wait != c.WAIT_OBJECT_0) {
                 _ = c.CancelIoEx(pipe, &overlapped);
                 var cancelled_bytes: c.DWORD = 0;
@@ -1627,5 +1662,6 @@ test "provider pipe rejects a connected client whose pid is not the launched chi
         c.GetCurrentProcess(),
         c.GetCurrentProcessId() + 1,
         200,
+        null,
     ));
 }
