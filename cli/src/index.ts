@@ -2238,28 +2238,18 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     if (!attribute) return [""];
     return staticClassVariants.get(attribute) ?? null;
   };
-  // Mirrors the runtime's lowering (runtime/src/main.zig hasPaintStyle and
-  // loweredDepth): <panel> is always a painted box around a column, and a
-  // <row>/<column>/<stack> becomes one when it paints its own box.
-  const paintsOwnBox = (compiled: Record<string, unknown>): boolean => Object.entries(compiled).some(([key, value]) =>
-    key === "background" || key === "backgroundGradient" || key === "shadow" || key === "borderColor" ||
-    ((key === "borderWidth" || key === "radius") && typeof value === "number" && value > 0) ||
-    (key.startsWith("radius") && key !== "radius") ||
-    key.startsWith("hover") || key.startsWith("pressed"));
   const isPaintedLayout = (node: ts.JsxElement | ts.JsxSelfClosingElement, tag: string): boolean => {
-    if (tag === "panel") return true;
     if (tag !== "row" && tag !== "column" && tag !== "stack") return false;
     for (const classText of classVariants(node) ?? []) {
       try {
-        if (paintsOwnBox(compileClass(classText) as Record<string, unknown>)) return true;
+        const compiled = compileClass(classText);
+        if (Object.keys(compiled).some((key) => key === "background" || key === "radius" || key.startsWith("radius") || key.startsWith("border") || key.toLowerCase().includes("shadow"))) return true;
       } catch {
         // The ordinary class validator reports the malformed utility.
       }
     }
     return false;
   };
-  // Leaves draw themselves; the runtime never builds their children.
-  const leafTags = new Set(["text", "slider", "icon", "image", "canvas"]);
   const maximum = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: Math.max(0, ...values.map((value) => value.nodes)),
     roots: Math.max(0, ...values.map((value) => value.roots)),
@@ -2356,7 +2346,7 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     return {
       nodes: ownDepth + combinedChildren.nodes,
       roots: 1,
-      depth: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.depth),
+      depth: ownDepth + combinedChildren.depth,
       maxChildren: Math.max(combinedChildren.maxChildren, directChildren, ownDepth === 2 ? 1 : 0),
       canvases: combinedChildren.canvases + (tag === "canvas" ? 1 : 0),
       images: combinedChildren.images + (tag === "image" ? 1 : 0),
@@ -2542,7 +2532,7 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Painted <row>/<column>/<stack> elements add an inner layout node.${limitation}`));
   }
   if (lowered.depth > nativeWidgetDepthLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); painted <row>/<column>/<stack> elements and every <panel> add one nesting level.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); painted <row>/<column>/<stack> elements add one nesting level.${limitation}`));
   }
   if (lowered.maxChildren > nativeWidgetChildLimit) {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetChildLimit: one authored parent lowers to ${lowered.maxChildren} direct Native children; child capacity exhausted: max_children=${nativeWidgetChildLimit}, asked for ${lowered.maxChildren}, headroom=${nativeWidgetChildLimit - lowered.maxChildren}.${limitation}`));
