@@ -1849,7 +1849,11 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     const init = environment.init;
     const allocator = init.arena.allocator();
     const capture_state_root = environment.capture_state_root;
-    const loaded = try manifest_mod.load(init.io, allocator, directory);
+    const loaded = try manifest_mod.load(init.io, allocator, std.heap.page_allocator, directory);
+    // The engine compiles the source; keeping it would hold every widget's
+    // bundle text resident for the life of the host (a dev hot swap reads
+    // the file again).
+    defer std.heap.page_allocator.free(loaded.bundle);
     const model = try createModel();
     // A failed load must stop the provider reader and free the engine
     // before the Model goes: the host keeps running the other widgets.
