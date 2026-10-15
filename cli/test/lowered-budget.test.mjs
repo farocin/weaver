@@ -68,6 +68,24 @@ test("check rejects depth after painted layout lowering", () => {
   }
 });
 
+test("check counts every panel and interaction-only paint as two levels, like the runtime", () => {
+  for (const [wrap, label] of [
+    [(inner) => `<panel>${inner}</panel>`, "panel"],
+    [(inner) => `<column class="hover:bg-[#112233]">${inner}</column>`, "hover background"],
+  ]) {
+    let tree = "<text>leaf</text>";
+    for (let index = 0; index < 16; index += 1) tree = wrap(tree);
+    const { root, widget } = fixture(source(tree));
+    try {
+      const checked = runCli(root, "check", widget);
+      assert.equal(checked.status, 1, `${label}: ${checked.stderr}`);
+      assert.match(checked.stderr, /LoweredWidgetDepthLimit: this tree lowers to depth 33 \(Native limit 32\)/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("check budgets the painted branch of a finite class expression", () => {
   let tree = "<text>leaf</text>";
   for (let index = 0; index < 16; index += 1) {
