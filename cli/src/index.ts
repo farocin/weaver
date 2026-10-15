@@ -2069,8 +2069,9 @@ const nativeWidgetImageLimit = 16;
 interface LoweredTreeMetrics {
   /** Native nodes buildNode emits (painted layouts and <panel> are two). */
   nodes: number;
-  /** Retained-tree nodes the reconciler creates: one per element or text,
-   * including children of leaves that Native never receives. */
+  /** Retained-tree nodes the reconciler creates: one per host element and
+   * per text value outside <text>, including leaf descendants Native never
+   * receives. */
   retainedNodes: number;
   roots: number;
   depth: number;
@@ -2268,8 +2269,8 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
         ts.isTypeAssertionExpression(current) || ts.isSatisfiesExpression(current)) {
         current = current.expression;
       }
-      return current.kind === ts.SyntaxKind.NullKeyword || ts.isVoidExpression(current) ||
-        (ts.isIdentifier(current) && current.text === "undefined");
+      // null is not absent: the reconciler serializes it and rejects it.
+      return ts.isVoidExpression(current) || (ts.isIdentifier(current) && current.text === "undefined");
     };
     return attributes.properties.some((attribute) => {
       if (!ts.isJsxAttribute(attribute) || attribute.name.getText(sourceFile) !== "background") return false;
@@ -2577,7 +2578,7 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
   const evidenceNode = roots[0];
   const limitation = " The static estimate follows the exported widget through local components and one level of relative imports; runtime limits remain authoritative for dynamic collections and unresolved component output.";
   if (lowered.retainedNodes > nativeWidgetNodeLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `RetainedWidgetNodeLimit: this tree creates ${lowered.retainedNodes} retained nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.retainedNodes}, headroom=${nativeWidgetNodeLimit - lowered.retainedNodes}. Every element and text value is one retained node, including children of <text>, <slider>, <icon>, <image>, and <canvas>, which are never drawn.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `RetainedWidgetNodeLimit: this tree creates ${lowered.retainedNodes} retained nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.retainedNodes}, headroom=${nativeWidgetNodeLimit - lowered.retainedNodes}. Each host element is one retained node, as is each text value outside a <text> element (a <text> joins its own children); descendants of a <slider> or <image> stay retained even though they are never drawn.${limitation}`));
   }
   if (lowered.nodes > nativeWidgetNodeLimit) {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Every <panel>, and each <row>/<column>/<stack> that paints its own box, adds an inner layout node.${limitation}`));

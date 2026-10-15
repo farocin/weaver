@@ -138,6 +138,8 @@ test("check does not count what the runtime treats as unpainted", () => {
 
 test("check counts nothing Native-side below leaves, but still budgets their retained nodes", () => {
   const slider = '<slider accessibilityLabel="volume" value={1} max={10} onChange={() => {}}>';
+  // Depth: 40 nested columns under a slider are never drawn (runtime: 1 node).
+  expectDepth(`${slider}${nested("<column>", "</column>", 40)}</slider>`, 1, "slider over 40 nested columns");
   // 1 + 16 columns x (1 + 32 panels) = 529 retained nodes; Native gets one.
   const hidden = Array.from({ length: 16 }, (_, group) =>
     `<column key="c${group}">${Array.from({ length: 32 }, (_, child) => `<panel key="p${group}-${child}" />`).join("")}</column>`,
