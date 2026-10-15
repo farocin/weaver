@@ -83,42 +83,73 @@ function checkDepth(tree) {
 
 // Each case was checked against the runtime: the same tree built by
 // recursion (which check cannot see) renders at 32 lowered levels and goes
-// blank at 33, exactly where check now passes or rejects.
-test("check counts depth the way the runtime lowers it", () => {
+// blank at 33, exactly where check now passes or rejects. Every case asserts
+// the whole check result, so a pass means no error of any kind.
+const depthError = /LoweredWidgetDepthLimit: this tree lowers to depth (\d+) \(Native limit 32\)/;
+const pressable = ['<button onPress={() => {}} accessibilityLabel="target">', "</button>"];
+
+function expectDepth(tree, depth, label) {
+  const checked = checkDepth(tree);
+  if (depth > 32) {
+    assert.equal(checked.status, 1, `${label}: ${checked.stderr}`);
+    assert.equal(checked.stderr.match(depthError)?.[1], String(depth), `${label}: ${checked.stderr}`);
+  } else {
+    assert.equal(checked.status, 0, `${label}: ${checked.stderr}`);
+  }
+}
+
+test("check counts painted boxes and panels as two levels, like the runtime", () => {
   const gradient = `{{ type: "linear", start: [0, 0], end: [1, 1], stops: [{ offset: 0, color: "cyan-400" }, { offset: 1, color: "violet-500" }] }}`;
-  const painted = [
+  for (const [open, close] of [
     ["<panel>", "</panel>"],
+    ['<column class="bg-gradient-to-r from-[#111111] to-[#222222]">', "</column>"],
+    [`<column background=${gradient}>`, "</column>"],
+    ['<column class="rounded-tl-[0px]">', "</column>"],
+  ]) {
+    expectDepth(nested(open, close, 16), 33, open);
+    expectDepth(open.repeat(15) + "<column><text>leaf</text></column>" + close.repeat(15), 32, open);
+  }
+});
+
+test("check counts interaction-only paint as two levels inside a pressable", () => {
+  for (const [open, close] of [
     ['<column class="hover:bg-[#112233]">', "</column>"],
     ['<column class="pressed:bg-[#112233]">', "</column>"],
     ['<column class="hover:opacity-50">', "</column>"],
     ['<column class="hover:shadow-none">', "</column>"],
-    ['<column class="bg-gradient-to-r from-[#111111] to-[#222222]">', "</column>"],
-    [`<column background=${gradient}>`, "</column>"],
-    ['<column class="rounded-tl-[0px]">', "</column>"],
-  ];
-  for (const [open, close] of painted) {
-    const checked = checkDepth(nested(open, close, 16));
-    assert.equal(checked.status, 1, `${open}: ${checked.stderr}`);
-    assert.match(checked.stderr, /LoweredWidgetDepthLimit: this tree lowers to depth 33 \(Native limit 32\)/, open);
+  ]) {
+    // The button is one level: 1 + 16 x 2 + text = 34; 1 + 15 x 2 + text = 32.
+    expectDepth(pressable[0] + nested(open, close, 16) + pressable[1], 34, open);
+    expectDepth(pressable[0] + nested(open, close, 15) + pressable[1], 32, open);
   }
-  const unpainted = [
+});
+
+test("check does not count what the runtime treats as unpainted", () => {
+  for (const [open, close] of [
     ['<column class="shadow-none">', "</column>"],
     ['<column class="rounded-[0px]">', "</column>"],
     ['<column class="text-shadow-md">', "</column>"],
-  ];
-  for (const [open, close] of unpainted) {
-    const checked = checkDepth(nested(open, close, 16));
-    assert.equal(checked.status, 0, `${open}: ${checked.stderr}`);
+    ["<column background={(undefined)}>", "</column>"],
+    ["<column background={void 0}>", "</column>"],
+  ]) {
+    expectDepth(nested(open, close, 16), 17, open);
   }
-  // 15 panels (30 levels) + a plain column + text is exactly the limit.
-  const boundary = checkDepth("<panel>".repeat(15) + "<column><text>leaf</text></column>" + "</panel>".repeat(15));
-  assert.equal(boundary.status, 0, boundary.stderr);
 });
 
-test("check does not count depth below leaves the runtime never builds", () => {
+test("check counts nothing Native-side below leaves, but still budgets their retained nodes", () => {
   const slider = '<slider accessibilityLabel="volume" value={1} max={10} onChange={() => {}}>';
-  const checked = checkDepth(`${slider}${nested("<column>", "</column>", 40)}</slider>`);
-  assert.equal(checked.status, 0, checked.stderr);
+  // 1 + 16 columns x (1 + 32 panels) = 529 retained nodes; Native gets one.
+  const hidden = Array.from({ length: 16 }, (_, group) =>
+    `<column key="c${group}">${Array.from({ length: 32 }, (_, child) => `<panel key="p${group}-${child}" />`).join("")}</column>`,
+  ).join("");
+  expectDepth(`${slider}${hidden}</slider>`, 1, "slider over 529 retained nodes");
+  const tooMany = Array.from({ length: 40 }, (_, group) =>
+    `<column key="c${group}">${Array.from({ length: 30 }, (_, child) => `<column key="r${group}-${child}" />`).join("")}</column>`,
+  ).join("");
+  const checked = checkDepth(`${slider}${tooMany}</slider>`);
+  assert.equal(checked.status, 1, checked.stderr);
+  assert.match(checked.stderr, /RetainedWidgetNodeLimit: this tree creates 1241 retained nodes \(limit 1024\)/);
+  assert.doesNotMatch(checked.stderr, /LoweredWidgetNodeLimit/);
 });
 
 test("check budgets the painted branch of a finite class expression", () => {
