@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
-import { compileClass, UtilityError } from "../../sdk/src/class-compiler.js";
+import { compileClass, UtilityError, type ClassProps } from "../../sdk/src/class-compiler.js";
 import { signalDevReload } from "./dev-reload.js";
 import { createDevRebuildLoop } from "./dev-rebuild-loop.js";
 import { endDevRegistration } from "./dev-registration.js";
@@ -2238,18 +2238,51 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     if (!attribute) return [""];
     return staticClassVariants.get(attribute) ?? null;
   };
+  // A layout element lowers to a painted panel around its layout node when
+  // the runtime's hasPaintStyle (runtime/src/main.zig) holds for it, read
+  // through the bridge's unset values: empty colors and shadows are null,
+  // unset corner radii and interaction opacity are -1, and an interaction
+  // `shadow-none` is the explicit override "none".
+  const paintsOwnBox = (props: ClassProps): boolean => {
+    const color = (value: string | undefined) => value !== undefined && value !== "";
+    const count = (value: number | undefined) => value !== undefined && value >= 0;
+    return color(props.background) || color(props.backgroundGradient) || color(props.borderColor) ||
+      (props.borderWidth ?? 0) > 0 || (props.radius ?? 0) > 0 ||
+      count(props.radiusTopLeft) || count(props.radiusTopRight) || count(props.radiusBottomRight) || count(props.radiusBottomLeft) ||
+      color(props.shadow) ||
+      color(props.hoverBackground) || color(props.hoverTextColor) || count(props.hoverOpacity) || color(props.hoverBorderColor) || color(props.hoverShadow) ||
+      color(props.pressedBackground) || color(props.pressedTextColor) || count(props.pressedOpacity) || color(props.pressedBorderColor) || color(props.pressedShadow);
+  };
+  // The explicit `background` prop is a gradient (the class form compiles to
+  // backgroundGradient), so any statically present value paints.
+  const hasBackgroundProp = (node: ts.JsxElement | ts.JsxSelfClosingElement): boolean => {
+    const { attributes } = tagAndAttributes(node);
+    const sourceFile = node.getSourceFile();
+    return attributes.properties.some((attribute) => {
+      if (!ts.isJsxAttribute(attribute) || attribute.name.getText(sourceFile) !== "background") return false;
+      const initializer = attribute.initializer;
+      if (!initializer || !ts.isJsxExpression(initializer) || !initializer.expression) return true;
+      const text = initializer.expression.getText(sourceFile).trim();
+      return text !== "undefined" && text !== "null";
+    });
+  };
+  // Mirrors buildNode: <panel> is always a painted box around a column.
   const isPaintedLayout = (node: ts.JsxElement | ts.JsxSelfClosingElement, tag: string): boolean => {
+    if (tag === "panel") return true;
     if (tag !== "row" && tag !== "column" && tag !== "stack") return false;
+    if (hasBackgroundProp(node)) return true;
     for (const classText of classVariants(node) ?? []) {
       try {
-        const compiled = compileClass(classText);
-        if (Object.keys(compiled).some((key) => key === "background" || key === "radius" || key.startsWith("radius") || key.startsWith("border") || key.toLowerCase().includes("shadow"))) return true;
+        if (paintsOwnBox(compileClass(classText))) return true;
       } catch {
         // The ordinary class validator reports the malformed utility.
       }
     }
     return false;
   };
+  // Leaves draw themselves; buildNode never emits their children, so those
+  // add no Native depth. (They still count as retained nodes below.)
+  const leafTags = new Set(["text", "slider", "icon", "image", "canvas"]);
   const maximum = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: Math.max(0, ...values.map((value) => value.nodes)),
     roots: Math.max(0, ...values.map((value) => value.roots)),
@@ -2346,7 +2379,7 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     return {
       nodes: ownDepth + combinedChildren.nodes,
       roots: 1,
-      depth: ownDepth + combinedChildren.depth,
+      depth: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.depth),
       maxChildren: Math.max(combinedChildren.maxChildren, directChildren, ownDepth === 2 ? 1 : 0),
       canvases: combinedChildren.canvases + (tag === "canvas" ? 1 : 0),
       images: combinedChildren.images + (tag === "image" ? 1 : 0),
@@ -2532,7 +2565,7 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Painted <row>/<column>/<stack> elements add an inner layout node.${limitation}`));
   }
   if (lowered.depth > nativeWidgetDepthLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); painted <row>/<column>/<stack> elements add one nesting level.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); every <panel>, and each <row>/<column>/<stack> that paints its own box (background, border, radius, shadow, or a hover:/pressed: style), adds one nesting level.${limitation}`));
   }
   if (lowered.maxChildren > nativeWidgetChildLimit) {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetChildLimit: one authored parent lowers to ${lowered.maxChildren} direct Native children; child capacity exhausted: max_children=${nativeWidgetChildLimit}, asked for ${lowered.maxChildren}, headroom=${nativeWidgetChildLimit - lowered.maxChildren}.${limitation}`));

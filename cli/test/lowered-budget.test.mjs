@@ -68,6 +68,59 @@ test("check rejects depth after painted layout lowering", () => {
   }
 });
 
+function nested(open, close, levels) {
+  return open.repeat(levels) + "<text>leaf</text>" + close.repeat(levels);
+}
+
+function checkDepth(tree) {
+  const { root, widget } = fixture(source(tree));
+  try {
+    return runCli(root, "check", widget);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// Each case was checked against the runtime: the same tree built by
+// recursion (which check cannot see) renders at 32 lowered levels and goes
+// blank at 33, exactly where check now passes or rejects.
+test("check counts depth the way the runtime lowers it", () => {
+  const gradient = `{{ type: "linear", start: [0, 0], end: [1, 1], stops: [{ offset: 0, color: "cyan-400" }, { offset: 1, color: "violet-500" }] }}`;
+  const painted = [
+    ["<panel>", "</panel>"],
+    ['<column class="hover:bg-[#112233]">', "</column>"],
+    ['<column class="pressed:bg-[#112233]">', "</column>"],
+    ['<column class="hover:opacity-50">', "</column>"],
+    ['<column class="hover:shadow-none">', "</column>"],
+    ['<column class="bg-gradient-to-r from-[#111111] to-[#222222]">', "</column>"],
+    [`<column background=${gradient}>`, "</column>"],
+    ['<column class="rounded-tl-[0px]">', "</column>"],
+  ];
+  for (const [open, close] of painted) {
+    const checked = checkDepth(nested(open, close, 16));
+    assert.equal(checked.status, 1, `${open}: ${checked.stderr}`);
+    assert.match(checked.stderr, /LoweredWidgetDepthLimit: this tree lowers to depth 33 \(Native limit 32\)/, open);
+  }
+  const unpainted = [
+    ['<column class="shadow-none">', "</column>"],
+    ['<column class="rounded-[0px]">', "</column>"],
+    ['<column class="text-shadow-md">', "</column>"],
+  ];
+  for (const [open, close] of unpainted) {
+    const checked = checkDepth(nested(open, close, 16));
+    assert.equal(checked.status, 0, `${open}: ${checked.stderr}`);
+  }
+  // 15 panels (30 levels) + a plain column + text is exactly the limit.
+  const boundary = checkDepth("<panel>".repeat(15) + "<column><text>leaf</text></column>" + "</panel>".repeat(15));
+  assert.equal(boundary.status, 0, boundary.stderr);
+});
+
+test("check does not count depth below leaves the runtime never builds", () => {
+  const slider = '<slider accessibilityLabel="volume" value={1} max={10} onChange={() => {}}>';
+  const checked = checkDepth(`${slider}${nested("<column>", "</column>", 40)}</slider>`);
+  assert.equal(checked.status, 0, checked.stderr);
+});
+
 test("check budgets the painted branch of a finite class expression", () => {
   let tree = "<text>leaf</text>";
   for (let index = 0; index < 16; index += 1) {
