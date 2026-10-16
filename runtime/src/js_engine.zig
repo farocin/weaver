@@ -231,7 +231,7 @@ pub const Engine = struct {
         }
         // Teardown ran widget code outside a turn; the shared exception slot
         // must not keep this realm alive.
-        if (c.JS_HasException(self.context)) logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
+        self.drainExceptions();
         c.JS_SetContextOpaque(self.context, null);
         c.JS_FreeContext(self.context);
         // The realm's cycles, its queued jobs among them (the context owns
@@ -347,6 +347,7 @@ pub const Engine = struct {
     pub fn setHotSwapSeed(self: *Engine, seed: []const u8) Error!void {
         const previous_owner = self.chargeHeap();
         defer heap().current = previous_owner;
+        defer self.drainExceptions();
         const global = c.JS_GetGlobalObject(self.context);
         defer c.JS_FreeValue(self.context, global);
         const value = c.JS_NewStringLen(self.context, seed.ptr, seed.len);
@@ -362,6 +363,7 @@ pub const Engine = struct {
         if (!c.JS_IsString(result)) return null;
         const previous_owner = self.chargeHeap();
         defer heap().current = previous_owner;
+        defer self.drainExceptions();
         var len: usize = 0;
         const raw = c.JS_ToCStringLen2(self.context, &len, result, false) orelse {
             std.log.warn("dev hot swap state capture could not be converted to UTF-8; candidate will use fresh state", .{});
@@ -480,6 +482,21 @@ pub const Engine = struct {
         }
     }
 
+    /// Empty the runtime's shared exception slot, logging what this widget
+    /// left there. Releasing a logged exception can run a finalizer whose
+    /// cleanup fails to queue and throws again, so this repeats until the
+    /// slot stays empty, logging the first few.
+    fn drainExceptions(self: *Engine) void {
+        var drained: usize = 0;
+        while (c.JS_HasException(self.context)) : (drained += 1) {
+            if (drained < 4) {
+                logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
+            } else {
+                c.JS_FreeValue(self.context, c.JS_GetException(self.context));
+            }
+        }
+    }
+
     /// Charge QuickJS allocations to this engine outside a turn; returns
     /// the owner to restore.
     fn chargeHeap(self: *const Engine) js_heap.Owner {
@@ -521,7 +538,7 @@ pub const Engine = struct {
     fn endTurn(self: *Engine) void {
         // The runtime's pending-exception slot is shared by every widget:
         // nothing of this turn may be left in it for the next one.
-        if (c.JS_HasException(self.context)) logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
+        self.drainExceptions();
         self.executing = false;
         executing_engine = null;
         heap().current = heap().hostOwner();
@@ -586,17 +603,23 @@ fn logExceptionFrom(context: *c.JSContext, emit: bool) void {
     widget_diagnostic.report("widget JavaScript exception:\n{s}", .{valueDetails(context, exception, &buffer)});
 }
 
-/// Format `value` for a diagnostic. Formatting runs widget code (toString,
-/// getters) that can itself throw; that exception is dropped here so it
-/// cannot outlive the diagnostic in the runtime's shared exception slot.
+/// Format `value` for a diagnostic without running widget code: no
+/// `toString`, no getters, no Proxy traps. Diagnostics run at turn ends and
+/// in teardown, where widget code could throw again, reject promises nobody
+/// will release, or recurse through the rejection tracker. An Error shows
+/// its name, message and stack; a primitive shows itself; any other thrown
+/// object is named by kind only.
 fn valueDetails(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []const u8 {
     const details = formatValue(context, value, buffer);
+    // Converting a string can still fail to allocate.
     if (c.JS_HasException(context)) c.JS_FreeValue(context, c.JS_GetException(context));
     return details;
 }
 
 fn formatValue(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []const u8 {
     if (c.JS_IsError(value)) return errorValueDetails(context, value, buffer);
+    if (c.JS_IsSymbol(value)) return "a thrown Symbol";
+    if (c.JS_IsObject(value)) return "a thrown object that is not an Error (throw new Error(...) to see its message and stack)";
     var len: usize = 0;
     const raw = c.JS_ToCStringLen2(context, &len, value, false) orelse return "JavaScript value could not be formatted";
     defer c.JS_FreeCString(context, raw);
@@ -605,22 +628,49 @@ fn formatValue(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []con
     return buffer[0..source.len];
 }
 
+/// The string data property `name` of `object` or its prototypes, as a
+/// value the caller frees; null when it is absent, an accessor, not a
+/// string, or behind a Proxy.
+fn stringDataProperty(context: *c.JSContext, object: c.JSValueConst, name: [*:0]const u8) ?c.JSValue {
+    const atom = c.JS_NewAtom(context, name);
+    defer c.JS_FreeAtom(context, atom);
+    var current = c.JS_DupValue(context, object);
+    defer c.JS_FreeValue(context, current);
+    for (0..8) |_| {
+        if (!c.JS_IsObject(current) or c.JS_IsProxy(current)) return null;
+        var descriptor: c.JSPropertyDescriptor = undefined;
+        const found = c.JS_GetOwnProperty(context, &descriptor, current, atom);
+        if (found < 0) return null;
+        if (found > 0) {
+            c.JS_FreeValue(context, descriptor.getter);
+            c.JS_FreeValue(context, descriptor.setter);
+            if (c.JS_IsString(descriptor.value)) return descriptor.value;
+            c.JS_FreeValue(context, descriptor.value);
+            return null;
+        }
+        const next = c.JS_GetPrototype(context, current);
+        c.JS_FreeValue(context, current);
+        current = next;
+    }
+    return null;
+}
+
 fn errorValueDetails(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []const u8 {
-    const name_value = c.JS_GetPropertyStr(context, value, "name");
+    const name_value = stringDataProperty(context, value, "name") orelse qjs.undefinedValue();
     defer c.JS_FreeValue(context, name_value);
-    const message_value = c.JS_GetPropertyStr(context, value, "message");
+    const message_value = stringDataProperty(context, value, "message") orelse qjs.undefinedValue();
     defer c.JS_FreeValue(context, message_value);
-    const stack_value = c.JS_GetPropertyStr(context, value, "stack");
+    const stack_value = stringDataProperty(context, value, "stack") orelse qjs.undefinedValue();
     defer c.JS_FreeValue(context, stack_value);
 
     var name_len: usize = 0;
-    const name_raw = c.JS_ToCStringLen2(context, &name_len, name_value, false);
+    const name_raw = if (c.JS_IsString(name_value)) c.JS_ToCStringLen2(context, &name_len, name_value, false) else null;
     defer if (name_raw) |raw| c.JS_FreeCString(context, raw);
     var message_len: usize = 0;
-    const message_raw = c.JS_ToCStringLen2(context, &message_len, message_value, false);
+    const message_raw = if (c.JS_IsString(message_value)) c.JS_ToCStringLen2(context, &message_len, message_value, false) else null;
     defer if (message_raw) |raw| c.JS_FreeCString(context, raw);
     var stack_len: usize = 0;
-    const stack_raw = c.JS_ToCStringLen2(context, &stack_len, stack_value, false);
+    const stack_raw = if (c.JS_IsString(stack_value)) c.JS_ToCStringLen2(context, &stack_len, stack_value, false) else null;
     defer if (stack_raw) |raw| c.JS_FreeCString(context, raw);
 
     const name = if (name_raw) |raw| raw[0..name_len] else "Error";
@@ -989,6 +1039,51 @@ test "widget code that throws while the runtime handles its error leaves nothing
     const next = try widgets.engine(0);
     defer next.destroy(std.testing.allocator);
     try next.evaluate("globalThis.big = new ArrayBuffer(28 * 1024 * 1024);", "next.js");
+}
+
+test "diagnostics format thrown values without running widget code" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    // Turn ends and teardown format errors; widget code run there could
+    // throw again or reject a promise nothing will release.
+    try engine.evaluate(
+        \\globalThis.ran = [];
+        \\globalThis.thrownObject = { toString() { ran.push("toString"); return "custom"; } };
+        \\globalThis.thrownError = new TypeError("plain message");
+        \\Object.defineProperty(thrownError, "stack", { get() { ran.push("stack getter"); return "x"; } });
+        \\globalThis.proxied = new Error("behind a proxy");
+        \\Object.setPrototypeOf(proxied, new Proxy({}, { get() { ran.push("proxy trap"); return "x"; } }));
+    , "diagnostics.js");
+    const global = c.JS_GetGlobalObject(engine.context);
+    defer c.JS_FreeValue(engine.context, global);
+    var buffer: [max_exception_detail_bytes]u8 = undefined;
+    for ([_][*:0]const u8{ "thrownObject", "thrownError", "proxied" }) |name| {
+        const value = c.JS_GetPropertyStr(engine.context, global, name);
+        defer c.JS_FreeValue(engine.context, value);
+        _ = valueDetails(engine.context, value, &buffer);
+    }
+    const error_value = c.JS_GetPropertyStr(engine.context, global, "thrownError");
+    defer c.JS_FreeValue(engine.context, error_value);
+    try std.testing.expectEqualStrings("TypeError: plain message", valueDetails(engine.context, error_value, &buffer));
+    try engine.evaluate("if (ran.length !== 0) throw new Error('diagnostics ran widget code: ' + ran.join(', '));", "check.js");
+}
+
+test "a hot-swap capture too big to convert leaves the exception slot empty" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    engine.bridge_state.emit_error_logs = false;
+    // The string fits the widget's heap; its UTF-8 copy does not.
+    try engine.evaluate(
+        \\globalThis.__weaverCaptureHotSwap = () => "é".repeat(12 * 1024 * 1024);
+    , "capture.js");
+    try std.testing.expectEqual(@as(?[]u8, null), engine.captureHotSwap(std.testing.allocator));
+    try std.testing.expect(!c.JS_HasException(engine.context));
 }
 
 test "an endless microtask chain stops at its own widget's budget" {
