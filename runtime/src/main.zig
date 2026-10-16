@@ -172,6 +172,10 @@ fn bridgeTimerCapacity() usize {
 const max_images: usize = 16;
 
 comptime {
+    // A heap range per hosted widget, plus one for a dev hot swap's candidate.
+    if (js_engine.max_engines != max_host_widgets + 1) {
+        @compileError("js_engine.max_engines must be max_host_widgets + 1");
+    }
     if (native_sdk.max_registered_canvas_images < max_images * max_host_widgets) {
         @compileError("the Native image registry must hold max_images for every hosted widget");
     }
@@ -2034,7 +2038,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         if (value.len != 0 and !std.mem.eql(u8, value, "0")) {
             const usage = engine.memoryUsage();
             std.log.info(
-                "widget memory receipt model_bytes={d} host_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
+                "widget memory receipt model_bytes={d} host_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_widget_heap_bytes={d} quickjs_widget_heap_grown_bytes={d} quickjs_runtime_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
                 .{
                     @sizeOf(Model),
                     @sizeOf(HostApp),
@@ -2042,6 +2046,8 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
                     @sizeOf(tree_mod.Node),
                     @sizeOf(tree_mod.CanvasState),
                     @sizeOf(js_engine.Engine),
+                    engine.heapBytes(),
+                    engine.heapGrownBytes(),
                     usage.malloc_size,
                     usage.memory_used_size,
                     usage.atom_size,

@@ -6,13 +6,19 @@ const provider_mod = @import("provider.zig");
 const tree_mod = @import("tree.zig");
 const storage_mod = @import("storage.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
+const js_heap = @import("js_heap.zig");
 const c = qjs.c;
 
 // QuickJS receipt (2026-07-29): a synthetic worst-good retained view with
 // 1,024 JS node records measured 629,335 allocator bytes (553,712 live).
-// 32 MiB leaves >50x headroom. QuickJS allocates on demand, so the allowance
-// reserves no resident memory.
+// 32 MiB leaves >50x headroom. It is each engine's heap range (js_heap.zig):
+// address space only, committed as the engine allocates.
 pub const memory_limit_bytes: usize = 32 * 1024 * 1024;
+/// Engines one process can hold at once, one heap range each: every hosted
+/// widget, plus one more so a dev hot swap can build its candidate beside
+/// the engine it replaces. A last range holds runtime-level allocations.
+/// main.zig pins max_host_widgets against it.
+pub const max_engines: usize = 33;
 // The same 1,024-record evaluation measured 8-11 ms in Debug on the Windows
 // test runner. 100 ms leaves >9x measured headroom while still interrupting a
 // runaway callback. This watchdog retains no memory.
@@ -44,11 +50,95 @@ const PendingRejection = struct {
     reason: c.JSValue = qjs.undefinedValue(),
 };
 
-/// A single-widget QuickJS isolate. It runs only when the Native SDK main loop
-/// enters `fireTimer`; no JS thread, OS timer, or hidden render loop exists.
+/// The one QuickJS runtime every engine in the process shares (ADR 0021):
+/// atoms, shapes and the engine itself are paid once. Each widget keeps its
+/// own realm (JSContext, built-ins, globals) and its own heap range, so its
+/// memory cap stays exact. Created with the first engine, freed with the
+/// last.
+const Shared = struct {
+    runtime: *c.JSRuntime,
+    heap: js_heap.Heap,
+    engines: usize = 0,
+    /// Heap ranges handed to live engines.
+    owners_in_use: std.StaticBitSet(max_engines) = .initEmpty(),
+};
+
+var shared: ?Shared = null;
+/// The engine whose turn is running: the interrupt budget is its.
+var executing_engine: ?*Engine = null;
+
+const heap_functions: c.JSMallocFunctions = .{
+    .js_calloc = heapCalloc,
+    .js_malloc = heapMalloc,
+    .js_free = heapFree,
+    .js_realloc = heapRealloc,
+    .js_malloc_usable_size = heapUsableSize,
+};
+
+fn heap() *js_heap.Heap {
+    return &shared.?.heap;
+}
+
+fn heapCalloc(_: ?*anyopaque, count: usize, size: usize) callconv(.c) ?*anyopaque {
+    const bytes = std.math.mul(usize, count, size) catch return null;
+    const block = heap().alloc(bytes) orelse return null;
+    @memset(@as([*]u8, @ptrCast(block))[0..bytes], 0);
+    return block;
+}
+
+fn heapMalloc(_: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    return heap().alloc(size);
+}
+
+fn heapFree(_: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+    heap().free(ptr orelse return);
+}
+
+fn heapRealloc(_: ?*anyopaque, ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    return heap().realloc(ptr, size);
+}
+
+fn heapUsableSize(ptr: ?*const anyopaque) callconv(.c) usize {
+    return heap().usableSize(ptr orelse return 0);
+}
+
+fn acquireShared() !*Shared {
+    if (shared == null) {
+        var heap_state = try js_heap.Heap.init(std.heap.page_allocator, .{ .owners = max_engines + 1, .range_bytes = memory_limit_bytes });
+        errdefer heap_state.deinit(std.heap.page_allocator);
+        shared = .{ .runtime = undefined, .heap = heap_state };
+        const runtime = c.JS_NewRuntime2(&heap_functions, null) orelse {
+            shared.?.heap.deinit(std.heap.page_allocator);
+            shared = null;
+            return error.OutOfMemory;
+        };
+        shared.?.runtime = runtime;
+        c.JS_SetMaxStackSize(runtime, max_stack_bytes);
+        c.JS_SetInterruptHandler(runtime, interruptHandler, null);
+        c.JS_SetHostPromiseRejectionTracker(runtime, promiseRejectionTracker, null);
+    }
+    return &shared.?;
+}
+
+fn releaseShared(owner: js_heap.Owner) void {
+    const state = &shared.?;
+    state.owners_in_use.unset(owner);
+    state.engines -= 1;
+    if (state.engines != 0) return;
+    state.heap.current = state.heap.hostOwner();
+    c.JS_FreeRuntime(state.runtime);
+    state.heap.deinit(std.heap.page_allocator);
+    shared = null;
+}
+
+/// A single-widget QuickJS realm in the shared runtime. It runs only when the
+/// Native SDK main loop enters `fireTimer`; no JS thread, OS timer, or hidden
+/// render loop exists.
 pub const Engine = struct {
     runtime: *c.JSRuntime,
     context: *c.JSContext,
+    /// This engine's heap range: what it allocates, and its memory cap.
+    owner: js_heap.Owner,
     bridge_state: bridge.State,
     provider: *provider_mod.Client,
     deadline_ms: u64 = 0,
@@ -67,13 +157,24 @@ pub const Engine = struct {
     ) !*Engine {
         const self = allocator.create(Engine) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
-        const runtime = c.JS_NewRuntime() orelse return error.OutOfMemory;
-        errdefer c.JS_FreeRuntime(runtime);
+        const state = acquireShared() catch return error.OutOfMemory;
+        const owner: js_heap.Owner = @intCast(blk: {
+            var free = state.owners_in_use.complement().iterator(.{});
+            break :blk free.next() orelse return error.OutOfMemory;
+        });
+        state.owners_in_use.set(owner);
+        state.engines += 1;
+        errdefer releaseShared(owner);
+        const previous_owner = state.heap.current;
+        state.heap.current = owner;
+        defer state.heap.current = previous_owner;
+        const runtime = state.runtime;
         const context = c.JS_NewContext(runtime) orelse return error.OutOfMemory;
         errdefer c.JS_FreeContext(context);
         self.* = .{
             .runtime = runtime,
             .context = context,
+            .owner = owner,
             .bridge_state = undefined,
             .provider = provider,
         };
@@ -85,15 +186,14 @@ pub const Engine = struct {
             .media_transport_enabled = media_transport_enabled,
             .capture_mode = capture_mode,
         };
-        c.JS_SetMemoryLimit(runtime, memory_limit_bytes);
-        c.JS_SetMaxStackSize(runtime, max_stack_bytes);
-        c.JS_SetInterruptHandler(runtime, interruptHandler, self);
-        c.JS_SetHostPromiseRejectionTracker(runtime, promiseRejectionTracker, self);
         bridge.install(context, &self.bridge_state) catch return error.QuickJs;
         return self;
     }
 
     pub fn destroy(self: *Engine, allocator: std.mem.Allocator) void {
+        const state = &shared.?;
+        const previous_owner = state.heap.current;
+        state.heap.current = self.owner;
         self.flushStorage();
         for (&self.pending_rejections) |*pending| {
             c.JS_FreeValue(self.context, pending.promise);
@@ -102,7 +202,11 @@ pub const Engine = struct {
         }
         bridge.deinit(self.context, &self.bridge_state);
         c.JS_FreeContext(self.context);
-        c.JS_FreeRuntime(self.runtime);
+        // The realm's cycles go now, not at some later widget's GC, so the
+        // range is empty before another engine takes it.
+        if (state.engines > 1) c.JS_RunGC(state.runtime);
+        state.heap.current = if (previous_owner == self.owner) state.heap.hostOwner() else previous_owner;
+        releaseShared(self.owner);
         allocator.destroy(self);
     }
 
@@ -114,10 +218,36 @@ pub const Engine = struct {
         defer std.heap.page_allocator.free(terminated);
         self.beginTurn();
         defer self.endTurn();
-        const result = c.JS_Eval(self.context, terminated.ptr, source.len, file_name, c.JS_EVAL_TYPE_GLOBAL);
+        const function = try self.compile(terminated, file_name);
+        const result = c.JS_EvalFunction(self.context, function);
         defer c.JS_FreeValue(self.context, result);
         if (c.JS_IsException(result)) return self.reportException();
         try self.pumpJobs();
+    }
+
+    /// Compile `source` into a function owned by this engine's heap range,
+    /// holding only the bytecode. The parser's working memory is many
+    /// short-lived blocks; made in the widget's range, they would stay
+    /// resident between its long-lived ones. So compile in the shared host
+    /// range, trim it, and copy the finished bytecode across.
+    fn compile(self: *Engine, source: [:0]const u8, file_name: [*:0]const u8) Error!c.JSValue {
+        var size: usize = 0;
+        const written = written: {
+            const scratch = heap().hostOwner();
+            heap().current = scratch;
+            defer {
+                heap().trim(scratch, std.heap.page_allocator) catch {};
+                heap().current = self.owner;
+            }
+            const compiled = c.JS_Eval(self.context, source.ptr, source.len, file_name, c.JS_EVAL_TYPE_GLOBAL | c.JS_EVAL_FLAG_COMPILE_ONLY);
+            if (c.JS_IsException(compiled)) break :written null;
+            defer c.JS_FreeValue(self.context, compiled);
+            break :written c.JS_WriteObject(self.context, &size, compiled, c.JS_WRITE_OBJ_BYTECODE);
+        } orelse return self.reportException();
+        defer c.js_free(self.context, written);
+        const function = c.JS_ReadObject(self.context, written, size, c.JS_READ_OBJ_BYTECODE);
+        if (c.JS_IsException(function)) return self.reportException();
+        return function;
     }
 
     /// Feed an explicit capture fixture through the same provider callback
@@ -164,10 +294,20 @@ pub const Engine = struct {
         return &self.bridge_state.timers;
     }
 
+    /// The shared runtime's totals, every engine included.
     pub fn memoryUsage(self: *const Engine) c.JSMemoryUsage {
         var usage: c.JSMemoryUsage = undefined;
         c.JS_ComputeMemoryUsage(self.runtime, &usage);
         return usage;
+    }
+
+    /// Bytes this engine's own heap range holds.
+    pub fn heapBytes(self: *const Engine) usize {
+        return heap().usedBytes(self.owner);
+    }
+
+    pub fn heapGrownBytes(self: *const Engine) usize {
+        return heap().grownBytes(self.owner);
     }
 
     pub fn setTree(self: *Engine, tree: *tree_mod.Tree) void {
@@ -328,10 +468,14 @@ pub const Engine = struct {
         if (!self.executing) c.JS_UpdateStackTop(self.runtime);
         self.deadline_ms = platform.monotonicMilliseconds() + turn_budget_ms;
         self.executing = true;
+        executing_engine = self;
+        heap().current = self.owner;
     }
 
     fn endTurn(self: *Engine) void {
         self.executing = false;
+        executing_engine = null;
+        heap().current = heap().hostOwner();
     }
 
     /// SDK storage normally flushes on its 200 ms native debounce. A clean
@@ -457,8 +601,11 @@ fn promiseRejectionTracker(
     is_handled: bool,
     opaque_context: ?*anyopaque,
 ) callconv(.c) void {
+    _ = opaque_context;
     const js = context orelse return;
-    const self: *Engine = @ptrCast(@alignCast(opaque_context orelse return));
+    // The context's opaque is its bridge state, a field of its engine.
+    const state: *bridge.State = @ptrCast(@alignCast(c.JS_GetContextOpaque(js) orelse return));
+    const self: *Engine = @fieldParentPtr("bridge_state", state);
     const promise_pointer = c.JS_VALUE_GET_PTR(promise);
     for (&self.pending_rejections) |*pending| {
         if (c.JS_IsUndefined(pending.promise) or c.JS_VALUE_GET_PTR(pending.promise) != promise_pointer) continue;
@@ -482,8 +629,8 @@ fn promiseRejectionTracker(
     std.log.err("widget unhandled promise rejection queue exhausted; newest rejection:\n{s}", .{valueDetails(js, reason, &buffer)});
 }
 
-fn interruptHandler(_: ?*c.JSRuntime, context: ?*anyopaque) callconv(.c) c_int {
-    const self: *Engine = @ptrCast(@alignCast(context orelse return 1));
+fn interruptHandler(_: ?*c.JSRuntime, _: ?*anyopaque) callconv(.c) c_int {
+    const self = executing_engine orelse return 0;
     return if (self.executing and platform.monotonicMilliseconds() >= self.deadline_ms) 1 else 0;
 }
 
@@ -597,4 +744,39 @@ test "unhandled promise rejection is visible while a handled rejection stays hea
     defer handled.destroy(std.testing.allocator);
     try handled.evaluate("Promise.reject(new Error('expected')).catch(() => {});", "handled-promise-test.js");
     try std.testing.expect(!handled.renderFailed());
+}
+
+test "a widget at its memory cap leaves its neighbour's realm untouched" {
+    var provider: provider_mod.Client = .{};
+    try provider.init(std.testing.io, null);
+    defer provider.deinit();
+    var store: storage_mod.Store = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .directory = ".",
+        .path = "weaver-js-engine-test-storage.json",
+        .temporary_path = "weaver-js-engine-test-storage.tmp",
+    };
+    var neighbour_tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
+    defer neighbour_tree.deinit();
+    const neighbour = try createTestEngine(&neighbour_tree, &store, &provider);
+    defer neighbour.destroy(std.testing.allocator);
+    try neighbour.evaluate("globalThis.kept = new Array(1000).fill(7);", "neighbour.js");
+    const neighbour_bytes = neighbour.heapBytes();
+
+    var hog_tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
+    defer hog_tree.deinit();
+    const hog = try createTestEngine(&hog_tree, &store, &provider);
+    try hog.evaluate(
+        \\globalThis.hog = [];
+        \\let message = "";
+        \\try { for (;;) hog.push(new ArrayBuffer(4 * 1024 * 1024)); } catch (error) { message = String(error); }
+        \\if (!message.includes("out of memory")) throw new Error("expected out of memory, got " + message);
+    , "hog.js");
+    try std.testing.expect(hog.heapBytes() > memory_limit_bytes / 2);
+    try std.testing.expect(hog.heapBytes() <= memory_limit_bytes);
+    hog.destroy(std.testing.allocator);
+
+    try std.testing.expectEqual(neighbour_bytes, neighbour.heapBytes());
+    try neighbour.evaluate("if (kept.length !== 1000 || kept[999] !== 7) throw new Error('neighbour lost its state');", "neighbour-check.js");
 }
