@@ -206,6 +206,100 @@ fn gcTrigger(_: ?*c.JSRuntime, size: usize) callconv(.c) bool {
     return true;
 }
 
+/// Built-in families a widget realm loads the first time one of their
+/// globals is read or written, rather than with the realm: most widgets use
+/// neither, and together they are about 20 KiB of every realm (typed arrays
+/// 15.8 KiB, atob/btoa 4.4 KiB; measured 2026-10-15). Every other family
+/// `JS_NewContext` adds stays eager: RegExp because a literal needs its
+/// class without reading a global.
+const LazyFamily = enum { typed_arrays, base64 };
+
+const lazy_globals = [_]struct { name: [:0]const u8, family: LazyFamily }{
+    .{ .name = "ArrayBuffer", .family = .typed_arrays },
+    .{ .name = "SharedArrayBuffer", .family = .typed_arrays },
+    .{ .name = "Uint8ClampedArray", .family = .typed_arrays },
+    .{ .name = "Int8Array", .family = .typed_arrays },
+    .{ .name = "Uint8Array", .family = .typed_arrays },
+    .{ .name = "Int16Array", .family = .typed_arrays },
+    .{ .name = "Uint16Array", .family = .typed_arrays },
+    .{ .name = "Int32Array", .family = .typed_arrays },
+    .{ .name = "Uint32Array", .family = .typed_arrays },
+    .{ .name = "BigInt64Array", .family = .typed_arrays },
+    .{ .name = "BigUint64Array", .family = .typed_arrays },
+    .{ .name = "Float16Array", .family = .typed_arrays },
+    .{ .name = "Float32Array", .family = .typed_arrays },
+    .{ .name = "Float64Array", .family = .typed_arrays },
+    .{ .name = "DataView", .family = .typed_arrays },
+    .{ .name = "Atomics", .family = .typed_arrays },
+    .{ .name = "atob", .family = .base64 },
+    .{ .name = "btoa", .family = .base64 },
+    .{ .name = "DOMException", .family = .base64 },
+};
+
+/// A widget's realm: what `JS_NewContext` builds, with the `lazy_globals`
+/// families behind accessors that load them on first use. Those accessors
+/// are configurable and not enumerable, as the built-ins are, and loading a
+/// family replaces every one of its accessors with the real definition.
+fn newWidgetContext(runtime: *c.JSRuntime) ?*c.JSContext {
+    const context = c.JS_NewContextRaw(runtime) orelse return null;
+    const eager = [_]*const fn (?*c.JSContext) callconv(.c) c_int{
+        c.JS_AddIntrinsicBaseObjects,
+        c.JS_AddIntrinsicDate,
+        c.JS_AddIntrinsicEval,
+        c.JS_AddIntrinsicRegExp,
+        c.JS_AddIntrinsicJSON,
+        c.JS_AddIntrinsicProxy,
+        c.JS_AddIntrinsicMapSet,
+        c.JS_AddIntrinsicPromise,
+        c.JS_AddIntrinsicWeakRef,
+        c.JS_AddPerformance,
+    };
+    for (eager) |add| {
+        if (add(context) < 0) {
+            c.JS_FreeContext(context);
+            return null;
+        }
+    }
+    const global = c.JS_GetGlobalObject(context);
+    defer c.JS_FreeValue(context, global);
+    for (lazy_globals, 0..) |entry, index| {
+        const getter = c.JS_NewCFunctionMagic(context, loadLazyGlobal, entry.name.ptr, 0, c.JS_CFUNC_generic_magic, @intCast(index));
+        const setter = c.JS_NewCFunctionMagic(context, loadLazyGlobal, entry.name.ptr, 1, c.JS_CFUNC_generic_magic, @intCast(index));
+        const atom = c.JS_NewAtom(context, entry.name.ptr);
+        defer c.JS_FreeAtom(context, atom);
+        if (c.JS_DefinePropertyGetSet(context, global, atom, getter, setter, c.JS_PROP_CONFIGURABLE) < 0) {
+            c.JS_FreeContext(context);
+            return null;
+        }
+    }
+    return context;
+}
+
+/// The accessor behind a lazy global: load its family into this realm,
+/// then read (no argument) or assign (one argument) the real global.
+fn loadLazyGlobal(context: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst, magic: c_int) callconv(.c) c.JSValue {
+    const js = context orelse return qjs.exceptionValue();
+    const entry = lazy_globals[@intCast(magic)];
+    const global = c.JS_GetGlobalObject(js);
+    defer c.JS_FreeValue(js, global);
+    // The family's own definitions would otherwise run into these
+    // accessors (and load the family again).
+    for (lazy_globals) |other| {
+        if (other.family != entry.family) continue;
+        const atom = c.JS_NewAtom(js, other.name.ptr);
+        defer c.JS_FreeAtom(js, atom);
+        if (c.JS_DeleteProperty(js, global, atom, 0) < 0) return qjs.exceptionValue();
+    }
+    const loaded = switch (entry.family) {
+        .typed_arrays => c.JS_AddIntrinsicTypedArrays(js),
+        .base64 => c.JS_AddIntrinsicAToB(js),
+    };
+    if (loaded < 0) return qjs.exceptionValue();
+    if (argc == 0) return c.JS_GetPropertyStr(js, global, entry.name.ptr);
+    if (c.JS_SetPropertyStr(js, global, entry.name.ptr, c.JS_DupValue(js, argv[0])) < 0) return qjs.exceptionValue();
+    return qjs.undefinedValue();
+}
+
 fn releaseShared(owner: js_heap.Owner) void {
     const state = &shared.?;
     state.heap.releaseOwner(owner);
@@ -252,7 +346,7 @@ pub const Engine = struct {
         state.heap.current = owner;
         defer state.heap.current = previous_owner;
         const runtime = state.runtime;
-        const context = c.JS_NewContext(runtime) orelse {
+        const context = newWidgetContext(runtime) orelse {
             // Building the realm can throw (out of memory) into the shared
             // exception slot with no context left to take it from.
             c.JS_DropRuntimeException(runtime);
@@ -1359,6 +1453,37 @@ test "a widget's garbage is collected before it reaches its own cap" {
     for (0..12) |_| try churner.evaluate("{ const node = { pad: new ArrayBuffer(4 * 1024 * 1024) }; node.self = node; }", "churn.js");
 }
 
+test "a widget realm has every built-in a full realm has, the lazy ones on first use" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    // The globals of a realm built with every family at once.
+    const full = c.JS_NewContext(engine.runtime).?;
+    defer c.JS_FreeContext(full);
+    const keys_source = "Reflect.ownKeys(globalThis).filter((k) => typeof k === 'string').join(',')";
+    const names = c.JS_Eval(full, keys_source, keys_source.len, "keys.js", c.JS_EVAL_TYPE_GLOBAL);
+    defer c.JS_FreeValue(full, names);
+    const text = c.JS_ToCString(full, names).?;
+    defer c.JS_FreeCString(full, text);
+    // Each of them exists here, the lazy ones not enumerable (as the built-ins
+    // they stand in for are not), and works.
+    var check: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer check.deinit();
+    try check.writer.print(
+        \\const names = "{s}".split(",");
+        \\const missing = names.filter((name) => !Object.prototype.hasOwnProperty.call(globalThis, name));
+        \\if (missing.length > 0) throw new Error("missing " + missing.join(","));
+        \\const shown = Object.keys(globalThis).filter((name) => ["ArrayBuffer", "Uint8Array", "Atomics", "atob", "DOMException"].includes(name));
+        \\if (shown.length > 0) throw new Error("enumerable " + shown.join(","));
+        \\if (new Uint8Array([1, 2, 3]).length !== 3 || new DataView(new ArrayBuffer(4)).byteLength !== 4) throw new Error("typed arrays");
+        \\if (atob(btoa("weaver")) !== "weaver") throw new Error("base64");
+        \\if (!("value" in Object.getOwnPropertyDescriptor(globalThis, "Float64Array"))) throw new Error("still an accessor");
+    , .{std.mem.span(text)});
+    try engine.evaluate(check.written(), "lazy.js");
+}
+
 test "every realm, not just the first, throws a real DOMException from atob" {
     var widgets: TestWidgets = .{};
     try widgets.init();
@@ -1370,6 +1495,18 @@ test "every realm, not just the first, throws a real DOMException from atob" {
     const check = "try { atob('!'); throw new Error('no throw'); } catch (error) { if (!(error instanceof DOMException) || error.name !== 'InvalidCharacterError') throw error; }";
     try first.evaluate(check, "first.js");
     try second.evaluate(check, "second.js");
+}
+
+test "assigning a lazy global before reading it keeps the assignment" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    try engine.evaluate(
+        \\globalThis.atob = () => "mine";
+        \\if (atob("x") !== "mine" || typeof btoa !== "function") throw new Error("assignment lost");
+    , "assign.js");
 }
 
 test "a destroyed widget's range comes back whole, queued jobs and all" {
