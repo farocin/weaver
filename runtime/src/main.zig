@@ -8,6 +8,7 @@ const gradient_mod = @import("gradients.zig");
 const dev_reload = @import("dev_reload.zig");
 const image_paths = @import("image_paths.zig");
 const js_engine = @import("js_engine.zig");
+
 const manifest_mod = @import("manifest.zig");
 const provider_mod = @import("provider.zig");
 const platform = @import("platform/root.zig");
@@ -17,6 +18,11 @@ const tree_mod = @import("tree.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
+
+/// Small objects that live as long as a widget: its engine and the image
+/// resolver's paths. The C heap packs them; `page_allocator` rounded each to
+/// its own 4 KiB page.
+const small_allocator = std.heap.c_allocator;
 
 comptime {
     if (native_sdk.platform.max_windows != 1 or
@@ -424,7 +430,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
     candidate_tree_moved = true;
     candidate.setTree(&model.tree);
     model.engine = candidate;
-    old_engine.destroy(std.heap.page_allocator);
+    old_engine.destroy(small_allocator);
     model.dev_seen_mtime = mtime;
     syncTimers(model, effects);
     std.log.info("dev hot swap applied ({s} root hook state)", .{if (preserved) "preserved" else "fresh"});
@@ -433,7 +439,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
 fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, seed: ?[]const u8) !*js_engine.Engine {
     const storage = model.storage orelse return error.MissingStorage;
     const candidate = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         tree,
         storage,
         model.origins,
@@ -441,7 +447,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
         model.media_transport_enabled,
         false,
     );
-    errdefer candidate.destroy(std.heap.page_allocator);
+    errdefer candidate.destroy(small_allocator);
     if (seed) |value| try candidate.setHotSwapSeed(value);
     try candidate.evaluate(source, "bundle.js");
     if (candidate.renderFailed()) return error.CandidateFirstRenderFailed;
@@ -1505,7 +1511,7 @@ pub fn main(init: std.process.Init) !void {
     const fonts = try loadFonts(init.io, allocator, directory, loaded.manifest.fonts);
     var image_resolver = try image_paths.Resolver.init(
         init.io,
-        std.heap.page_allocator,
+        small_allocator,
         directory,
         if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
     );
@@ -1562,7 +1568,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, capability, "media-transport")) break true;
     } else false;
     const engine = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         &app_state.model.tree,
         &storage,
         loaded.manifest.origins,
@@ -1577,7 +1583,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     app_state.model.engine = engine;
-    defer if (app_state.model.engine) |current| current.destroy(std.heap.page_allocator);
+    defer if (app_state.model.engine) |current| current.destroy(small_allocator);
     app_state.model.io = init.io;
     app_state.model.storage = &storage;
     app_state.model.origins = loaded.manifest.origins;
