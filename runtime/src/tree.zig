@@ -625,7 +625,9 @@ pub const Tree = struct {
         return error.NodeLimit;
     }
 
-    /// A node to change: an open batch records it first. Reads use
+    /// A node to change: an open batch records it first, so the pointer is
+    /// for changes within the batch it was taken in (one taken earlier and
+    /// written during a batch would escape the record). Reads use
     /// `nodeConst`.
     pub fn node(self: *Tree, id: NodeId) Error!*Node {
         if (id == 0 or id > max_nodes) return error.InvalidNode;
@@ -1009,6 +1011,8 @@ pub const Tree = struct {
         self.changed();
     }
 
+    /// A canvas to change; like `node`, recorded when taken, so the pointer is
+    /// for changes within the batch it was taken in.
     pub fn canvasState(self: *Tree, id: NodeId) Error!*CanvasState {
         const target = try self.nodeConst(id);
         if (target.kind != .canvas or target.canvas_slot == 0) return error.InvalidNode;
@@ -1211,7 +1215,12 @@ pub const Tree = struct {
         var children: [max_children]NodeId = undefined;
         @memcpy(children[0..count], target.children[0..count]);
         for (children[0..count]) |child_id| self.removeSubtree(child_id);
-        if (target.canvas_slot > 0) self.canvas_occupied.unset(target.canvas_slot - 1);
+        if (target.canvas_slot > 0) {
+            // Recorded before its slot is let go: an abort, even after the
+            // tree moved (which copies only occupied slots), restores it.
+            if (self.recording) self.rememberCanvas(target.canvas_slot - 1);
+            self.canvas_occupied.unset(target.canvas_slot - 1);
+        }
         inline for (owned_slices) |field| self.releaseSlice(id - 1, field, @field(target, field));
         self.occupied.unset(id - 1);
     }
@@ -1652,6 +1661,30 @@ test "aborting restores a canvas whose slot the batch reused" {
     const restored = try tree.canvasStateConst(canvas);
     try std.testing.expectEqual(@as(usize, 1), restored.command_count);
     try std.testing.expectEqual(@as(f32, 1), restored.commands[0].polyline.points[0].x);
+    try std.testing.expectEqual(@as(f32, 4), restored.commands[0].polyline.points[1].y);
+    try std.testing.expect(@intFromPtr(restored.commands[0].polyline.points.ptr) == @intFromPtr(&restored.points));
+}
+
+test "aborting after the tree moved restores a canvas the batch removed" {
+    var tree: Tree = .{ .allocator = std.testing.allocator };
+    defer tree.deinit();
+    const root = try tree.createNode(.column);
+    const canvas = try tree.createNode(.canvas);
+    try tree.appendChild(root, canvas);
+    try tree.setRoot(root);
+    try tree.setCanvasCommands(canvas, &.{ 5, 1, 0xffffffff, 2, 1, 2, 3, 4 });
+
+    try tree.beginBatch();
+    try tree.removeNode(canvas);
+    const moved = try std.testing.allocator.create(Tree);
+    defer std.testing.allocator.destroy(moved);
+    resetEmpty(moved, std.testing.allocator);
+    moved.moveFrom(&tree);
+    defer moved.deinit();
+    moved.abortBatch();
+
+    const restored = try moved.canvasStateConst(canvas);
+    try std.testing.expectEqual(@as(usize, 2), restored.point_count);
     try std.testing.expectEqual(@as(f32, 4), restored.commands[0].polyline.points[1].y);
     try std.testing.expect(@intFromPtr(restored.commands[0].polyline.points.ptr) == @intFromPtr(&restored.points));
 }
