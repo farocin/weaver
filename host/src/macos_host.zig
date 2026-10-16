@@ -924,11 +924,11 @@ const Host = struct {
     }
 
     fn hasAudioSubscribers(self: *const Host) bool {
-        return supervisor.hasSubscription(self.slots.all(), .audio, self);
+        return supervisor.hasSubscription(self.slots.allConst(), .audio, self);
     }
 
     fn hasMediaSubscribers(self: *const Host) bool {
-        return supervisor.hasSubscription(self.slots.all(), .media, self);
+        return supervisor.hasSubscription(self.slots.allConst(), .media, self);
     }
 
     fn sampleAudio(self: *Host, now_ms: u64) void {

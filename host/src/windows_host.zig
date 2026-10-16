@@ -35,6 +35,12 @@ const env_renderer_log = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER
 const env_art_cache = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_ART_CACHE");
 const env_crash_breadcrumb = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_CRASH_BREADCRUMB");
 const max_widgets = supervisor.max_widgets;
+/// While any widget is installed, the loop looks at sources and sidecars
+/// this often: a widget whose source vanished stops, a hosted widget whose
+/// bundle failed to load is latched stopped, and backend changes reach
+/// status.json. Five seconds is a few file reads per widget, invisible in
+/// CPU (2026-10-16); the old loop did all this every one to two seconds.
+const sweep_interval_ms: u64 = 5000;
 
 /// Auto-reset event the supervision loop waits on: provider pipe readers
 /// and media executors set it when they queue work, so the loop sleeps
@@ -259,6 +265,7 @@ const Host = struct {
     shared: SharedHost = .{},
     /// No default: only the slot count is written at startup (initDefaults).
     slots: supervisor.Slots(@FieldType(Slot, "platform")),
+    next_sweep_ms: u64 = 0,
     sampler: providers.Sampler = .{},
     audio_provider: audio.Provider = .{},
     media_provider: media.Provider = .{},
@@ -830,8 +837,9 @@ const Host = struct {
     }
 
     /// The earliest deadline the loop owns, or null when it can sleep until
-    /// an event: a CPU/memory sample while something subscribes, a backoff
-    /// relaunch, a renderer restart, or a missing source to look for again.
+    /// an event: the sweep while any widget is installed, a CPU/memory
+    /// sample while something subscribes, a backoff relaunch, a renderer
+    /// restart, or a missing source to look for again.
     fn nextDeadlineMs(self: *Host, next_provider_ms: u64) ?u64 {
         var deadline: ?u64 = null;
         const consider = struct {
@@ -841,6 +849,7 @@ const Host = struct {
         }.at;
         for (self.slots.all(), 0..) |*slot, index| {
             if (!slot.used or !slot.enabled) continue;
+            consider(&deadline, self.next_sweep_ms);
             if (self.running(index) and (slot.wants_cpu or slot.wants_memory)) consider(&deadline, next_provider_ms);
             const process_running = slot.platform.process != null or slot.platform.hosted;
             if (!process_running and (slot.state == .starting or slot.state == .backoff)) consider(&deadline, slot.next_restart_ms);
@@ -864,6 +873,23 @@ const Host = struct {
             hash.update(std.mem.asBytes(&slot.platform.pid));
             hash.update(std.mem.asBytes(&slot.platform.hosted));
             hash.update(slot.reason());
+        }
+        return hash.final();
+    }
+
+    /// What status.json shows from the widgets' sidecars: each one's
+    /// backend (or a load failure) and whether it has gone ten seconds
+    /// without presenting a frame. Read only by the sweep: file reads, not
+    /// for every wake.
+    fn sidecarFingerprint(self: *Host, now_ms: u64) u64 {
+        var hash = std.hash.Wyhash.init(0);
+        for (self.slots.all()) |*slot| {
+            if (!slot.used or (slot.platform.process == null and !slot.platform.hosted) or slot.platform.backend_path_len == 0) continue;
+            const backend = small_fs.readAlloc(self.allocator, slot.platform.backendPath(), 16) catch null;
+            defer if (backend) |bytes| self.allocator.free(bytes);
+            hash.update(backend orelse "-");
+            const silent = backend == null and now_ms -| slot.started_ms >= 10_000;
+            hash.update(std.mem.asBytes(&silent));
         }
         return hash.final();
     }
@@ -1074,7 +1100,8 @@ const Host = struct {
         supervisor.recordChannelFailure(slot, now_ms);
     }
 
-    fn writeStatus(self: *Host, now_ms: u64) void {
+    /// Publish status.json; false when it could not be written.
+    fn writeStatus(self: *Host, now_ms: u64) bool {
         if (self.thread_sample_ms == 0 or now_ms -| self.thread_sample_ms >= 30_000) {
             self.slot_threads = [_]u32{0} ** max_widgets;
             self.renderer_threads = 0;
@@ -1163,9 +1190,16 @@ const Host = struct {
             .audio_capture_starts = self.audio_provider.capture_starts,
             .audio_provider_frames = self.audio_provider.frame_count,
             .audio_last_error = self.audio_provider.last_error,
-        }, entries[0..entry_count]) catch |err| return self.noteStatusWriteFailure("encode", err);
-        small_fs.writeReplace(self.allocator, self.status_temp_path, self.status_path, output.written()) catch |err| return self.noteStatusWriteFailure("publish", err);
+        }, entries[0..entry_count]) catch |err| {
+            self.noteStatusWriteFailure("encode", err);
+            return false;
+        };
+        small_fs.writeReplace(self.allocator, self.status_temp_path, self.status_path, output.written()) catch |err| {
+            self.noteStatusWriteFailure("publish", err);
+            return false;
+        };
         self.noteStatusWriteRecovery();
+        return true;
     }
 
     fn noteStatusWriteFailure(self: *Host, operation: []const u8, err: anyerror) void {
@@ -1325,6 +1359,7 @@ fn run(init: std.process.Init) !void {
     }
     var next_provider_ms: u64 = 0;
     var published_state: u64 = 0;
+    var published_sidecars: u64 = 0;
     while (true) {
         // Sleep until something happens: a signal, queued pipe work, a
         // child process exiting, or a deadline the loop owns. Live audio
@@ -1366,17 +1401,33 @@ fn run(init: std.process.Init) !void {
             host.sampleProviders();
             next_provider_ms = now + 1000;
         }
+        // The sweep: what the old two-second loop noticed on the side. A
+        // hosted widget's load failure (its sidecar) is latched, a vanished
+        // source is seen by supervise on this wake, and a sidecar change
+        // (backend, "no frames presented") is published.
+        var sidecars_changed = false;
+        if (now >= host.next_sweep_ms) {
+            host.noteHostedLoadFailures();
+            sidecars_changed = host.sidecarFingerprint(now) != published_sidecars;
+            host.next_sweep_ms = now + sweep_interval_ms;
+        }
         if (wait == c.WAIT_OBJECT_0 + 2) {
             // `weaver status` is asking: costs since the last request, as
-            // of now, and whatever the widgets have reported since.
+            // of now, and whatever the widgets have reported since. Only a
+            // published status is acknowledged; a failed write leaves the
+            // CLI to time out and say so.
             host.noteHostedLoadFailures();
             host.sampleCostsNow(now);
-            host.writeStatus(now);
-            published_state = host.stateFingerprint();
-            _ = c.SetEvent(status_ready_event);
-        } else if (host.stateFingerprint() != published_state) {
-            host.writeStatus(now);
-            published_state = host.stateFingerprint();
+            if (host.writeStatus(now)) {
+                published_state = host.stateFingerprint();
+                published_sidecars = host.sidecarFingerprint(now);
+                _ = c.SetEvent(status_ready_event);
+            }
+        } else if (sidecars_changed or host.stateFingerprint() != published_state) {
+            if (host.writeStatus(now)) {
+                published_state = host.stateFingerprint();
+                published_sidecars = host.sidecarFingerprint(now);
+            }
         }
     }
     host.stopSharedHost(true);
@@ -1387,7 +1438,7 @@ fn run(init: std.process.Init) !void {
         _ = c.CloseHandle(process);
         host.renderer.platform.process = null;
     }
-    host.writeStatus(c.GetTickCount64());
+    _ = host.writeStatus(c.GetTickCount64());
 }
 
 /// Write each defaulted field of `value` on its own. Assigning a whole
