@@ -287,6 +287,8 @@ struct JSRuntime {
     struct list_head context_list; /* list of JSContext.link */
     /* Weaver: charges a job's allocation to its context (JS_SetChargeJobFunc). */
     JSChargeJobFunc *charge_job;
+    /* Weaver: charges runtime-wide tables to no context (JS_SetChargeSharedFunc). */
+    JSChargeSharedFunc *charge_shared;
     /* list of JSGCObjectHeader.link. List of allocated GC objects (used
        by the garbage collector) */
     struct list_head gc_obj_list;
@@ -2181,6 +2183,31 @@ void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func)
     rt->charge_job = func;
 }
 
+void JS_SetChargeSharedFunc(JSRuntime *rt, JSChargeSharedFunc *func)
+{
+    rt->charge_shared = func;
+}
+
+/* Weaver: allocate a runtime-wide table outside the running context's
+   charge, so it does not stay in that context's memory after it is gone. */
+static void *js_mallocz_shared(JSRuntime *rt, size_t size)
+{
+    void *restore = rt->charge_shared ? rt->charge_shared(rt, NULL) : NULL;
+    void *ptr = js_mallocz_rt(rt, size);
+    if (restore)
+        rt->charge_shared(rt, restore);
+    return ptr;
+}
+
+static void *js_realloc_shared(JSRuntime *rt, void *ptr, size_t size)
+{
+    void *restore = rt->charge_shared ? rt->charge_shared(rt, NULL) : NULL;
+    void *moved = js_realloc_rt(rt, ptr, size);
+    if (restore)
+        rt->charge_shared(rt, restore);
+    return moved;
+}
+
 /* Weaver: the first context with a pending job, in creation order. */
 static JSContext *js_first_context_with_jobs(JSRuntime *rt)
 {
@@ -3037,7 +3064,7 @@ static int JS_ResizeAtomHash(JSRuntime *rt, int new_hash_size)
 
     assert((new_hash_size & (new_hash_size - 1)) == 0); /* power of two */
     new_hash_mask = new_hash_size - 1;
-    new_hash = js_mallocz_rt(rt, sizeof(rt->atom_hash[0]) * new_hash_size);
+    new_hash = js_mallocz_shared(rt, sizeof(rt->atom_hash[0]) * new_hash_size);
     if (!new_hash)
         return -1;
     for(i = 0; i < rt->atom_hash_size; i++) {
@@ -3218,14 +3245,14 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         if (new_size > JS_ATOM_MAX)
             goto fail;
         /* XXX: should use realloc2 to use slack space */
-        new_array = js_realloc_rt(rt, rt->atom_array, sizeof(*new_array) * new_size);
+        new_array = js_realloc_shared(rt, rt->atom_array, sizeof(*new_array) * new_size);
         if (!new_array)
             goto fail;
         /* Note: the atom 0 is not used */
         start = rt->atom_size;
         if (start == 0) {
             /* JS_ATOM_NULL entry */
-            p = js_mallocz_rt(rt, sizeof(JSAtomStruct));
+            p = js_mallocz_shared(rt, sizeof(JSAtomStruct));
             if (!p) {
                 js_free_rt(rt, new_array);
                 goto fail;
@@ -5330,8 +5357,8 @@ static int resize_shape_hash(JSRuntime *rt, int new_shape_hash_bits)
     JSShape **new_shape_hash, *sh, *sh_next;
 
     new_shape_hash_size = 1 << new_shape_hash_bits;
-    new_shape_hash = js_mallocz_rt(rt, sizeof(rt->shape_hash[0]) *
-                                   new_shape_hash_size);
+    new_shape_hash = js_mallocz_shared(rt, sizeof(rt->shape_hash[0]) *
+                                       new_shape_hash_size);
     if (!new_shape_hash)
         return -1;
     for(i = 0; i < rt->shape_hash_size; i++) {

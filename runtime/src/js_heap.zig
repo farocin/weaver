@@ -114,6 +114,16 @@ pub const Heap = struct {
         return self.ranges[owner].used;
     }
 
+    /// Give an empty range back whole: the empty granules its size classes
+    /// keep for reuse would otherwise sit scattered through it, and the next
+    /// owner could not get one run as long as the range allows.
+    pub fn resetRange(self: *Heap, owner: Owner) void {
+        const range = &self.ranges[owner];
+        std.debug.assert(range.used == 0);
+        if (range.committed > 0) decommit(self.rangeBase(owner), range.committed);
+        range.* = .{};
+    }
+
     /// Bytes of `owner`'s heap area below its top: the most that can be
     /// resident (free runs inside it are mostly decommitted).
     pub fn grownBytes(self: *const Heap, owner: Owner) usize {

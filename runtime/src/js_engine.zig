@@ -86,7 +86,22 @@ fn heap() *js_heap.Heap {
     return &shared.?.heap;
 }
 
+/// Tests only: how many more QuickJS allocations succeed before one fails.
+var test_allocations_left: ?usize = null;
+
+fn testAllocationFails() bool {
+    if (!@import("builtin").is_test) return false;
+    const left = test_allocations_left orelse return false;
+    if (left == 0) {
+        test_allocations_left = null;
+        return true;
+    }
+    test_allocations_left = left - 1;
+    return false;
+}
+
 fn heapCalloc(_: ?*anyopaque, count: usize, size: usize) callconv(.c) ?*anyopaque {
+    if (testAllocationFails()) return null;
     const bytes = std.math.mul(usize, count, size) catch return null;
     const block = heap().alloc(bytes) orelse return null;
     @memset(@as([*]u8, @ptrCast(block))[0..bytes], 0);
@@ -94,6 +109,7 @@ fn heapCalloc(_: ?*anyopaque, count: usize, size: usize) callconv(.c) ?*anyopaqu
 }
 
 fn heapMalloc(_: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    if (testAllocationFails()) return null;
     return heap().alloc(size);
 }
 
@@ -102,6 +118,7 @@ fn heapFree(_: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
 }
 
 fn heapRealloc(_: ?*anyopaque, ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    if (testAllocationFails()) return null;
     return heap().realloc(ptr, size);
 }
 
@@ -126,6 +143,7 @@ fn acquireShared() !*Shared {
         c.JS_SetInterruptHandler(runtime, interruptHandler, null);
         c.JS_SetHostPromiseRejectionTracker(runtime, promiseRejectionTracker, null);
         c.JS_SetChargeJobFunc(runtime, chargeJob);
+        c.JS_SetChargeSharedFunc(runtime, chargeShared);
     }
     return &shared.?;
 }
@@ -146,8 +164,26 @@ fn chargeJob(context: ?*c.JSContext, restore: ?*anyopaque) callconv(.c) ?*anyopa
     return @ptrFromInt(@as(usize, previous) + 1);
 }
 
+/// `JS_SetChargeSharedFunc`: the runtime's own tables (atoms, shapes) grow
+/// in the host range whichever widget's turn grew them, so a widget's range
+/// is empty once the widget is gone. Returns the owner to restore, plus one,
+/// or null when no switch was needed.
+fn chargeShared(_: ?*c.JSRuntime, restore: ?*anyopaque) callconv(.c) ?*anyopaque {
+    if (restore) |token| {
+        heap().current = @intCast(@intFromPtr(token) - 1);
+        return null;
+    }
+    const previous = heap().current;
+    if (previous == heap().hostOwner()) return null;
+    heap().current = heap().hostOwner();
+    return @ptrFromInt(@as(usize, previous) + 1);
+}
+
 fn releaseShared(owner: js_heap.Owner) void {
     const state = &shared.?;
+    // Empty unless something the runtime shares still lives there (an atom
+    // another widget uses); then the range is left as it is.
+    if (state.heap.usedBytes(owner) == 0) state.heap.resetRange(owner);
     state.owners_in_use.unset(owner);
     state.engines -= 1;
     if (state.engines != 0) return;
@@ -202,6 +238,13 @@ pub const Engine = struct {
             return error.OutOfMemory;
         };
         errdefer c.JS_FreeContext(context);
+        // Building the realm can run out of memory part way and still return
+        // a context, its exception left in the shared slot: that realm is
+        // not whole, and the exception is not the next widget's.
+        if (c.JS_HasException(context)) {
+            c.JS_FreeValue(context, c.JS_GetException(context));
+            return error.OutOfMemory;
+        }
         errdefer if (c.JS_HasException(context)) c.JS_FreeValue(context, c.JS_GetException(context));
         self.* = .{
             .runtime = runtime,
@@ -1162,6 +1205,42 @@ test "freed small blocks give their capacity back to the widget" {
     try engine.evaluate("globalThis.strings = null;", "churn.js");
     c.JS_RunGC(engine.runtime);
     try engine.evaluate("globalThis.big = new ArrayBuffer(24 * 1024 * 1024);", "big.js");
+}
+
+test "the runtime's own tables leave nothing in a destroyed widget's range" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    const leaving = try widgets.engine(0);
+    const owner = leaving.owner;
+    // Each object gets a shape of its own, so the runtime's shape table
+    // grows during this widget's turns.
+    try leaving.evaluate("globalThis.kept = [];", "kept.js");
+    for (0..35) |_| try leaving.evaluate("for (let i = 0; i < 2000; i += 1) kept.push(Object.create({}));", "shapes.js");
+    leaving.destroy(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(owner));
+
+    const next = try widgets.engine(0);
+    defer next.destroy(std.testing.allocator);
+    try std.testing.expectEqual(owner, next.owner);
+    try next.evaluate("globalThis.big = new ArrayBuffer(30 * 1024 * 1024);", "next.js");
+}
+
+test "a realm that runs out of memory while it is built leaves no exception behind" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    for ([_]usize{ 100, 200, 400, 800 }) |allocations| {
+        test_allocations_left = allocations;
+        const created = widgets.engine(0);
+        test_allocations_left = null;
+        if (created) |engine| engine.destroy(std.testing.allocator) else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expect(!c.JS_HasException(survivor.context));
+    }
 }
 
 test "a destroyed widget's range comes back whole, queued jobs and all" {

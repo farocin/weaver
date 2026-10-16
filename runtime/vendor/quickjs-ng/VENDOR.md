@@ -23,6 +23,11 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
   around allocating a job, so a garbage collection in one widget's turn
   charges another widget's queued cleanup job to that widget's heap.
+- `JS_SetChargeSharedFunc(rt, func)` (`quickjs.h`): QuickJS calls `func`
+  around growing a runtime-wide table (atom hash and array, shape hash), so
+  the table is charged to the host's heap, not to the widget whose turn grew
+  it; otherwise it stayed in that widget's range after the widget was gone,
+  and the next widget given the range had less room.
 - `JS_DropRuntimeException(rt)`: clears the runtime's pending exception when
   a context failed to build and none is left to take it from; the slot is
   shared by every widget.

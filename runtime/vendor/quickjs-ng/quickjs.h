@@ -1212,6 +1212,13 @@ JS_EXTERN int JS_ExecuteContextJob(JSContext *ctx);
    allocation fails. */
 typedef void *JSChargeJobFunc(JSContext *ctx, void *restore);
 JS_EXTERN void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func);
+/* Called with NULL before QuickJS grows a runtime-wide table (the atom
+   hash and array, the shape hash), which belongs to no context; an
+   embedder that charges memory per context and had to switch away from the
+   running one returns non-NULL, and QuickJS calls it again with that value
+   to switch back. */
+typedef void *JSChargeSharedFunc(JSRuntime *rt, void *restore);
+JS_EXTERN void JS_SetChargeSharedFunc(JSRuntime *rt, JSChargeSharedFunc *func);
 /* Drop the runtime's pending exception without a context. */
 JS_EXTERN void JS_DropRuntimeException(JSRuntime *rt);
 /* A DOMException's name and message, without calling its getters; false
