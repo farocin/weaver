@@ -333,7 +333,10 @@ pub const Engine = struct {
     /// short-lived blocks; made in the widget's range, they would stay
     /// resident between its long-lived ones. So compile in the shared host
     /// range, which every compile reuses, and copy the finished bytecode
-    /// across.
+    /// across. The copy leaves out each function's source text, which
+    /// QuickJS keeps only for `Function.prototype.toString` and repeats in
+    /// every enclosing function: 54 KiB of a clock widget's 347 KiB
+    /// (2026-10-15). Stack traces keep their lines and columns.
     fn compile(self: *Engine, source: [:0]const u8, file_name: [*:0]const u8) Error!c.JSValue {
         var size: usize = 0;
         const written = written: {
@@ -342,7 +345,7 @@ pub const Engine = struct {
             const compiled = c.JS_Eval(self.context, source.ptr, source.len, file_name, c.JS_EVAL_TYPE_GLOBAL | c.JS_EVAL_FLAG_COMPILE_ONLY);
             if (c.JS_IsException(compiled)) break :written null;
             defer c.JS_FreeValue(self.context, compiled);
-            break :written c.JS_WriteObject(self.context, &size, compiled, c.JS_WRITE_OBJ_BYTECODE);
+            break :written c.JS_WriteObject(self.context, &size, compiled, c.JS_WRITE_OBJ_BYTECODE | c.JS_WRITE_OBJ_STRIP_SOURCE);
         } orelse return self.reportException();
         defer c.js_free(self.context, written);
         const function = c.JS_ReadObject(self.context, written, size, c.JS_READ_OBJ_BYTECODE);
@@ -1394,4 +1397,19 @@ test "a destroyed widget's range comes back whole, queued jobs and all" {
     const next = try widgets.engine(0);
     defer next.destroy(std.testing.allocator);
     try next.evaluate("globalThis.big = new ArrayBuffer(28 * 1024 * 1024);", "next.js");
+}
+
+test "widget functions keep no source text, and stacks keep their lines" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    try engine.evaluate(
+        \\function named() { return "body text"; }
+        \\if (String(named).includes("body text")) throw new Error("function source was kept");
+        \\let stack = "";
+        \\try { null.missing; } catch (error) { stack = error.stack; }
+        \\if (!/strip\.js:4:\d+/.test(stack)) throw new Error("stack lost its line: " + stack);
+    , "strip.js");
 }
