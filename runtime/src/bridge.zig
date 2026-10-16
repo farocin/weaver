@@ -75,6 +75,8 @@ pub const FetchSlot = struct {
     active: bool = false,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancelled: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// The worker's WinHTTP request handle while it is in flight (`network.cancel`).
+    in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     thread: ?std.Thread = null,
     resolve: c.JSValue = qjs.undefinedValue(),
     reject: c.JSValue = qjs.undefinedValue(),
@@ -151,7 +153,9 @@ pub fn deinit(ctx: *c.JSContext, bridge_state: *State) void {
     c.JS_FreeValue(ctx, bridge_state.provider_callback);
     c.JS_FreeValue(ctx, bridge_state.canvas_resize_callback);
     for (&bridge_state.fetches) |*slot| {
-        if (slot.thread != null) slot.cancelled.store(1, .release);
+        // A request blocked on the network ends now, so unloading a widget
+        // never waits out a slow server.
+        if (slot.thread != null) network.cancel(&slot.cancelled, &slot.in_flight);
     }
     for (&bridge_state.fetches) |*slot| {
         if (slot.thread) |thread| thread.join();
@@ -863,6 +867,7 @@ fn fetch(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValue
     };
     slot.* = .{ .active = true, .resolve = resolving[0], .reject = resolving[1] };
     slot.request.cancelled = &slot.cancelled;
+    slot.request.in_flight = &slot.in_flight;
     slot.request.method = if (std.ascii.eqlIgnoreCase(method.bytes, "GET")) .get else if (std.ascii.eqlIgnoreCase(method.bytes, "POST")) .post else {
         rejectAndResetFetch(js, slot, "wfetch method must be GET or POST");
         return promise;

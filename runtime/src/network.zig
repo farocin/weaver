@@ -38,9 +38,14 @@ pub const Request = struct {
     headers: []const u8 = &.{},
     body: []const u8 = &.{},
     /// Set only by the bridge slot that owns this request. macOS polls it
-    /// while NSURLSession is in flight so engine teardown can cancel before
-    /// joining the worker.
+    /// while NSURLSession is in flight, and Windows checks it between WinHTTP
+    /// calls, so engine teardown can cancel before joining the worker
+    /// (`cancel`).
     cancelled: ?*const std.atomic.Value(u8) = null,
+    /// Windows: where the worker publishes its WinHTTP request handle while
+    /// the request is in flight, so `cancel` can close it and end a call
+    /// that is blocked on the network.
+    in_flight: ?*std.atomic.Value(usize) = null,
     /// Test-only leaf certificate path. Production builds never call the
     /// alternate trust entry point; NSURLSession uses the system trust store.
     test_certificate_path: []const u8 = &.{},
@@ -114,6 +119,23 @@ pub fn perform(request: *const Request, allocator: std.mem.Allocator) Result {
     return performWithTimeout(request, allocator, timeout_ms);
 }
 
+/// Stop a request from another thread: the worker returns `.cancelled`
+/// promptly instead of waiting out the network. On Windows a blocked WinHTTP
+/// call returns once its request handle is closed (WinHttpCloseHandle's
+/// documented cancellation); whichever thread takes the handle out of
+/// `in_flight` closes it, so it is closed exactly once.
+pub fn cancel(cancelled: *std.atomic.Value(u8), in_flight: *std.atomic.Value(usize)) void {
+    cancelled.store(1, .release);
+    if (builtin.os.tag != .windows) return;
+    const handle = in_flight.swap(0, .acq_rel);
+    if (handle != 0) _ = win.WinHttpCloseHandle(@ptrFromInt(handle));
+}
+
+fn isCancelled(request: *const Request) bool {
+    const flag = request.cancelled orelse return false;
+    return flag.load(.acquire) != 0;
+}
+
 fn performWithTimeout(request: *const Request, allocator: std.mem.Allocator, exchange_timeout_ms: c_int) Result {
     if (!requestWithinCap(request.url.len, request.headers.len, request.body.len)) return .{ .failure = .request_too_large };
     // The Linux null-backend lane verifies parsing, bounds, and ownership;
@@ -123,7 +145,7 @@ fn performWithTimeout(request: *const Request, allocator: std.mem.Allocator, exc
         performWindowsFallible(request, allocator, exchange_timeout_ms)
     else
         performMacFallible(request, allocator, exchange_timeout_ms);
-    return result catch |err| .{ .failure = failureFromError(err) };
+    return result catch |err| .{ .failure = if (isCancelled(request)) .cancelled else failureFromError(err) };
 }
 
 fn failureFromError(err: anyerror) Failure {
@@ -161,7 +183,13 @@ fn performWindowsFallible(request: *const Request, allocator: std.mem.Allocator,
     const connection = win.WinHttpConnect(session, host.ptr, parsed.port, 0) orelse return mapLastError();
     defer _ = win.WinHttpCloseHandle(connection);
     const handle = win.WinHttpOpenRequest(connection, method.ptr, path.ptr, null, null, null, win.WINHTTP_FLAG_SECURE) orelse return mapLastError();
-    defer _ = win.WinHttpCloseHandle(handle);
+    if (request.in_flight) |in_flight| in_flight.store(@intFromPtr(handle), .release);
+    defer {
+        // `cancel` may already have taken and closed it.
+        const ours = if (request.in_flight) |in_flight| in_flight.swap(0, .acq_rel) != 0 else true;
+        if (ours) _ = win.WinHttpCloseHandle(handle);
+    }
+    if (isCancelled(request)) return error.Cancelled;
     var disabled: win.DWORD = win.WINHTTP_DISABLE_REDIRECTS;
     if (win.WinHttpSetOption(handle, win.WINHTTP_OPTION_DISABLE_FEATURE, &disabled, @sizeOf(win.DWORD)) == 0) return mapLastError();
     if (request.headers.len > 0) {
@@ -173,8 +201,10 @@ fn performWindowsFallible(request: *const Request, allocator: std.mem.Allocator,
     const payload = request.body;
     const payload_pointer: win.LPVOID = if (payload.len == 0) win.WINHTTP_NO_REQUEST_DATA else @ptrCast(@constCast(payload.ptr));
     try applyRemainingTimeout(handle, deadline_ms);
+    if (isCancelled(request)) return error.Cancelled;
     if (win.WinHttpSendRequest(handle, null, 0, payload_pointer, @intCast(payload.len), @intCast(payload.len), 0) == 0) return mapLastError();
     try applyRemainingTimeout(handle, deadline_ms);
+    if (isCancelled(request)) return error.Cancelled;
     if (win.WinHttpReceiveResponse(handle, null) == 0) return mapLastError();
     var status: win.DWORD = 0;
     var status_size: win.DWORD = @sizeOf(win.DWORD);
@@ -183,6 +213,7 @@ fn performWindowsFallible(request: *const Request, allocator: std.mem.Allocator,
     errdefer body.deinit(allocator);
     while (true) {
         try applyRemainingTimeout(handle, deadline_ms);
+        if (isCancelled(request)) return error.Cancelled;
         var available: win.DWORD = 0;
         if (win.WinHttpQueryDataAvailable(handle, &available) == 0) return mapLastError();
         if (available == 0) break;
@@ -432,4 +463,43 @@ test "macOS HTTPS transport preserves policy, bounds, timeout, trust, and cancel
     defer cancellation_context.result.deinit(std.heap.page_allocator);
     try std.testing.expectEqual(Failure.cancelled, cancellation_context.result.failure);
     try std.testing.expect(cancellation_elapsed < std.time.ns_per_s);
+}
+
+test "Windows: cancelling a request blocked on the network returns at once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    // A server that accepts the connection and never answers the TLS
+    // handshake: WinHTTP blocks in WinHttpSendRequest until cancelled.
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const Silent = struct {
+        fn run(listener: *std.Io.net.Server, stream: *?std.Io.net.Stream) void {
+            stream.* = listener.accept(std.testing.io) catch null;
+        }
+    };
+    var accepted: ?std.Io.net.Stream = null;
+    const acceptor = try std.Thread.spawn(.{}, Silent.run, .{ &server, &accepted });
+    defer {
+        acceptor.join();
+        if (accepted) |stream| stream.close(io);
+    }
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buffer, "https://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    var cancelled = std.atomic.Value(u8).init(0);
+    var in_flight = std.atomic.Value(usize).init(0);
+    const request = Request{ .url = url, .cancelled = &cancelled, .in_flight = &in_flight };
+    var context = TestFetchContext{ .request = &request };
+    const started = win.GetTickCount64();
+    const worker = try std.Thread.spawn(.{}, testFetchWorker, .{&context});
+    // Let the worker reach the blocking call before cancelling.
+    while (in_flight.load(.acquire) == 0 and win.GetTickCount64() - started < 5_000) std.Thread.yield() catch {};
+    win.Sleep(300);
+    cancel(&cancelled, &in_flight);
+    worker.join();
+    const elapsed_ms = win.GetTickCount64() - started;
+    defer context.result.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(Failure.cancelled, context.result.failure);
+    try std.testing.expect(elapsed_ms < 2_000);
+    try std.testing.expectEqual(@as(usize, 0), in_flight.load(.acquire));
 }
