@@ -41,6 +41,9 @@ const max_widgets = supervisor.max_widgets;
 /// status.json. Five seconds is a few file reads per widget, invisible in
 /// CPU (2026-10-16); the old loop did all this every one to two seconds.
 const sweep_interval_ms: u64 = 5000;
+/// After a failed status.json write, the next try: the cadence the old loop
+/// rewrote it at, so a file someone holds open is retried without spinning.
+const status_retry_ms: u64 = 2000;
 
 /// Auto-reset event the supervision loop waits on: provider pipe readers
 /// and media executors set it when they queue work, so the loop sleeps
@@ -1374,9 +1377,10 @@ fn run(init: std.process.Init) !void {
         work_event = null;
     }
     var next_provider_ms: u64 = 0;
-    // Null until the first status.json is written: the first pass publishes
-    // whatever the registry holds, even nothing, without waiting.
     var published_state: ?u64 = null;
+    // When status.json is due whether or not anything changed: at once on
+    // startup (even for an empty registry), and again after a failed write.
+    var status_due_ms: ?u64 = 0;
     while (true) {
         // Sleep until something happens: a signal, queued pipe work, a
         // child process exiting, or a deadline the loop owns. Live audio
@@ -1392,16 +1396,15 @@ fn run(init: std.process.Init) !void {
         }
         host.collectProcessHandles(&handles, &handle_count);
         const now_before = c.GetTickCount64();
-        const wait_ms: c.DWORD = if (host.hasAudioSubscribers())
+        var wait_ms: c.DWORD = if (host.hasAudioSubscribers())
             10
         else if (host.hasMediaSubscribers())
             250
-        else if (published_state == null)
-            0
         else if (host.nextDeadlineMs(next_provider_ms)) |deadline_ms|
             @intCast(@min(deadline_ms -| now_before, 60_000))
         else
             c.INFINITE;
+        if (status_due_ms) |due_ms| wait_ms = @min(wait_ms, @as(c.DWORD, @intCast(@min(due_ms -| now_before, 60_000))));
         const wait = c.WaitForMultipleObjects(@intCast(handle_count), &handles, 0, wait_ms);
         if (wait == c.WAIT_OBJECT_0) break;
         if (wait == c.WAIT_OBJECT_0 + 1) {
@@ -1439,10 +1442,18 @@ fn run(init: std.process.Init) !void {
             host.sampleCostsNow(now);
             if (host.writeStatus(now)) {
                 published_state = host.stateFingerprint();
+                status_due_ms = null;
                 _ = c.SetEvent(status_ready_event);
+            } else {
+                status_due_ms = now + status_retry_ms;
             }
-        } else if (sidecars_changed or published_state != host.stateFingerprint()) {
-            if (host.writeStatus(now)) published_state = host.stateFingerprint();
+        } else if (sidecars_changed or published_state != host.stateFingerprint() or (status_due_ms != null and now >= status_due_ms.?)) {
+            if (host.writeStatus(now)) {
+                published_state = host.stateFingerprint();
+                status_due_ms = null;
+            } else {
+                status_due_ms = now + status_retry_ms;
+            }
         }
     }
     host.stopSharedHost(true);
