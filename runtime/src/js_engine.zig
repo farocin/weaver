@@ -1261,7 +1261,9 @@ test "a realm that runs out of memory while it is built leaves no exception behi
         test_allocations_left = allocations;
         const created = widgets.engine(0);
         test_allocations_left = null;
-        if (created) |engine| engine.destroy(std.testing.allocator) else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // The failure surfaces from whichever step ran out: building the
+        // realm (OutOfMemory) or installing the bridge (QuickJs).
+        if (created) |engine| engine.destroy(std.testing.allocator) else |err| try std.testing.expect(err == error.OutOfMemory or err == error.QuickJs);
         try std.testing.expect(!c.JS_HasException(survivor.context));
     }
 }
