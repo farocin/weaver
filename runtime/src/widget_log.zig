@@ -44,6 +44,16 @@ pub fn use(sink: *Sink) void {
     current = sink;
 }
 
+/// Release a widget's sink when it unloads; logging goes nowhere until the
+/// next `use` if it was current.
+pub fn deinit(sink: *Sink) void {
+    if (current == sink) current = null;
+    if (sink.path.len > 0) std.heap.page_allocator.free(sink.path);
+    if (sink.old_path.len > 0) std.heap.page_allocator.free(sink.old_path);
+    sink.path = &.{};
+    sink.old_path = &.{};
+}
+
 pub fn logFn(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
