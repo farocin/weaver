@@ -27,7 +27,6 @@ const env_backend_file = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_BACKEND_
 const env_renderer_pipe = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER_PIPE");
 const env_renderer_log = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER_LOG");
 const env_art_cache = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_ART_CACHE");
-const env_crash_breadcrumb = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_CRASH_BREADCRUMB");
 const env_control_pipe = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_CONTROL_PIPE");
 const max_widgets = supervisor.max_widgets;
 /// Widgets the shared host can hold: its hidden anchor window takes one of
@@ -166,7 +165,8 @@ const WindowsSlotState = struct {
     /// a process of its own; `process` stays null.
     hosted: bool = false,
     /// Its slot in the shared host while it is being added or runs there:
-    /// the `id` of its control commands, and its breadcrumb less one.
+    /// the `id` of its control commands, and how the host's crash record
+    /// names it (plus one).
     host_slot: ?u16 = null,
 
     fn backendPath(self: *const WindowsSlotState) []const u8 {
@@ -219,9 +219,9 @@ const RendererState = supervisor.RendererState(WindowsRendererState);
 
 /// Every widget not in `--dev` runs in one `weaver-widget --host` process
 /// (ADR 0020), added and removed over its control pipe while the others
-/// keep running (ADR 0022). Hosted slots hold no process of their own. The
-/// host names the widget that was running in the breadcrumb, as its slot
-/// plus one, so a crash is charged to it alone.
+/// keep running (ADR 0022). Hosted slots hold no process of their own.
+/// When the host dies, its record (`HostRecord`) says whether a widget's
+/// code crashed it.
 const SharedHost = struct {
     process: WindowsRendererState = .{},
     started_ms: u64 = 0,
@@ -230,9 +230,105 @@ const SharedHost = struct {
     control: c.HANDLE = invalid_handle,
     /// Signals the control pipe's overlapped reads and writes.
     control_event: c.HANDLE = null,
-    breadcrumb_mapping: c.HANDLE = null,
-    breadcrumb: ?*volatile u32 = null,
     threads: u32 = 0,
+};
+
+/// The host's record of itself, `%LOCALAPPDATA%\weaver\host.record`: the
+/// layout of `Record` in runtime/src/crash_record.zig, which the host keeps
+/// mapped and fills when it crashes. Change both together.
+const HostRecord = extern struct {
+    magic: u32,
+    version: u32,
+    generation: u64,
+    pid: u32,
+    state: u32,
+    start_time: u64,
+    turn_slot: u32,
+    turn_thread: u32,
+    turn_bundle: u64,
+    crash_kind: u32,
+    crash_code: u32,
+    crash_thread: u32,
+    /// The crashed widget's host slot plus one, for `crash_widget_turn`.
+    crash_slot: u32,
+    crash_bundle: u64,
+    crash_time: u64,
+
+    const magic_value: u32 = 0x5248_5657;
+    const version_value: u32 = 1;
+    /// The crash happened while that widget's own code ran.
+    const crash_widget_turn: u32 = 1;
+
+    comptime {
+        std.debug.assert(@sizeOf(HostRecord) == 80);
+    }
+};
+
+/// Widgets quarantined because their own code crashed the host (ADR 0022),
+/// kept in crash-ledger.json so a quarantine outlives weaverd. An entry
+/// holds while the widget's bundle is the one that crashed: a reinstall or
+/// a new bundle (a new bundle.js modification time) lifts it.
+const Ledger = struct {
+    entries: [max_widgets]Entry = undefined,
+    count: usize = 0,
+
+    const Entry = struct {
+        name: [supervisor.max_name_bytes]u8 = undefined,
+        name_len: usize = 0,
+        artifact: i128 = 0,
+        code: u32 = 0,
+
+        fn nameSlice(self: *const Entry) []const u8 {
+            return self.name[0..self.name_len];
+        }
+    };
+
+    const Wire = struct {
+        quarantined: []const struct { name: []const u8, artifact: []const u8, code: u32 } = &.{},
+    };
+
+    fn find(self: *const Ledger, name: []const u8) ?usize {
+        for (self.entries[0..self.count], 0..) |*entry, index| {
+            if (std.mem.eql(u8, entry.nameSlice(), name)) return index;
+        }
+        return null;
+    }
+
+    fn put(self: *Ledger, name: []const u8, artifact: i128, code: u32) void {
+        const index = self.find(name) orelse index: {
+            if (self.count == self.entries.len or name.len > supervisor.max_name_bytes) return;
+            self.count += 1;
+            break :index self.count - 1;
+        };
+        const entry = &self.entries[index];
+        @memcpy(entry.name[0..name.len], name);
+        entry.name_len = name.len;
+        entry.artifact = artifact;
+        entry.code = code;
+    }
+
+    fn remove(self: *Ledger, index: usize) void {
+        self.entries[index] = self.entries[self.count - 1];
+        self.count -= 1;
+    }
+
+    fn parse(self: *Ledger, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(Wire, allocator, bytes, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        self.count = 0;
+        for (parsed.value.quarantined) |entry| {
+            self.put(entry.name, std.fmt.parseInt(i128, entry.artifact, 10) catch continue, entry.code);
+        }
+    }
+
+    fn write(self: *const Ledger, writer: *std.Io.Writer) !void {
+        try writer.writeAll("{\"quarantined\":[");
+        for (self.entries[0..self.count], 0..) |*entry, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.print("{{\"name\":{f},\"artifact\":\"{d}\",\"code\":{d}}}", .{ std.json.fmt(entry.nameSlice(), .{}), entry.artifact, entry.code });
+        }
+        try writer.writeAll("]}\n");
+    }
 };
 
 /// The host's answer to one control command.
@@ -255,6 +351,11 @@ const Host = struct {
     registry_path: []const u8,
     status_path: []const u8,
     status_temp_path: []const u8,
+    /// The shared host's record (`HostRecord`).
+    record_path: []const u8,
+    ledger_path: []const u8,
+    ledger_temp_path: []const u8,
+    ledger: Ledger = .{},
     runtime_exe: []const u8,
     renderer_exe: []const u8,
     renderer_pipe_name: []const u8,
@@ -478,6 +579,11 @@ const Host = struct {
             return;
         };
         self.prepareSlot(slot, now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
+        if (self.quarantined(slot)) {
+            self.closePipe(slot);
+            slot.platform.host_slot = null;
+            return;
+        }
         self.ensureSharedHost(now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
         const line = self.addCommand(slot) catch |err| return self.failLaunch(slot, now_ms, err);
         defer self.allocator.free(line);
@@ -485,8 +591,8 @@ const Host = struct {
         const pid = self.shared.process.pid;
         const answer = self.controlRequest(line) catch |err| {
             // The host died or hung loading this widget. It is a member
-            // now, so the exit is settled once and the breadcrumb decides
-            // who pays.
+            // now, so the exit is settled once and the host's record
+            // decides who pays.
             self.closePipe(slot);
             slot.platform.hosted = true;
             slot.platform.pid = pid;
@@ -513,6 +619,64 @@ const Host = struct {
             self.removeHosted(slot);
             supervisor.recordLaunchFailure(slot, now_ms, err);
         };
+    }
+
+    /// Whether the ledger holds `slot` back: its bundle is the one that
+    /// crashed the host. An entry for an older bundle is dropped.
+    fn quarantined(self: *Host, slot: *Slot) bool {
+        const index = self.ledger.find(slot.name()) orelse return false;
+        const entry = self.ledger.entries[index];
+        const artifact = self.artifactMtime(slot.source());
+        if (artifact == 0 or artifact != entry.artifact) {
+            self.ledger.remove(index);
+            self.writeLedger();
+            return false;
+        }
+        // A reinstall changes the artifact; the reconcile compares against this.
+        slot.artifact_mtime = artifact;
+        slot.state = .stopped;
+        slot.setReason("quarantined: its code crashed the widget host (exception 0x{X:0>8}); reinstall or update it to run it again", .{entry.code});
+        return true;
+    }
+
+    fn quarantine(self: *Host, slot: *Slot, code: u32) void {
+        const artifact = self.artifactMtime(slot.source());
+        slot.artifact_mtime = artifact;
+        slot.state = .stopped;
+        slot.setReason("quarantined: its code crashed the widget host (exception 0x{X:0>8}); reinstall or update it to run it again", .{code});
+        self.ledger.put(slot.name(), artifact, code);
+        self.writeLedger();
+    }
+
+    fn loadLedger(self: *Host) void {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, self.ledger_path, self.allocator, .limited(256 * 1024)) catch return;
+        defer self.allocator.free(bytes);
+        self.ledger.parse(self.allocator, bytes) catch |err| std.log.warn("crash ledger ignored: {s}", .{@errorName(err)});
+    }
+
+    fn writeLedger(self: *Host) void {
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        self.ledger.write(&output.writer) catch return;
+        const cwd = std.Io.Dir.cwd();
+        cwd.writeFile(self.io, .{ .sub_path = self.ledger_temp_path, .data = output.written() }) catch |err| return std.log.warn("crash ledger not written: {s}", .{@errorName(err)});
+        cwd.rename(self.ledger_temp_path, cwd, self.ledger_path, self.io) catch |err| std.log.warn("crash ledger not published: {s}", .{@errorName(err)});
+    }
+
+    /// The record of the host that just exited, if it is that host's: the
+    /// same PID and process start time.
+    fn readHostRecord(self: *Host, process: c.HANDLE, pid: u32) ?HostRecord {
+        var bytes: [@sizeOf(HostRecord)]u8 = undefined;
+        const read = std.Io.Dir.cwd().readFile(self.io, self.record_path, &bytes) catch return null;
+        if (read.len != bytes.len) return null;
+        const record = std.mem.bytesToValue(HostRecord, &bytes);
+        if (record.magic != HostRecord.magic_value or record.version != HostRecord.version_value or record.pid != pid) return null;
+        var created: c.FILETIME = undefined;
+        var unused: c.FILETIME = undefined;
+        if (c.GetProcessTimes(process, &created, &unused, &unused, &unused) == 0) return null;
+        const start: u64 = (@as(u64, created.dwHighDateTime) << 32) | created.dwLowDateTime;
+        if (record.start_time != start) return null;
+        return record;
     }
 
     fn failLaunch(self: *Host, slot: *Slot, now_ms: u64, err: anyerror) void {
@@ -579,9 +743,7 @@ const Host = struct {
     /// hidden anchor window and a control pipe only it may open.
     fn ensureSharedHost(self: *Host, now_ms: u64) !void {
         if (self.shared.process.process != null) return;
-        try self.openBreadcrumb();
-        defer clearEnv(env_crash_breadcrumb);
-        errdefer self.closeBreadcrumb();
+        self.shared.launches += 1;
         var name_buffer: [96]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buffer, "\\\\.\\pipe\\weaver-control-{d}-{d}", .{ c.GetCurrentProcessId(), self.shared.launches });
         const name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, name);
@@ -657,57 +819,40 @@ const Host = struct {
         self.shared.control_event = null;
     }
 
-    /// A fresh 4-byte mapping per launch: the host writes the running
-    /// widget's slot plus one into it; zero means none yet.
-    fn openBreadcrumb(self: *Host) !void {
-        self.closeBreadcrumb();
-        self.shared.launches += 1;
-        var name_buffer: [96]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "Local\\WeaverHostBreadcrumb-{d}-{d}", .{ c.GetCurrentProcessId(), self.shared.launches });
-        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, name);
-        defer self.allocator.free(name_w);
-        const mapping = c.CreateFileMappingW(invalid_handle, null, c.PAGE_READWRITE, 0, @sizeOf(u32), name_w.ptr) orelse return error.CreateBreadcrumbFailed;
-        const view = c.MapViewOfFile(mapping, c.FILE_MAP_ALL_ACCESS, 0, 0, @sizeOf(u32)) orelse {
-            _ = c.CloseHandle(mapping);
-            return error.CreateBreadcrumbFailed;
-        };
-        self.shared.breadcrumb_mapping = mapping;
-        self.shared.breadcrumb = @ptrCast(@alignCast(view));
-        self.shared.breadcrumb.?.* = 0;
-        try setEnv(self.allocator, env_crash_breadcrumb, name);
-    }
-
-    fn closeBreadcrumb(self: *Host) void {
-        if (self.shared.breadcrumb) |view| _ = c.UnmapViewOfFile(@volatileCast(view));
-        if (self.shared.breadcrumb_mapping) |mapping| _ = c.CloseHandle(mapping);
-        self.shared.breadcrumb = null;
-        self.shared.breadcrumb_mapping = null;
-    }
-
-    /// The shared host exited: charge the crash to the widget the
-    /// breadcrumb names and restart the others at once. With no widget
-    /// named, the fault was the platform's and every member pays it.
+    /// The shared host exited. If its record shows that a widget's own code
+    /// crashed it, that widget is quarantined and the others start again at
+    /// once. Any other end (a crash outside widget code, a kill, a fault no
+    /// handler saw) names no widget, and every member pays a crash backoff.
     fn settleSharedHostExit(self: *Host, now_ms: u64) void {
         const process = self.shared.process.process orelse return;
         if (c.WaitForSingleObject(process, 0) != c.WAIT_OBJECT_0) return;
         var exit_code: c.DWORD = 1;
         _ = c.GetExitCodeProcess(process, &exit_code);
-        // The breadcrumb is the running widget's host slot plus one.
-        const crumb = if (self.shared.breadcrumb) |view| view.* else 0;
-        const blamed: ?*Slot = if (crumb == 0 or crumb > max_hosted_widgets) null else self.slotInHost(@intCast(crumb - 1));
+        const record = self.readHostRecord(process, self.shared.process.pid);
+        const blamed: ?*Slot = blamed: {
+            const crash = record orelse break :blamed null;
+            if (crash.crash_kind != HostRecord.crash_widget_turn or crash.crash_slot == 0 or crash.crash_slot > max_hosted_widgets) break :blamed null;
+            break :blamed self.slotInHost(@intCast(crash.crash_slot - 1));
+        };
         for (&self.slots) |*slot| {
             if (!slot.platform.hosted) continue;
             self.releaseHostedSlot(slot);
             if (!self.sourceExists(slot.source())) {
                 _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
-            } else if (blamed == null or blamed.? == slot) {
+            } else if (blamed == slot) {
+                self.quarantine(slot, record.?.crash_code);
+            } else if (blamed == null) {
                 supervisor.recordCrash(slot, now_ms, exit_code);
             } else {
                 slot.state = .starting;
                 slot.next_restart_ms = 0;
             }
         }
-        if (blamed) |slot| std.log.warn("shared widget host exited with code {d} while running '{s}'", .{ exit_code, slot.name() });
+        if (blamed) |slot| {
+            std.log.warn("shared widget host crashed in '{s}' (exception 0x{X:0>8}); it is quarantined", .{ slot.name(), record.?.crash_code });
+        } else if (record) |crash| {
+            std.log.warn("shared widget host exited with code {d}; its record names no widget (crash kind {d})", .{ exit_code, crash.crash_kind });
+        }
         self.closeSharedHost();
     }
 
@@ -742,7 +887,6 @@ const Host = struct {
         self.shared.process = .{};
         self.closeControl();
         self.thread_sample_ms = 0;
-        self.closeBreadcrumb();
     }
 
     fn rendererDesired(self: *const Host) bool {
@@ -1290,6 +1434,12 @@ fn run(init: std.process.Init) !void {
     defer allocator.free(status_path);
     const status_temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{status_path});
     defer allocator.free(status_temp_path);
+    const record_path = try std.fs.path.join(allocator, &.{ directory, "host.record" });
+    defer allocator.free(record_path);
+    const ledger_path = try std.fs.path.join(allocator, &.{ directory, "crash-ledger.json" });
+    defer allocator.free(ledger_path);
+    const ledger_temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{ledger_path});
+    defer allocator.free(ledger_temp_path);
     cleanupBackendStatusFiles(init.io, directory);
     const art_cache_root = try std.fs.path.join(allocator, &.{ directory, "artcache" });
     defer allocator.free(art_cache_root);
@@ -1315,6 +1465,9 @@ fn run(init: std.process.Init) !void {
         .registry_path = registry_path,
         .status_path = status_path,
         .status_temp_path = status_temp_path,
+        .record_path = record_path,
+        .ledger_path = ledger_path,
+        .ledger_temp_path = ledger_temp_path,
         .runtime_exe = runtime_exe,
         .renderer_exe = renderer_exe,
         .renderer_pipe_name = renderer_pipe_name,
@@ -1326,6 +1479,7 @@ fn run(init: std.process.Init) !void {
     host.media_provider.cache = &media_art_cache;
     defer host.audio_provider.deinit();
     defer host.media_provider.deinit();
+    host.loadLedger();
     try host.loadRegistry();
     var next_provider_ms: u64 = 0;
     var next_cost_ms: u64 = 0;
@@ -1655,6 +1809,25 @@ fn closeWindowsForProcess(pid: u32) void {
         }
     };
     _ = c.EnumWindows(Callback.call, @intCast(pid));
+}
+
+test "the crash ledger round-trips and keeps one entry per widget" {
+    var ledger: Ledger = .{};
+    ledger.put("Clock", 1234567890123456789, 0xC000_0005);
+    ledger.put("Clock \"two\"", -1, 1);
+    ledger.put("Clock", 42, 3);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try ledger.write(&output.writer);
+    var read: Ledger = .{};
+    try read.parse(std.testing.allocator, output.written());
+    try std.testing.expectEqual(@as(usize, 2), read.count);
+    const clock = read.entries[read.find("Clock").?];
+    try std.testing.expectEqual(@as(i128, 42), clock.artifact);
+    try std.testing.expectEqual(@as(u32, 3), clock.code);
+    try std.testing.expect(read.find("Clock \"two\"") != null);
+    read.remove(read.find("Clock").?);
+    try std.testing.expect(read.find("Clock") == null);
 }
 
 test {
