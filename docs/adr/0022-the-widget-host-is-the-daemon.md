@@ -26,96 +26,160 @@ restart skips that Widget (quarantine), or the crash was transient. A blind
 restart after a deterministic crash just crashes again. Rainmeter never
 restarts at all.
 
-Decision (Dara, 2026-10-16): there is no supervisor process. On Windows the
+Decision (Dara, 2026-10-16): there is no supervisor process on Windows. The
 widget host is the daemon. It asks the OS to restart it after a crash,
-quarantines the Widget it was running when it died, and stops asking after
-three restarts in ten minutes. `weaver status` says what happened.
+quarantines a Widget only when the crash is clearly that Widget's, and stops
+asking after three crashes in ten minutes. `weaver status` says what
+happened, even when nothing restarted. macOS keeps its process per Widget
+and its `weaverd` until it moves to one host; launchd's `KeepAlive` is the
+equivalent there, and is unmeasured.
 
 ## How the OS restart behaves
 
-Receipts are in the PR that adds this ADR. A test process registered with
-`RegisterApplicationRestart` and crashed:
+A test process registered with `RegisterApplicationRestart` and crashed.
+Receipts are in the PR that adds this ADR.
 
 - After running 62–70 s, it was restarted 5–37 s after the crash, with no
-  dialog on screen.
+  dialog on screen. Treat those times as what one machine did, not a
+  promise. The documented contract mentions user consent.
 - After running 10 s, it was not restarted. Windows only restarts a process
-  that ran at least 60 s. That is a built-in guard against crash loops, and
-  it also means a host that dies in its first minute stays down until
-  `weaver up` or the next login.
-- Windows only sees the crash if Windows Error Reporting handles it. Zig's
-  default segfault handler catches the crash and exits quietly. A parent
-  running with `SEM_NOGPFAULTERRORBOX` (Git Bash does) hands that error mode
-  down. Either one stops the restart. So the host sets `SetErrorMode(0)`,
-  turns off Zig's segfault handler, and ends a panic with
-  `RaiseFailFastException`.
+  that ran at least 60 s.
+- Windows only restarts a crash that Windows Error Reporting handles. Zig's
+  default segfault handler, and an error mode inherited from a parent with
+  `SEM_NOGPFAULTERRORBOX` (Git Bash has it), each stopped the restart.
+- The spike's restarted instance exited at once. The real host still has to
+  show that it restarts long-lived, crashes a second time, and comes back
+  without a console window. `weaver-widget.exe` is a console-subsystem
+  program today, and Windows restarts console programs in a new console. So
+  the daemon host becomes a GUI-subsystem program. That is part of step 5's
+  receipts.
 
-macOS keeps its process per Widget and its `weaverd` for now (ADR 0020).
-When it moves to one host, launchd's `KeepAlive` is the equivalent; that is
-not measured yet.
+## The host as daemon
 
-## What moves into the host
+**Control comes up before any Widget.** The singleton and the
+`Local\WeaverHost*` control objects (probe, reload with acknowledgement,
+down, status request) exist, and the host reports ready, before it
+evaluates any Widget. A Widget that hangs or crashes at load cannot keep
+`weaver down`, status or a fixed install from reaching the host.
 
-Everything `weaverd` does today except creating processes it doesn't need.
-The map comes from a read-through of `windows_host.zig`:
+**Zero Widgets, and Widgets in place.** The host runs with no Widgets: its
+primary window is a hidden window of its own, and every Widget is a
+secondary window, which Native already reconciles at runtime. Native stops
+quitting when the last widget window closes. Loading or unloading a Widget
+never restarts the process. That requires per-Widget resource lifetimes:
+- fonts that can be unregistered, because Native font IDs are permanent
+  today;
+- each Widget's allocations in its own arena, freed when it unloads;
+- a generation number on each slot, so a queued timer or wake for an
+  unloaded Widget is dropped and never reaches a new one in the same slot.
 
-- **Singleton and CLI control:** the `Local\WeaverHost*` objects (probe,
-  reload with acknowledgement, down, status request). The CLI's commands
-  keep their meaning, and `weaver up` starts the host.
-- **Registry reconciliation, bundle freshness, widget admission and
-  removal**, now inside the running process. Today any change of membership
-  rebuilds the whole process. The host gains loading and unloading of a
-  Widget's window, engine and tree in place, and it runs with zero Widgets.
-- **Providers** (CPU and memory sampling, WASAPI audio, media and artwork
-  through WinRT, media commands) on their own threads, as in `weaverd`. They
-  never run on the UI thread, because blocking WinRT calls there would stall
-  every Widget. Hosted Widgets read frames through an in-process queue, not
-  a pipe.
-- **Dev Widgets:** the host launches `--dev` processes and serves their
-  providers over the existing authenticated pipes.
-- **The renderer process** and its restart backoff.
-- **status.json:** one writer again. It keeps `hostPid`, now the widget
-  host, and gains the last crash and the quarantine list.
-- **Crash ledger:** per-Widget crash history, quarantine and the restart
-  count, persisted in `%LOCALAPPDATA%\weaver\crash-ledger.json`, because
-  the process that keeps it is the one that dies. A new bundle or a reinstall
-  clears that Widget's record, as a new artifact does today.
-- **Crash attribution:** the breadcrumb becomes a small file the host maps,
-  naming the Widget whose work is running. It is cleared between turns, so
-  a crash outside any Widget's turn charges no Widget.
+Native already gives each view a stable slot (native#41).
+
+**Management off the UI thread.** Registry reconciliation, bundle freshness
+(which may run `node`), dev admission and provider teardown run on a
+management thread. The UI thread only applies a prepared load or unload.
+The reload acknowledgement, which tells the CLI it may delete superseded
+install directories, is sent after that apply.
+
+**Providers on threads that own them.** In `weaverd`, audio and media are
+sampled on its main loop; that does not carry over. In the host:
+- each provider (system sampling, audio, media, media commands) gets a
+  worker thread that initialises COM and creates, polls, commands and
+  destroys its objects;
+- Widgets get frames through an in-process queue with the existing
+  semantics: manifest authorisation, the per-widget command rate limit,
+  acknowledgements and rejections, fatal-channel handling, wakes only on
+  frames or acknowledgements, idle when nothing subscribes, and the
+  meaning of the existing counters;
+- one owner holds the artwork cache;
+- the UI thread never runs provider code.
+
+**Children die with the host.** The renderer and `--dev` Widget processes
+run in a job object that kills them when the host's handle closes. A
+restarted host starts them again. Dev Widgets get their providers from the
+host over the existing authenticated pipes.
+
+**One status writer, and a record that survives the crash.** Each host
+start writes a generation record to `%LOCALAPPDATA%\weaver\host.json`
+before loading any Widget: generation number, PID, process start time and
+state `running`. The record also carries:
+- **Clean exit:** a clean exit writes `stopped`.
+- **Crash:** the crash path writes `crashed`, before the fail-fast. That
+  covers the panic wrapper, after its diagnostics, and an unhandled-exception
+  filter for access violations. The entry names the faulting thread's kind
+  (UI or provider) and, for a UI-thread crash during a Widget's turn, that
+  Widget's name and bundle identity.
+- **Torn record:** if the crash path couldn't write, a record still
+  `running` whose process is gone (PID and start time no longer match)
+  means it crashed.
+
+The CLI reads this record whether or not anything restarted, so `weaver
+status` can say "not running: crashed at 14:02 in Clock (quarantined)" or
+"not running: crashed three times in ten minutes; run `weaver up`". A
+restarted host consumes the record exactly once, by generation.
+
+**Quarantine only on evidence.** A crash on the UI thread inside a Widget's
+turn quarantines that Widget's bundle identity, kept in
+`%LOCALAPPDATA%\weaver\crash-ledger.json`. A new bundle or a reinstall
+clears it. A crash on a provider thread, or outside any turn, quarantines
+nothing and counts only toward the restart cap.
+
+**Stopping and the cap.** `weaver down` writes a stop marker before it
+signals the host. A host restarted by the OS reads it first and exits
+without loading anything, so a pending restart cannot bring Widgets back
+after `down`. The marker clears when `weaver up` runs. The fourth crash
+within ten minutes leaves the host down (it doesn't re-register), and the
+next `weaver up` starts a fresh count. The CLI edits the registry and the
+crash ledger itself while the host is down; it already owns the registry.
+
+**Panics and exits.** Only daemon mode re-registers for restart and routes
+crashes to fail-fast. Dev, capture and macOS behave as today. A startup
+error returned from `main` is an ordinary exit: a clean `stopped` record
+with the reason, and no restart.
 
 ## What this gives up
 
-- **First-minute crashes stay down.** A host that crashes within 60 s of
-  starting is not restarted, and every Widget is gone until `weaver up` or
-  the next login. `weaverd` restarted it within about a second.
-- **Restart is slower:** 5–37 s, against about 1 s.
-- **One process holds everything.** A fault in provider code (WinRT, WASAPI)
-  now takes the Widgets down with it. Today it takes `weaverd` down, and
-  nothing restarts that.
-- **Status while the host is down comes from the file it left.** The CLI
-  checks whether `hostPid` is alive and reports "not running", with the last
-  crash it recorded.
-- A Windows-specific restart path. macOS gets its own when it moves to one
-  host.
+- **First-minute crashes stay down** until `weaver up`. Weaver has no login
+  start today, so nothing brings the host back at login either.
+- **Restart is slower:** seconds to tens of seconds, against about 1 s.
+- **One process holds everything.** A fault in provider code (WinRT,
+  WASAPI) now takes the Widgets down with it. Today it takes `weaverd` down,
+  and nothing restarts that.
+- **A Windows-specific recovery path.**
 
 ## Order of work
 
-Each step is its own PR, measured and reviewed:
+Each step is its own PR, measured and reviewed. `weaverd` keeps supervising
+until step 5 replaces it.
 
-1. The host runs with zero Widgets, and loads and unloads one in place.
-2. The crash ledger and file breadcrumb. `weaverd` still supervises, but
-   reads them.
-3. Providers inside the host on worker threads. Hosted Widgets drop their
-   pipes; `weaverd` keeps serving dev Widgets.
-4. Registry, CLI control, status, the renderer and dev launching move into
-   the host. `weaverd` becomes a thin launcher.
-5. OS restart, quarantine and the restart cap. The thin launcher is deleted.
+1. **In-place membership.** The host:
+   - runs with zero Widgets and a hidden primary window;
+   - has per-Widget resource lifetimes (fonts, arena, slot generations);
+   - takes add and remove commands from `weaverd`, with acknowledgement.
+
+   `weaverd` stops rebuilding the host when membership changes. Receipts:
+   empty startup, all loads failing, removing the last Widget, adding again,
+   and a hundred replacements with fonts and timers, with memory flat.
+2. **Crash record and attribution.** `host.json`, UI-thread attribution and
+   the ledger. `weaverd` reads them, replacing its attribution, and keeps
+   restarting.
+3. **Providers in the host,** on owned worker threads, serving hosted
+   Widgets in process and dev Widgets over pipes. One artwork cache owner.
+   `weaverd` stops running providers.
+4. **Registry, control, status, renderer and dev launch move into the
+   host,** with the job object. `weaverd` only starts the host and restarts
+   it after a crash.
+5. **OS restart.** GUI subsystem, `RegisterApplicationRestart`, stop
+   marker, crash cap; then `weaverd` is deleted. Receipts: the real host
+   restarted after a UI-thread crash and after a provider-thread crash,
+   twice each, with no console window. Also `down` during a pending
+   restart, and the cap.
 
 ## Consequences
 
 - Ten clocks: about 0.9 MiB less, the host's own growth from the moved code
   aside, which each PR measures.
-- Live install, uninstall and reload stop restarting every other Widget, a
-  side effect of step 1.
+- Live install, uninstall and reload stop restarting every other Widget
+  (step 1).
 - Fewer moving parts: one process, one status writer, no pipes for hosted
-  Widgets.
+  Widgets, and a crash record that says what happened.
