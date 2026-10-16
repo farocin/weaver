@@ -206,43 +206,20 @@ fn gcTrigger(_: ?*c.JSRuntime, size: usize) callconv(.c) bool {
     return true;
 }
 
-/// Built-in families a widget realm loads the first time one of their
-/// globals is read or written, rather than with the realm: most widgets use
-/// neither, and together they are about 20 KiB of every realm (typed arrays
-/// 15.8 KiB, atob/btoa 4.4 KiB; measured 2026-10-15). Every other family
-/// `JS_NewContext` adds stays eager: RegExp because a literal needs its
-/// class without reading a global.
-const LazyFamily = enum { typed_arrays, base64 };
-
-const lazy_globals = [_]struct { name: [:0]const u8, family: LazyFamily }{
-    .{ .name = "ArrayBuffer", .family = .typed_arrays },
-    .{ .name = "SharedArrayBuffer", .family = .typed_arrays },
-    .{ .name = "Uint8ClampedArray", .family = .typed_arrays },
-    .{ .name = "Int8Array", .family = .typed_arrays },
-    .{ .name = "Uint8Array", .family = .typed_arrays },
-    .{ .name = "Int16Array", .family = .typed_arrays },
-    .{ .name = "Uint16Array", .family = .typed_arrays },
-    .{ .name = "Int32Array", .family = .typed_arrays },
-    .{ .name = "Uint32Array", .family = .typed_arrays },
-    .{ .name = "BigInt64Array", .family = .typed_arrays },
-    .{ .name = "BigUint64Array", .family = .typed_arrays },
-    .{ .name = "Float16Array", .family = .typed_arrays },
-    .{ .name = "Float32Array", .family = .typed_arrays },
-    .{ .name = "Float64Array", .family = .typed_arrays },
-    .{ .name = "DataView", .family = .typed_arrays },
-    .{ .name = "Atomics", .family = .typed_arrays },
-    .{ .name = "atob", .family = .base64 },
-    .{ .name = "btoa", .family = .base64 },
-    .{ .name = "DOMException", .family = .base64 },
-};
-
-/// A widget's realm: what `JS_NewContext` builds, with the `lazy_globals`
-/// families behind accessors that load them on first use. Those accessors
-/// are configurable and not enumerable, as the built-ins are, and loading a
-/// family replaces every one of its accessors with the real definition.
+/// A widget's realm: what `JS_NewContext` builds, except that the typed
+/// array family (ArrayBuffer, the typed arrays, DataView, Atomics) and the
+/// base64 one (atob, btoa, DOMException) are built the first time widget
+/// code touches one of their globals. Most widgets use neither, and they
+/// are about 18 KiB of every realm (measured 2026-10-16, see
+/// "a widget realm builds typed arrays and base64 only when used").
+/// QuickJS keeps each of their globals as a lazily initialized property,
+/// which JavaScript sees as an ordinary data property (see VENDOR.md).
+/// Every other family stays eager: RegExp because a literal needs its class
+/// without reading a global.
 fn newWidgetContext(runtime: *c.JSRuntime) ?*c.JSContext {
     const context = c.JS_NewContextRaw(runtime) orelse return null;
-    const eager = [_]*const fn (?*c.JSContext) callconv(.c) c_int{
+    // `JS_NewContext`'s order, so the globals keep its order too.
+    const steps = [_]*const fn (?*c.JSContext) callconv(.c) c_int{
         c.JS_AddIntrinsicBaseObjects,
         c.JS_AddIntrinsicDate,
         c.JS_AddIntrinsicEval,
@@ -250,54 +227,19 @@ fn newWidgetContext(runtime: *c.JSRuntime) ?*c.JSContext {
         c.JS_AddIntrinsicJSON,
         c.JS_AddIntrinsicProxy,
         c.JS_AddIntrinsicMapSet,
+        c.JS_AddLazyIntrinsicTypedArrays,
         c.JS_AddIntrinsicPromise,
         c.JS_AddIntrinsicWeakRef,
+        c.JS_AddLazyIntrinsicAToB,
         c.JS_AddPerformance,
     };
-    for (eager) |add| {
+    for (steps) |add| {
         if (add(context) < 0) {
             c.JS_FreeContext(context);
             return null;
         }
     }
-    const global = c.JS_GetGlobalObject(context);
-    defer c.JS_FreeValue(context, global);
-    for (lazy_globals, 0..) |entry, index| {
-        const getter = c.JS_NewCFunctionMagic(context, loadLazyGlobal, entry.name.ptr, 0, c.JS_CFUNC_generic_magic, @intCast(index));
-        const setter = c.JS_NewCFunctionMagic(context, loadLazyGlobal, entry.name.ptr, 1, c.JS_CFUNC_generic_magic, @intCast(index));
-        const atom = c.JS_NewAtom(context, entry.name.ptr);
-        defer c.JS_FreeAtom(context, atom);
-        if (c.JS_DefinePropertyGetSet(context, global, atom, getter, setter, c.JS_PROP_CONFIGURABLE) < 0) {
-            c.JS_FreeContext(context);
-            return null;
-        }
-    }
     return context;
-}
-
-/// The accessor behind a lazy global: load its family into this realm,
-/// then read (no argument) or assign (one argument) the real global.
-fn loadLazyGlobal(context: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst, magic: c_int) callconv(.c) c.JSValue {
-    const js = context orelse return qjs.exceptionValue();
-    const entry = lazy_globals[@intCast(magic)];
-    const global = c.JS_GetGlobalObject(js);
-    defer c.JS_FreeValue(js, global);
-    // The family's own definitions would otherwise run into these
-    // accessors (and load the family again).
-    for (lazy_globals) |other| {
-        if (other.family != entry.family) continue;
-        const atom = c.JS_NewAtom(js, other.name.ptr);
-        defer c.JS_FreeAtom(js, atom);
-        if (c.JS_DeleteProperty(js, global, atom, 0) < 0) return qjs.exceptionValue();
-    }
-    const loaded = switch (entry.family) {
-        .typed_arrays => c.JS_AddIntrinsicTypedArrays(js),
-        .base64 => c.JS_AddIntrinsicAToB(js),
-    };
-    if (loaded < 0) return qjs.exceptionValue();
-    if (argc == 0) return c.JS_GetPropertyStr(js, global, entry.name.ptr);
-    if (c.JS_SetPropertyStr(js, global, entry.name.ptr, c.JS_DupValue(js, argv[0])) < 0) return qjs.exceptionValue();
-    return qjs.undefinedValue();
 }
 
 fn releaseShared(owner: js_heap.Owner) void {
@@ -1459,24 +1401,29 @@ test "a widget realm has every built-in a full realm has, the lazy ones on first
     defer widgets.deinit();
     const engine = try widgets.engine(0);
     defer engine.destroy(std.testing.allocator);
-    // The globals of a realm built with every family at once.
+    // The globals of a realm built with every family at once, each with
+    // what its property descriptor says.
     const full = c.JS_NewContext(engine.runtime).?;
     defer c.JS_FreeContext(full);
-    const keys_source = "Reflect.ownKeys(globalThis).filter((k) => typeof k === 'string').join(',')";
+    const describe = "const describe = (d) => d === undefined ? 'missing' : JSON.stringify([typeof d.value, typeof d.get, d.writable, d.enumerable, d.configurable]);";
+    const keys_source = describe ++ "JSON.stringify(Reflect.ownKeys(globalThis).filter((k) => typeof k === 'string').map((k) => [k, describe(Object.getOwnPropertyDescriptor(globalThis, k))]))";
     const names = c.JS_Eval(full, keys_source, keys_source.len, "keys.js", c.JS_EVAL_TYPE_GLOBAL);
     defer c.JS_FreeValue(full, names);
     const text = c.JS_ToCString(full, names).?;
     defer c.JS_FreeCString(full, text);
     // Each of them exists here, the lazy ones not enumerable (as the built-ins
-    // they stand in for are not), and works.
+    // they stand in for are not), described as in the full realm (a data
+    // property, even before first use), and works.
     var check: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer check.deinit();
-    try check.writer.print(
-        \\const names = "{s}".split(",");
-        \\const missing = names.filter((name) => !Object.prototype.hasOwnProperty.call(globalThis, name));
+    try check.writer.print(describe ++
+        \\const full = {s};
+        \\const missing = full.filter(([name]) => !Object.prototype.hasOwnProperty.call(globalThis, name)).map(([name]) => name);
         \\if (missing.length > 0) throw new Error("missing " + missing.join(","));
         \\const shown = Object.keys(globalThis).filter((name) => ["ArrayBuffer", "Uint8Array", "Atomics", "atob", "DOMException"].includes(name));
         \\if (shown.length > 0) throw new Error("enumerable " + shown.join(","));
+        \\const differ = full.filter(([name, expected]) => describe(Object.getOwnPropertyDescriptor(globalThis, name)) !== expected).map(([name]) => name);
+        \\if (differ.length > 0) throw new Error("described unlike a full realm: " + differ.join(","));
         \\if (new Uint8Array([1, 2, 3]).length !== 3 || new DataView(new ArrayBuffer(4)).byteLength !== 4) throw new Error("typed arrays");
         \\if (atob(btoa("weaver")) !== "weaver") throw new Error("base64");
         \\if (!("value" in Object.getOwnPropertyDescriptor(globalThis, "Float64Array"))) throw new Error("still an accessor");
@@ -1507,6 +1454,129 @@ test "assigning a lazy global before reading it keeps the assignment" {
         \\globalThis.atob = () => "mine";
         \\if (atob("x") !== "mine" || typeof btoa !== "function") throw new Error("assignment lost");
     , "assign.js");
+}
+
+test "a lazy global made non-configurable before first use still builds its family" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    try engine.evaluate(
+        \\Object.defineProperty(globalThis, "Uint8Array", { configurable: false });
+        \\if (new Uint8Array(2).length !== 2) throw new Error("Uint8Array");
+        \\const described = Object.getOwnPropertyDescriptor(globalThis, "Uint8Array");
+        \\if (described.configurable || typeof described.value !== "function") throw new Error("descriptor");
+    , "sealed.js");
+}
+
+test "building a family keeps what the widget did to its other globals" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    try engine.evaluate(
+        \\delete globalThis.Uint8Array;
+        \\if (typeof Float64Array !== "function" || "Uint8Array" in globalThis) throw new Error("a deleted Uint8Array came back");
+        \\if (Object.getPrototypeOf(Int8Array) !== Object.getPrototypeOf(Float64Array)) throw new Error("the family was built twice");
+        \\const mine = () => "mine";
+        \\Object.defineProperty(globalThis, "atob", { value: mine, writable: true, configurable: true });
+        \\if (typeof btoa !== "function" || globalThis.atob !== mine) throw new Error("the widget's atob was replaced");
+    , "siblings.js");
+}
+
+test "typed arrays built late share the realm's own Array.prototype.toString" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    try engine.evaluate(
+        \\const original = Array.prototype.toString;
+        \\Array.prototype.toString = () => "patched";
+        \\if (Uint8Array.prototype.toString !== original) throw new Error("typed arrays took the patched toString");
+    , "to-string.js");
+}
+
+/// Fails each allocation in turn of the first read of the lazy global
+/// `name` in a fresh widget realm, until a read fails none. A read that
+/// fails must throw and leave nothing pending, and the realm must then
+/// build the family on its next use and pass `check`. Returns how many
+/// allocations the sweep failed.
+fn expectFirstUseSurvivesOutOfMemory(name: [:0]const u8, check: [:0]const u8) !usize {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    const previous_owner = engine.chargeHeap();
+    defer heap().current = previous_owner;
+    var failures: usize = 0;
+    while (true) : (failures += 1) {
+        const context = newWidgetContext(engine.runtime) orelse return error.OutOfMemory;
+        defer c.JS_RunGC(engine.runtime);
+        defer c.JS_FreeContext(context);
+        const global = c.JS_GetGlobalObject(context);
+        defer c.JS_FreeValue(context, global);
+        test_allocations_left = failures;
+        const value = c.JS_GetPropertyStr(context, global, name.ptr);
+        const failed = test_allocations_left == null;
+        test_allocations_left = null;
+        if (c.JS_IsException(value)) {
+            try std.testing.expect(failed);
+            c.JS_FreeValue(context, c.JS_GetException(context));
+        } else {
+            c.JS_FreeValue(context, value);
+        }
+        try std.testing.expect(!c.JS_HasException(context));
+        const result = c.JS_Eval(context, check.ptr, check.len, "recovered.js", c.JS_EVAL_TYPE_GLOBAL);
+        defer c.JS_FreeValue(context, result);
+        if (c.JS_IsException(result)) return engine.reportExceptionFrom(context);
+        if (!failed) return failures;
+    }
+}
+
+test "a typed array family that runs out of memory while it is built is built again on next use" {
+    const failures = try expectFirstUseSurvivesOutOfMemory("Uint8Array",
+        \\if (typeof Uint8Array !== "function" || new Uint8Array([1, 2]).length !== 2) throw new Error("Uint8Array");
+        \\if (typeof Atomics !== "object" || new Float64Array(1).length !== 1) throw new Error("the rest of the family");
+    );
+    // The sweep reached past the whole build, not just its first steps.
+    try std.testing.expect(failures > 100);
+}
+
+test "base64 that runs out of memory while it is built throws, leaves nothing pending, and builds later" {
+    const failures = try expectFirstUseSurvivesOutOfMemory("atob",
+        \\if (atob(btoa("weaver")) !== "weaver") throw new Error("base64");
+        \\try { atob("!"); throw new Error("no throw"); } catch (error) { if (!(error instanceof DOMException)) throw error; }
+    );
+    try std.testing.expect(failures > 20);
+}
+
+test "a widget realm builds typed arrays and base64 only when used" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    const previous_owner = engine.chargeHeap();
+    defer heap().current = previous_owner;
+    c.JS_RunGC(engine.runtime);
+    const before_full = engine.heapBytes();
+    const full = c.JS_NewContext(engine.runtime) orelse return error.OutOfMemory;
+    const full_bytes = engine.heapBytes() - before_full;
+    c.JS_FreeContext(full);
+    c.JS_RunGC(engine.runtime);
+    const before_widget = engine.heapBytes();
+    const widget = newWidgetContext(engine.runtime) orelse return error.OutOfMemory;
+    const widget_bytes = engine.heapBytes() - before_widget;
+    c.JS_FreeContext(widget);
+    c.JS_RunGC(engine.runtime);
+    // Receipt (2026-10-16, Windows, Debug): a full realm 66,000 bytes, a
+    // widget realm 43,872. The floor sits under that 22,128-byte gap so a
+    // build that turns a family eager again fails here.
+    try std.testing.expect(full_bytes >= widget_bytes + 16 * 1024);
 }
 
 test "a destroyed widget's range comes back whole, queued jobs and all" {
