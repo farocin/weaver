@@ -1240,8 +1240,10 @@ test "the runtime's own tables leave nothing in a destroyed widget's range" {
     // grows during this widget's turns.
     try leaving.evaluate("globalThis.kept = [];", "kept.js");
     // 50,000 shapes grow the table well past its start, and stay below the
-    // point where this widget would collect inside a turn.
-    for (0..25) |_| try leaving.evaluate("for (let i = 0; i < 2000; i += 1) kept.push(Object.create({}));", "shapes.js");
+    // point where this widget would collect inside a turn. Small turns: 2,000
+    // shapes in one Debug turn came close enough to `turn_budget_ms` that a
+    // busy machine interrupted it.
+    for (0..100) |_| try leaving.evaluate("for (let i = 0; i < 500; i += 1) kept.push(Object.create({}));", "shapes.js");
     leaving.destroy(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(owner));
 
