@@ -63463,10 +63463,11 @@ static int js_uint8array_funcs_init(JSContext *ctx)
 
 int JS_AddIntrinsicAToB(JSContext *ctx)
 {
-    if (!JS_IsRegisteredClass(ctx->rt, JS_CLASS_DOM_EXCEPTION)) {
-        if (JS_AddIntrinsicDOMException(ctx))
-            return -1;
-    }
+    /* Weaver: every context needs its own DOMException global and
+       prototype; the class registration is the runtime's, and
+       JS_AddIntrinsicDOMException registers it only once. */
+    if (JS_AddIntrinsicDOMException(ctx))
+        return -1;
     JS_SetPropertyFunctionList(ctx, ctx->global_obj,
                                js_base64_funcs, countof(js_base64_funcs));
     return 0;

@@ -35,6 +35,9 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
 - `JS_NewContextRaw` unlinks a context from the GC list before freeing it
   when its class table cannot be allocated (upstream left a dangling entry
   that crashed the next collection).
+- `JS_AddIntrinsicAToB` adds DOMException to every context. Upstream adds it
+  only while the runtime has not registered the class, so with one runtime
+  shared by every widget, each realm after the first had no `DOMException`.
 - `JS_DropRuntimeException(rt)`: clears the runtime's pending exception when
   a context failed to build and none is left to take it from; the slot is
   shared by every widget.

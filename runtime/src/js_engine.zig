@@ -1354,6 +1354,19 @@ test "a widget's garbage is collected before it reaches its own cap" {
     for (0..12) |_| try churner.evaluate("{ const node = { pad: new ArrayBuffer(4 * 1024 * 1024) }; node.self = node; }", "churn.js");
 }
 
+test "every realm, not just the first, throws a real DOMException from atob" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const first = try widgets.engine(0);
+    defer first.destroy(std.testing.allocator);
+    const second = try widgets.engine(1);
+    defer second.destroy(std.testing.allocator);
+    const check = "try { atob('!'); throw new Error('no throw'); } catch (error) { if (!(error instanceof DOMException) || error.name !== 'InvalidCharacterError') throw error; }";
+    try first.evaluate(check, "first.js");
+    try second.evaluate(check, "second.js");
+}
+
 test "a destroyed widget's range comes back whole, queued jobs and all" {
     var widgets: TestWidgets = .{};
     try widgets.init();
