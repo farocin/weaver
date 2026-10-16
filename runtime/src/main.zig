@@ -1699,6 +1699,7 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     backend_status_io = init.io;
     if (hosted) {
         if (init.environ_map.get("WEAVER_CRASH_BREADCRUMB")) |name| crash_breadcrumb.open(name);
+        if (init.environ_map.get("WEAVER_SHARED_REALM")) |value| js_engine.shared_realm_enabled = std.mem.eql(u8, value, "1");
     }
     const local_app_data = init.environ_map.get("LOCALAPPDATA");
     const home = init.environ_map.get("HOME");

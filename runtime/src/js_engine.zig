@@ -66,15 +66,79 @@ const Shared = struct {
     /// Ranges whose threshold is due a reset: every range after a
     /// collection, since it frees garbage in all of them.
     gc_settle: std.StaticBitSet(max_engines + 1) = .initFull(),
+    /// The one realm every widget shares, when `shared_realm_enabled`.
+    realm: ?*c.JSContext = null,
 };
 
 var shared: ?Shared = null;
+
+/// PROTOTYPE (shared realm, WEAVER_SHARED_REALM=1 in a hosted runtime):
+/// every widget runs in one realm whose built-ins are frozen, each in a
+/// scope of its own. Set before the first engine is created.
+pub var shared_realm_enabled = false;
+
+/// Freezes every built-in reachable from the global object (and the hidden
+/// ones reachable only through syntax), after making the handful of
+/// prototype properties programs routinely shadow by assignment
+/// (`this.name = ...` in an Error subclass) assignable on instances.
+const lockdown_source =
+    \\(() => {
+    \\  const tame = (proto, key) => {
+    \\    const d = Object.getOwnPropertyDescriptor(proto, key);
+    \\    if (!d || !("value" in d)) return;
+    \\    const value = d.value;
+    \\    Object.defineProperty(proto, key, {
+    \\      get() { return value; },
+    \\      set(next) {
+    \\        if (this === proto) throw new TypeError("Cannot assign to read only property '" + String(key) + "' of a shared built-in");
+    \\        Object.defineProperty(this, key, { value: next, writable: true, enumerable: true, configurable: true });
+    \\      },
+    \\      enumerable: d.enumerable,
+    \\      configurable: false,
+    \\    });
+    \\  };
+    \\  for (const key of ["constructor", "toString", "valueOf", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString"]) tame(Object.prototype, key);
+    \\  for (const E of [Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError, AggregateError]) {
+    \\    for (const key of ["constructor", "name", "message", "toString"]) tame(E.prototype, key);
+    \\  }
+    \\  for (const key of ["constructor", "toString", "name"]) tame(Function.prototype, key);
+    \\  for (const key of ["constructor", "toString", "push"]) tame(Array.prototype, key);
+    \\  for (const key of ["then", "catch", "finally", "constructor"]) tame(Promise.prototype, key);
+    \\  const roots = [
+    \\    globalThis,
+    \\    Object.getPrototypeOf(function* () {}),
+    \\    Object.getPrototypeOf(async function () {}),
+    \\    Object.getPrototypeOf(async function* () {}),
+    \\    Object.getPrototypeOf([][Symbol.iterator]()),
+    \\    Object.getPrototypeOf(new Map()[Symbol.iterator]()),
+    \\    Object.getPrototypeOf(new Set()[Symbol.iterator]()),
+    \\    Object.getPrototypeOf(""[Symbol.iterator]()),
+    \\    Object.getPrototypeOf(/x/[Symbol.matchAll]("")),
+    \\    Object.getPrototypeOf((function* () {})()),
+    \\    Object.getPrototypeOf((async function* () {})()),
+    \\  ];
+    \\  const seen = new Set();
+    \\  const queue = roots.slice();
+    \\  while (queue.length > 0) {
+    \\    const value = queue.pop();
+    \\    if ((typeof value !== "object" && typeof value !== "function") || value === null || seen.has(value)) continue;
+    \\    seen.add(value);
+    \\    for (const key of Reflect.ownKeys(value)) {
+    \\      const d = Object.getOwnPropertyDescriptor(value, key);
+    \\      if ("value" in d) queue.push(d.value); else queue.push(d.get, d.set);
+    \\    }
+    \\    queue.push(Object.getPrototypeOf(value));
+    \\  }
+    \\  for (const value of seen) Object.freeze(value);
+    \\})();
+;
 /// The engine whose turn is running: the interrupt budget is its.
 var executing_engine: ?*Engine = null;
 
 /// The engine whose realm `context` is, through its opaque: the engine's
 /// bridge state. Null once the engine is being destroyed.
 fn engineOf(context: *c.JSContext) ?*Engine {
+    if (shared_realm_enabled) return executing_engine;
     const state: *bridge.State = @ptrCast(@alignCast(c.JS_GetContextOpaque(context) orelse return null));
     return @fieldParentPtr("bridge_state", state);
 }
@@ -150,6 +214,29 @@ fn acquireShared() !*Shared {
         c.JS_SetChargeJobFunc(runtime, chargeJob);
         c.JS_SetChargeSharedFunc(runtime, chargeShared);
         c.JS_SetGCTriggerFunc(runtime, gcTrigger);
+        if (shared_realm_enabled) {
+            // Built once, in the host's range: no widget pays for it.
+            const previous = shared.?.heap.current;
+            shared.?.heap.current = shared.?.heap.hostOwner();
+            defer shared.?.heap.current = previous;
+            const realm = c.JS_NewContext(runtime) orelse {
+                c.JS_FreeRuntime(runtime);
+                shared.?.heap.deinit(std.heap.page_allocator);
+                shared = null;
+                return error.OutOfMemory;
+            };
+            const locked = c.JS_Eval(realm, lockdown_source.ptr, lockdown_source.len, "lockdown.js", c.JS_EVAL_TYPE_GLOBAL);
+            defer c.JS_FreeValue(realm, locked);
+            if (c.JS_IsException(locked)) {
+                logExceptionFrom(realm, true);
+                c.JS_FreeContext(realm);
+                c.JS_FreeRuntime(runtime);
+                shared.?.heap.deinit(std.heap.page_allocator);
+                shared = null;
+                return error.OutOfMemory;
+            }
+            shared.?.realm = realm;
+        }
     }
     return &shared.?;
 }
@@ -212,6 +299,7 @@ fn releaseShared(owner: js_heap.Owner) void {
     state.engines -= 1;
     if (state.engines != 0) return;
     state.heap.current = state.heap.hostOwner();
+    if (state.realm) |realm| c.JS_FreeContext(realm);
     c.JS_FreeRuntime(state.runtime);
     state.heap.deinit(std.heap.page_allocator);
     shared = null;
@@ -252,13 +340,13 @@ pub const Engine = struct {
         state.heap.current = owner;
         defer state.heap.current = previous_owner;
         const runtime = state.runtime;
-        const context = c.JS_NewContext(runtime) orelse {
+        const context = state.realm orelse c.JS_NewContext(runtime) orelse {
             // Building the realm can throw (out of memory) into the shared
             // exception slot with no context left to take it from.
             c.JS_DropRuntimeException(runtime);
             return error.OutOfMemory;
         };
-        errdefer c.JS_FreeContext(context);
+        errdefer if (state.realm == null) c.JS_FreeContext(context);
         // Building the realm can run out of memory part way and still return
         // a context, its exception left in the shared slot: that realm is
         // not whole, and the exception is not the next widget's.
@@ -266,6 +354,14 @@ pub const Engine = struct {
             c.JS_FreeValue(context, c.JS_GetException(context));
             return error.OutOfMemory;
         }
+        const scope: ?c.JSValue = if (state.realm != null) scope: {
+            const global = c.JS_GetGlobalObject(context);
+            defer c.JS_FreeValue(context, global);
+            const scope = c.JS_NewObjectProto(context, global);
+            if (c.JS_IsException(scope)) return error.OutOfMemory;
+            break :scope scope;
+        } else null;
+        errdefer if (scope) |value| c.JS_FreeValue(context, value);
         errdefer if (c.JS_HasException(context)) c.JS_FreeValue(context, c.JS_GetException(context));
         self.* = .{
             .runtime = runtime,
@@ -281,6 +377,7 @@ pub const Engine = struct {
             .origins = origins,
             .media_transport_enabled = media_transport_enabled,
             .capture_mode = capture_mode,
+            .scope = scope,
         };
         bridge.install(context, &self.bridge_state) catch return error.QuickJs;
         return self;
@@ -290,10 +387,13 @@ pub const Engine = struct {
         const state = &shared.?;
         const previous_owner = state.heap.current;
         state.heap.current = self.owner;
+        const previous_bridge = bridge.current;
+        if (self.bridge_state.scope != null) bridge.current = &self.bridge_state;
         self.flushStorage();
         // Settling the bridge's outstanding callbacks can reject promises,
         // so its teardown comes before the rejections are released.
         bridge.deinit(self.context, &self.bridge_state);
+        bridge.current = previous_bridge;
         for (&self.pending_rejections) |*pending| {
             c.JS_FreeValue(self.context, pending.promise);
             c.JS_FreeValue(self.context, pending.reason);
@@ -302,12 +402,17 @@ pub const Engine = struct {
         // Teardown ran widget code outside a turn; the shared exception slot
         // must not keep this realm alive.
         self.drainExceptions();
-        c.JS_SetContextOpaque(self.context, null);
-        c.JS_FreeContext(self.context);
+        if (self.bridge_state.scope) |scope| {
+            c.JS_FreeValue(self.context, scope);
+            self.bridge_state.scope = null;
+        } else {
+            c.JS_SetContextOpaque(self.context, null);
+            c.JS_FreeContext(self.context);
+        }
         // The realm's cycles, its queued jobs among them (the context owns
         // its job queue), go now, not at some later widget's GC, so the
         // range is empty before another engine takes it.
-        if (state.engines > 1) c.JS_RunGC(state.runtime);
+        if (state.engines > 1 or state.realm != null) c.JS_RunGC(state.runtime);
         state.heap.current = if (previous_owner == self.owner) state.heap.hostOwner() else previous_owner;
         releaseShared(self.owner);
         allocator.destroy(self);
@@ -321,6 +426,22 @@ pub const Engine = struct {
         defer std.heap.page_allocator.free(terminated);
         self.beginTurn();
         defer self.endTurn();
+        if (self.bridge_state.scope) |scope| {
+            const prefix = "(function (globalThis, native, console) {";
+            const wrapped = std.heap.page_allocator.allocSentinel(u8, prefix.len + source.len + 3, 0) catch return error.OutOfMemory;
+            defer std.heap.page_allocator.free(wrapped);
+            @memcpy(wrapped[0..prefix.len], prefix);
+            @memcpy(wrapped[prefix.len..][0..source.len], source);
+            @memcpy(wrapped[prefix.len + source.len ..], "\n})");
+            const wrapper_function = try self.compile(wrapped, file_name);
+            const wrapper = c.JS_EvalFunction(self.context, wrapper_function);
+            defer c.JS_FreeValue(self.context, wrapper);
+            if (c.JS_IsException(wrapper)) return self.reportException();
+            const result = bridge.callInScope(self.context, scope, wrapper);
+            defer c.JS_FreeValue(self.context, result);
+            if (c.JS_IsException(result)) return self.reportException();
+            return self.pumpJobs();
+        }
         const function = try self.compile(terminated, file_name);
         const result = c.JS_EvalFunction(self.context, function);
         defer c.JS_FreeValue(self.context, result);
@@ -421,7 +542,7 @@ pub const Engine = struct {
         const previous_owner = self.chargeHeap();
         defer heap().current = previous_owner;
         defer self.drainExceptions();
-        const global = c.JS_GetGlobalObject(self.context);
+        const global = self.globalObject();
         defer c.JS_FreeValue(self.context, global);
         const value = c.JS_NewStringLen(self.context, seed.ptr, seed.len);
         if (c.JS_IsException(value) or c.JS_SetPropertyStr(self.context, global, "__weaverHotSwapSeed", value) < 0) return error.QuickJs;
@@ -581,7 +702,7 @@ pub const Engine = struct {
     fn callGlobal(self: *Engine, name: [*:0]const u8) Error!c.JSValue {
         self.beginTurn();
         defer self.endTurn();
-        const global = c.JS_GetGlobalObject(self.context);
+        const global = self.globalObject();
         defer c.JS_FreeValue(self.context, global);
         const callback = c.JS_GetPropertyStr(self.context, global, name);
         defer c.JS_FreeValue(self.context, callback);
@@ -595,6 +716,13 @@ pub const Engine = struct {
         return result;
     }
 
+    /// The object widget code knows as `globalThis`: its scope in a shared
+    /// realm, else the realm's global.
+    fn globalObject(self: *Engine) c.JSValue {
+        if (self.bridge_state.scope) |scope| return c.JS_DupValue(self.context, scope);
+        return c.JS_GetGlobalObject(self.context);
+    }
+
     fn beginTurn(self: *Engine) void {
         // QuickJS records its C-stack top when the runtime is created, but
         // platform callbacks can enter from a materially deeper native
@@ -605,6 +733,7 @@ pub const Engine = struct {
         self.deadline_ms = platform.monotonicMilliseconds() + turn_budget_ms;
         self.executing = true;
         executing_engine = self;
+        if (self.bridge_state.scope != null) bridge.current = &self.bridge_state;
         heap().current = self.owner;
     }
 
@@ -614,6 +743,7 @@ pub const Engine = struct {
         self.drainExceptions();
         self.executing = false;
         executing_engine = null;
+        bridge.current = null;
         heap().current = heap().hostOwner();
     }
 
@@ -623,7 +753,7 @@ pub const Engine = struct {
     /// uninstall, and host shutdown all take this path; only a crashed or
     /// externally force-killed widget relies on the completed debounce.
     fn flushStorage(self: *Engine) void {
-        const global = c.JS_GetGlobalObject(self.context);
+        const global = self.globalObject();
         defer c.JS_FreeValue(self.context, global);
         const callback = c.JS_GetPropertyStr(self.context, global, "__weaverFlushStorage");
         defer c.JS_FreeValue(self.context, callback);
