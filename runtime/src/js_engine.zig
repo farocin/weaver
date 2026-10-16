@@ -244,6 +244,11 @@ pub const Engine = struct {
         const self = allocator.create(Engine) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
         const state = acquireShared() catch return error.OutOfMemory;
+        // Building the realm and installing the bridge run QuickJS code
+        // outside a turn, possibly on a thread other than the last turn's
+        // (a widget the daemon adds loads on its own thread): measure the
+        // recursion guard from here, as `beginTurn` does.
+        if (executing_engine == null) c.JS_UpdateStackTop(state.runtime);
         const owner = state.heap.acquireOwner() orelse return error.OutOfMemory;
         state.gc_settle.set(owner);
         state.engines += 1;
@@ -288,6 +293,9 @@ pub const Engine = struct {
 
     pub fn destroy(self: *Engine, allocator: std.mem.Allocator) void {
         const state = &shared.?;
+        // Teardown runs widget code outside a turn, maybe on another thread
+        // than the last turn (see `create`).
+        if (executing_engine == null) c.JS_UpdateStackTop(state.runtime);
         const previous_owner = state.heap.current;
         state.heap.current = self.owner;
         self.flushStorage();
