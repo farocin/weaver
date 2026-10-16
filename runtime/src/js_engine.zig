@@ -7,6 +7,7 @@ const tree_mod = @import("tree.zig");
 const storage_mod = @import("storage.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const js_heap = @import("js_heap.zig");
+const crash_record = @import("crash_record.zig");
 const c = qjs.c;
 
 // QuickJS receipt (2026-07-29): a synthetic worst-good retained view with
@@ -229,6 +230,11 @@ pub const Engine = struct {
     provider: *provider_mod.Client,
     deadline_ms: u64 = 0,
     executing: bool = false,
+    /// The widget's slot in the host, for the crash record: a crash during
+    /// one of its turns names it (`crash_record`). Null outside a host.
+    crash_slot: ?u16 = null,
+    /// Wyhash of the widget's bundle, recorded with its turns.
+    crash_bundle: u64 = 0,
     capture_clock_ms: ?u64 = null,
     pending_rejections: [max_pending_rejections]PendingRejection = [_]PendingRejection{.{}} ** max_pending_rejections,
 
@@ -614,12 +620,14 @@ pub const Engine = struct {
         self.executing = true;
         executing_engine = self;
         heap().current = self.owner;
+        if (self.crash_slot) |slot| crash_record.beginTurn(slot, self.crash_bundle);
     }
 
     fn endTurn(self: *Engine) void {
         // The runtime's pending-exception slot is shared by every widget:
         // nothing of this turn may be left in it for the next one.
         self.drainExceptions();
+        crash_record.endTurn();
         self.executing = false;
         executing_engine = null;
         heap().current = heap().hostOwner();

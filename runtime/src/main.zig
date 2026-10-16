@@ -18,7 +18,7 @@ const tree_mod = @import("tree.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
-const crash_breadcrumb = @import("crash_breadcrumb.zig");
+const crash_record = @import("crash_record.zig");
 const small_fs = @import("small_fs.zig");
 
 comptime {
@@ -39,7 +39,14 @@ comptime {
 /// widget-windows.
 pub const max_host_widgets: usize = 32;
 
-pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
+pub const panic = std.debug.FullPanic(recordPanic);
+
+/// A panic is recorded as a crash (`crash_record`) before Native's
+/// diagnostics run, since they may fail in turn.
+fn recordPanic(msg: []const u8, ra: ?usize) noreturn {
+    crash_record.notePanic();
+    native_sdk.debug.capturePanic(msg, ra);
+}
 pub const std_options: std.Options = .{ .logFn = widget_log.logFn };
 
 pub const Model = struct {
@@ -83,11 +90,6 @@ pub const Model = struct {
     /// `HostMsg.widget` of its messages, and the namespace of its Native
     /// timer keys, image ids, and font ids.
     slot: u16 = 0,
-    /// How the daemon names this widget in the crash breadcrumb: its
-    /// position on the `--host` command line (its per-widget environment
-    /// variables' suffix, equal to `slot` unless a widget before it failed
-    /// to load), or in an anchored host the id it was added under.
-    argument: u16 = 0,
     window: WindowSpec = .{},
     /// Where `publishBackendStatus` tells the daemon this widget's renderer.
     backend_status_path: ?[]const u8 = null,
@@ -1836,9 +1838,6 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     }
     const capture_state_root = init.environ_map.get("WEAVER_CAPTURE_STATE_ROOT");
     backend_status_io = init.io;
-    if (hosted) {
-        if (init.environ_map.get("WEAVER_CRASH_BREADCRUMB")) |name| crash_breadcrumb.open(name);
-    }
     const local_app_data = init.environ_map.get("LOCALAPPDATA");
     const home = init.environ_map.get("HOME");
     // Capture receives its own empty state root from the CLI. Keeping the
@@ -1863,6 +1862,15 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
 
+    if (anchored_host) {
+        // Before any widget loads: a crash from here on is recorded.
+        const record_path = try std.fs.path.join(allocator, &.{ environment.data_root, "host.record" });
+        std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
+        crash_record.open(record_path) catch |err| {
+            std.debug.print("weaver-widget --host: no crash record at {s}: {s}; crashes go unattributed\n", .{ record_path, @errorName(err) });
+        };
+    }
+    defer crash_record.markStopped();
     if (control_pipe_name) |name| {
         control_pipe = host_control.Pipe.connect(name) catch |err| {
             std.debug.print("weaver-widget --host: cannot open the control pipe {s}: {s}\n", .{ name, @errorName(err) });
@@ -2025,7 +2033,7 @@ const Loader = struct {
         };
         for (self.directories, 0..) |directory, argument| {
             const slot: u16 = @intCast(self.widgets.items.len);
-            const model = loadWidget(self.environment, directory, slot, @intCast(argument), self.environment.channels(@intCast(argument))) catch |err| {
+            const model = loadWidget(self.environment, directory, slot, self.environment.channels(@intCast(argument))) catch |err| {
                 // One widget's broken install must not keep the others off
                 // the desktop; a lone widget fails the process as it always
                 // has.
@@ -2048,7 +2056,7 @@ const Loader = struct {
 /// Load one widget into `slot`: its manifest, log, storage, placement,
 /// provider channel, and engine, then evaluate its bundle. What it
 /// allocates lives in the widget's arena (`freeModel`).
-fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, argument: u16, channels: WidgetChannels) !*Model {
+fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, channels: WidgetChannels) !*Model {
     const init = environment.init;
     const capture_state_root = environment.capture_state_root;
     const model = try createModel();
@@ -2066,8 +2074,6 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     // the file again).
     defer std.heap.page_allocator.free(loaded.bundle);
     model.slot = slot;
-    model.argument = argument;
-    crash_breadcrumb.mark(argument);
     model.backend_status_path = if (channels.backend_file) |path| try allocator.dupe(u8, path) else null;
     const log_name = try safeLogName(allocator, loaded.manifest.name);
     model.log = try allocator.create(widget_log.Sink);
@@ -2176,6 +2182,9 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
             try engine.setCaptureClock(epoch_ms);
         }
     }
+    // Its turns mark the crash record with its slot and bundle.
+    engine.crash_slot = slot;
+    engine.crash_bundle = std.hash.Wyhash.hash(0, loaded.bundle);
     model.engine = engine;
     model.io = init.io;
     model.storage = storage;
@@ -2327,7 +2336,7 @@ const WidgetLoad = struct {
     }
 
     fn load(self: *WidgetLoad) void {
-        self.model = loadWidget(control_environment.?, self.directory, self.slot, self.slot, self.channels) catch |err| {
+        self.model = loadWidget(control_environment.?, self.directory, self.slot, self.channels) catch |err| {
             self.failure = err;
             return;
         };
@@ -2398,6 +2407,7 @@ fn serveControl(pipe: host_control.Pipe) void {
         if (count == 0) break;
         reader.filled(count);
     }
+    crash_record.markStopped();
     std.process.exit(0);
 }
 
@@ -2405,7 +2415,6 @@ fn serveControl(pipe: host_control.Pipe) void {
 /// enters the widget it is about to run.
 fn enter(model: *Model) *Model {
     widget_log.use(model.log);
-    crash_breadcrumb.mark(model.argument);
     return model;
 }
 
@@ -2950,6 +2959,7 @@ test {
     _ = @import("widget_log.zig");
     _ = @import("small_fs.zig");
     _ = @import("host_control.zig");
+    _ = @import("crash_record.zig");
     const automatic_software_backend: native_sdk.app_manifest.GpuSurfaceBackend =
         if (@import("builtin").os.tag == .macos) .metal else .software;
     try std.testing.expectEqual(automatic_software_backend, declaredGpuBackend("software", false));
