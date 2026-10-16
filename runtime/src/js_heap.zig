@@ -8,12 +8,13 @@
 //! Inside a range, sizes up to 512 bytes come from 1 KiB granules carved
 //! into one size class each (16-byte steps up to 128, then quarter steps);
 //! larger blocks are runs of whole granules behind a 16-byte length header.
-//! A byte per granule, at the start of the range, records what it holds.
-//! Freed runs merge with free neighbours, the run at the top of the range
-//! returns to it, and pages wholly inside free space are decommitted, so a
-//! freed block leaves the working set; `trim` returns small-class granules
-//! whose blocks are all free. QuickJS grows its parser and bytecode buffers
-//! by repeated realloc; the newest block grows in place.
+//! An 8-byte record per granule, at the start of the range, says what it
+//! holds; a small-class granule keeps its own free list there, and goes
+//! back to the range as soon as its last block is freed. Freed runs merge
+//! with free neighbours, the run at the top of the range returns to it, and
+//! pages wholly inside free space are decommitted, so freed memory leaves
+//! the working set. QuickJS grows its parser and bytecode buffers by
+//! repeated realloc; the newest block grows in place.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -26,13 +27,28 @@ const class_sizes = [_]u16{ 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256
 const page_bytes: usize = std.heap.page_size_min;
 const commit_step: usize = 64 * 1024;
 
-/// What a granule below `bump` holds: a small class index, or one of these.
+/// What a granule holds: a small class index, or one of these. Only the
+/// first and last granule of a run are marked; nothing looks inside one.
 const run_start: u8 = 0xF0;
-const run_rest: u8 = 0xF1;
+const run_end: u8 = 0xF1;
 const free_start: u8 = 0xF2;
-const free_rest: u8 = 0xF3;
+const free_end: u8 = 0xF3;
 
-const FreeBlock = struct { next: ?*FreeBlock };
+/// No granule, no block: granule indices and in-granule offsets are u16.
+const none: u16 = std.math.maxInt(u16);
+
+const Granule = extern struct {
+    kind: u8,
+    /// Small class: blocks handed out.
+    live: u8 = 0,
+    /// Small class: offset of the first free block; each free block starts
+    /// with the offset of the next.
+    free_head: u16 = none,
+    /// Small class: neighbours among the class's granules with a free block.
+    prev: u16 = none,
+    next: u16 = none,
+};
+
 /// Head of a free run, in its first granule; its length is repeated in the
 /// last 8 bytes of its last granule so the run after it can find its start.
 const FreeRun = struct { prev: ?*FreeRun, next: ?*FreeRun, granules: usize };
@@ -45,7 +61,8 @@ const Range = struct {
     committed: usize = 0,
     /// Usable bytes currently allocated.
     used: usize = 0,
-    free_blocks: [class_sizes.len]?*FreeBlock = @splat(null),
+    /// Per class, the first granule with a free block.
+    open: [class_sizes.len]u16 = @splat(none),
     free_runs: ?*FreeRun = null,
 };
 
@@ -59,9 +76,9 @@ pub const Layout = struct {
     }
 
     fn mapBytes(self: Layout) usize {
-        // One byte per granule of the whole range, rounded to a page; the
+        // A record per granule of the whole range, rounded to a page; the
         // map's own granules are simply never handed out.
-        return std.mem.alignForward(usize, self.range_bytes / granule_bytes, page_bytes);
+        return std.mem.alignForward(usize, self.range_bytes / granule_bytes * @sizeOf(Granule), page_bytes);
     }
 };
 
@@ -73,7 +90,9 @@ pub const Heap = struct {
     current: Owner,
 
     pub fn init(allocator: std.mem.Allocator, layout: Layout) !Heap {
+        std.debug.assert(layout.granulesPerRange() < none);
         const base = try reserve(layout.owners * layout.range_bytes);
+        errdefer release(base, layout.owners * layout.range_bytes);
         const ranges = try allocator.alloc(Range, layout.owners);
         for (ranges) |*range| range.* = .{};
         return .{ .layout = layout, .base = base, .ranges = ranges, .current = @intCast(layout.owners - 1) };
@@ -105,8 +124,8 @@ pub const Heap = struct {
         return self.base + @as(usize, owner) * self.layout.range_bytes;
     }
 
-    fn map(self: *const Heap, owner: Owner) [*]u8 {
-        return self.rangeBase(owner);
+    fn granules(self: *const Heap, owner: Owner) [*]Granule {
+        return @ptrCast(@alignCast(self.rangeBase(owner)));
     }
 
     fn granuleAddress(self: *const Heap, owner: Owner, granule: usize) [*]u8 {
@@ -127,6 +146,13 @@ pub const Heap = struct {
 
     fn runFooter(self: *const Heap, owner: Owner, last: usize) *usize {
         return @ptrCast(@alignCast(self.granuleAddress(owner, last) + granule_bytes - @sizeOf(usize)));
+    }
+
+    /// Mark the first and last granule of a run of `count`.
+    fn markEnds(self: *Heap, owner: Owner, start: usize, count: usize, first: u8, last: u8) void {
+        const map = self.granules(owner);
+        map[start + count - 1] = .{ .kind = last };
+        map[start] = .{ .kind = first };
     }
 
     /// Commit the bump region through `end` bytes from the range start.
@@ -164,16 +190,16 @@ pub const Heap = struct {
     /// free neighbours, or hand them back to the top of the range.
     fn freeGranules(self: *Heap, owner: Owner, first_granule: usize, first_count: usize) void {
         const range = &self.ranges[owner];
-        const granules = self.map(owner);
+        const map = self.granules(owner);
         var start = first_granule;
         var count = first_count;
         const after = start + count;
-        if (after < range.bump and granules[after] == free_start) {
+        if (after < range.bump and map[after].kind == free_start) {
             const next = self.runHead(owner, after);
             self.unlink(owner, next);
             count += next.granules;
         }
-        if (start > 0 and (granules[start - 1] == free_start or granules[start - 1] == free_rest)) {
+        if (start > 0 and (map[start - 1].kind == free_start or map[start - 1].kind == free_end)) {
             const previous_count = self.runFooter(owner, start - 1).*;
             start -= previous_count;
             self.unlink(owner, self.runHead(owner, start));
@@ -190,8 +216,7 @@ pub const Heap = struct {
             }
             return;
         }
-        granules[start] = free_start;
-        @memset(granules[start + 1 .. start + count], free_rest);
+        self.markEnds(owner, start, count, free_start, free_end);
         const run = self.runHead(owner, start);
         run.* = .{ .prev = null, .next = range.free_runs, .granules = count };
         if (range.free_runs) |head| head.prev = run;
@@ -209,12 +234,17 @@ pub const Heap = struct {
             if (run.granules < count) continue;
             const start = self.granuleOf(owner, run);
             const remaining = run.granules - count;
+            // Commit before touching the run's bookkeeping, so a failed
+            // commit leaves the run as it was. The remainder's head granule
+            // is written below, so it is committed too.
+            if (!self.commitGranules(owner, start, count + @intFromBool(remaining > 0))) return null;
             self.unlink(owner, run);
-            if (!self.commitGranules(owner, start, run.granules)) return null;
-            // Taken before the remainder is freed, so its merge check does
-            // not see these granules as a free neighbour.
-            @memset(self.map(owner)[start .. start + count], run_rest);
-            if (remaining > 0) self.freeGranules(owner, start + count, remaining);
+            if (remaining > 0) {
+                // Taken before the remainder is freed, so its merge check
+                // does not see these granules as a free neighbour.
+                self.granules(owner)[start + count - 1] = .{ .kind = run_end };
+                self.freeGranules(owner, start + count, remaining);
+            }
             return start;
         }
         if (range.bump + count > self.layout.granulesPerRange()) return null;
@@ -229,25 +259,16 @@ pub const Heap = struct {
     }
 
     fn allocFor(self: *Heap, owner: Owner, size: usize) ?*anyopaque {
-        if (size == 0) return null;
+        if (size == 0 or size > self.layout.range_bytes) return null;
         const range = &self.ranges[owner];
         if (size <= small_max) {
             const class = classFor(size);
-            if (range.free_blocks[class] == null) {
-                const granule = self.takeGranules(owner, 1) orelse return null;
-                self.map(owner)[granule] = @intCast(class);
-                const block_size: usize = class_sizes[class];
-                const first = self.granuleAddress(owner, granule);
-                var offset: usize = granule_bytes - granule_bytes % block_size;
-                while (offset >= block_size) {
-                    offset -= block_size;
-                    const block: *FreeBlock = @ptrCast(@alignCast(first + offset));
-                    block.next = range.free_blocks[class];
-                    range.free_blocks[class] = block;
-                }
-            }
-            const block = range.free_blocks[class].?;
-            range.free_blocks[class] = block.next;
+            const granule = if (range.open[class] != none) range.open[class] else self.carve(owner, class) orelse return null;
+            const record = &self.granules(owner)[granule];
+            const block = self.granuleAddress(owner, granule) + record.free_head;
+            record.free_head = @as(*const u16, @ptrCast(@alignCast(block))).*;
+            record.live += 1;
+            if (record.free_head == none) self.close(owner, class, granule);
             range.used += class_sizes[class];
             return block;
         }
@@ -258,10 +279,41 @@ pub const Heap = struct {
         return self.granuleAddress(owner, start) + header_bytes;
     }
 
+    /// A fresh granule of `class` blocks, all free, opened for allocation.
+    fn carve(self: *Heap, owner: Owner, class: usize) ?u16 {
+        const granule = self.takeGranules(owner, 1) orelse return null;
+        const block_size: usize = class_sizes[class];
+        const first = self.granuleAddress(owner, granule);
+        var next: u16 = none;
+        var offset: usize = granule_bytes - granule_bytes % block_size;
+        while (offset >= block_size) {
+            offset -= block_size;
+            @as(*u16, @ptrCast(@alignCast(first + offset))).* = next;
+            next = @intCast(offset);
+        }
+        self.granules(owner)[granule] = .{ .kind = @intCast(class), .free_head = 0 };
+        self.open(owner, class, @intCast(granule));
+        return @intCast(granule);
+    }
+
+    fn open(self: *Heap, owner: Owner, class: usize, granule: u16) void {
+        const range = &self.ranges[owner];
+        const map = self.granules(owner);
+        map[granule].prev = none;
+        map[granule].next = range.open[class];
+        if (range.open[class] != none) map[range.open[class]].prev = granule;
+        range.open[class] = granule;
+    }
+
+    fn close(self: *Heap, owner: Owner, class: usize, granule: u16) void {
+        const map = self.granules(owner);
+        const record = map[granule];
+        if (record.prev != none) map[record.prev].next = record.next else self.ranges[owner].open[class] = record.next;
+        if (record.next != none) map[record.next].prev = record.prev;
+    }
+
     fn markRun(self: *Heap, owner: Owner, start: usize, count: usize) void {
-        const granules = self.map(owner);
-        granules[start] = run_start;
-        @memset(granules[start + 1 .. start + count], run_rest);
+        self.markEnds(owner, start, count, run_start, if (count == 1) run_start else run_end);
         const header: *usize = @ptrCast(@alignCast(self.granuleAddress(owner, start)));
         header.* = count;
     }
@@ -272,7 +324,7 @@ pub const Heap = struct {
 
     pub fn usableSize(self: *const Heap, ptr: *const anyopaque) usize {
         const owner = self.ownerOf(ptr);
-        const kind = self.map(owner)[self.granuleOf(owner, ptr)];
+        const kind = self.granules(owner)[self.granuleOf(owner, ptr)].kind;
         if (kind < class_sizes.len) return class_sizes[kind];
         return runCount(ptr) * granule_bytes - header_bytes;
     }
@@ -280,47 +332,29 @@ pub const Heap = struct {
     pub fn free(self: *Heap, ptr: *anyopaque) void {
         const owner = self.ownerOf(ptr);
         const range = &self.ranges[owner];
-        const granule = self.granuleOf(owner, ptr);
-        const kind = self.map(owner)[granule];
+        const granule: u16 = @intCast(self.granuleOf(owner, ptr));
+        const record = &self.granules(owner)[granule];
+        const kind = record.kind;
         if (kind < class_sizes.len) {
-            const block: *FreeBlock = @ptrCast(@alignCast(ptr));
-            block.next = range.free_blocks[kind];
-            range.free_blocks[kind] = block;
             range.used -= class_sizes[kind];
+            const was_full = record.free_head == none;
+            @as(*u16, @ptrCast(@alignCast(ptr))).* = record.free_head;
+            record.free_head = @intCast(@intFromPtr(ptr) - @intFromPtr(self.granuleAddress(owner, granule)));
+            record.live -= 1;
+            if (was_full) self.open(owner, kind, granule);
+            // An empty granule goes back, unless it is the class's last one
+            // with room: then an alloc/free pair at the edge cannot make
+            // every call take and return a granule.
+            if (record.live == 0 and (range.open[kind] != granule or record.next != none)) {
+                self.close(owner, kind, granule);
+                self.freeGranules(owner, granule, 1);
+            }
             return;
         }
         std.debug.assert(kind == run_start);
         const count = runCount(ptr);
         range.used -= count * granule_bytes - header_bytes;
         self.freeGranules(owner, granule, count);
-    }
-
-    /// Give back the small-class granules of `owner` whose blocks are all
-    /// free, merging and decommitting them like freed runs. Compiling leaves
-    /// many freed small blocks spread across granules a few survivors pin;
-    /// without a trim those granules stay resident.
-    pub fn trim(self: *Heap, owner: Owner, scratch: std.mem.Allocator) !void {
-        const range = &self.ranges[owner];
-        if (range.bump == 0) return;
-        const free_counts = try scratch.alloc(u8, range.bump);
-        defer scratch.free(free_counts);
-        for (&range.free_blocks, 0..) |*head, class| {
-            @memset(free_counts, 0);
-            var cursor = head.*;
-            while (cursor) |block| : (cursor = block.next) free_counts[self.granuleOf(owner, block)] += 1;
-            const per_granule: u8 = @intCast(granule_bytes / class_sizes[class]);
-            var link = head;
-            while (link.*) |block| {
-                if (free_counts[self.granuleOf(owner, block)] == per_granule) {
-                    link.* = block.next;
-                } else {
-                    link = &block.next;
-                }
-            }
-            for (free_counts, 0..) |count, granule| {
-                if (count == per_granule and self.map(owner)[granule] == class) self.freeGranules(owner, granule, 1);
-            }
-        }
     }
 
     /// Grow or shrink in the block's own range, so an object stays with the
@@ -331,12 +365,13 @@ pub const Heap = struct {
             self.free(old);
             return null;
         }
+        if (size > self.layout.range_bytes) return null;
         const usable = self.usableSize(old);
         if (size <= usable) return old;
         const owner = self.ownerOf(old);
         const range = &self.ranges[owner];
         const granule = self.granuleOf(owner, old);
-        if (size > small_max and self.map(owner)[granule] == run_start) {
+        if (size > small_max and self.granules(owner)[granule].kind == run_start) {
             const count = runCount(old);
             const wanted = runGranules(size);
             if (granule + count == range.bump and granule + wanted <= self.layout.granulesPerRange() and
@@ -355,6 +390,7 @@ pub const Heap = struct {
     }
 };
 
+/// Granules for a block of `size` bytes; callers cap `size` at a range first.
 fn runGranules(size: usize) usize {
     return (size + header_bytes + granule_bytes - 1) / granule_bytes;
 }
@@ -484,26 +520,34 @@ test "realloc keeps contents and the block's owner" {
     try std.testing.expectEqual(@as(usize, 0), heap.usedBytes(1));
 }
 
-test "trim gives back small-class granules whose blocks are all free" {
+test "a small-class granule goes back once its blocks are all free" {
     var heap = try Heap.init(std.testing.allocator, .{ .owners = 2, .range_bytes = 1024 * 1024 });
     defer heap.deinit(std.testing.allocator);
     heap.current = 0;
-    var blocks: [256]*anyopaque = undefined;
+    // Eight full granules of 64-byte blocks, then a large block above them.
+    var blocks: [128]*anyopaque = undefined;
     for (&blocks) |*block| block.* = heap.alloc(64).?;
     const keep = heap.alloc(5000).?;
-    for (blocks[1..]) |block| heap.free(block);
-    const grown = heap.grownBytes(0);
-    try heap.trim(0, std.testing.allocator);
-    // Every granule but the one still holding blocks[0] came back, and the
-    // live block is untouched.
-    try std.testing.expectEqual(@as(usize, 64) + heap.usableSize(keep), heap.usedBytes(0));
-    const again = heap.alloc(64).?;
-    try std.testing.expect(heap.ownerOf(again) == 0);
-    heap.free(blocks[0]);
-    heap.free(again);
+    for (blocks) |block| heap.free(block);
+    try std.testing.expectEqual(heap.usableSize(keep), heap.usedBytes(0));
+    // The class keeps one empty granule; the other seven merged into one
+    // free run below `keep`, where a 7-granule block now fits.
+    const reused = heap.alloc(7000).?;
+    try std.testing.expect(@intFromPtr(reused) < @intFromPtr(keep));
+    heap.free(reused);
     heap.free(keep);
-    try heap.trim(0, std.testing.allocator);
-    try std.testing.expect(heap.grownBytes(0) < grown);
+    try std.testing.expect(heap.grownBytes(0) <= 1024);
+}
+
+test "sizes past a range fail instead of wrapping" {
+    var heap = try Heap.init(std.testing.allocator, .{ .owners = 2, .range_bytes = 1024 * 1024 });
+    defer heap.deinit(std.testing.allocator);
+    heap.current = 0;
+    try std.testing.expectEqual(@as(?*anyopaque, null), heap.alloc(std.math.maxInt(usize)));
+    const small: [*]u8 = @ptrCast(heap.alloc(10).?);
+    @memcpy(small[0..3], "abc");
+    try std.testing.expectEqual(@as(?*anyopaque, null), heap.realloc(small, std.math.maxInt(usize)));
+    try std.testing.expectEqualStrings("abc", small[0..3]);
 }
 
 test "a range refuses past its capacity, the cap" {

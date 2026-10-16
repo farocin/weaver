@@ -1202,6 +1202,8 @@ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
+/* Weaver addition: see VENDOR.md. */
+JS_EXTERN void JS_DropPendingJobs(JSRuntime *rt, JSContext *ctx);
 JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 
 /* Structure to retrieve (de)serialized SharedArrayBuffer objects. */

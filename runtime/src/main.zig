@@ -592,6 +592,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
         false,
     );
     errdefer candidate.destroy(std.heap.page_allocator);
+    candidate.host_widget = model;
     if (seed) |value| try candidate.setHotSwapSeed(value);
     try candidate.evaluate(source, "bundle.js");
     if (candidate.renderFailed()) return error.CandidateFirstRenderFailed;
@@ -1724,6 +1725,7 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
 
+    js_engine.enter_widget = enterEngineWidget;
     var loader: Loader = .{ .environment = environment, .directories = directories };
     const widgets = try loader.run();
     if (widgets.items.len == 0) return error.NoWidgetLoaded;
@@ -2010,6 +2012,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         model.media_transport_enabled,
         capture_state_root != null,
     );
+    engine.host_widget = model;
     if (capture_state_root != null) {
         if (init.environ_map.get("WEAVER_CAPTURE_CLOCK_EPOCH_MS")) |value| {
             const epoch_ms = std.fmt.parseInt(u64, value, 10) catch return error.CaptureClockInvalid;
@@ -2110,6 +2113,11 @@ fn enter(model: *Model) *Model {
     widget_log.use(model.log);
     crash_breadcrumb.mark(model.argument);
     return model;
+}
+
+/// `js_engine.enter_widget`: one widget's queued job runs in another's turn.
+fn enterEngineWidget(engine: *js_engine.Engine) void {
+    _ = enter(@ptrCast(@alignCast(engine.host_widget orelse return)));
 }
 
 fn widgetAt(host: *const Host, slot: u16) ?*Model {

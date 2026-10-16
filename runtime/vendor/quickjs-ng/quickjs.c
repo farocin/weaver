@@ -2170,6 +2170,24 @@ JSContext *JS_GetPendingJobContext(JSRuntime *rt)
     return NULL;
 }
 
+/* Weaver: drop the queued jobs of one context, as JS_FreeRuntime drops
+   every job. Only compares 'ctx', so it may already be freed. */
+void JS_DropPendingJobs(JSRuntime *rt, JSContext *ctx)
+{
+    struct list_head *el, *el1;
+    int i;
+
+    list_for_each_safe(el, el1, &rt->job_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        if (e->ctx != ctx)
+            continue;
+        list_del(&e->link);
+        for(i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        js_free_rt(rt, e);
+    }
+}
+
 /* return < 0 if exception, 0 if no job pending, 1 if a job was
    executed successfully. the context of the job is stored in '*pctx' */
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
