@@ -28,6 +28,9 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   the table is charged to the host's heap, not to the widget whose turn grew
   it; otherwise it stayed in that widget's range after the widget was gone,
   and the next widget given the range had less room.
+- `JS_NewContextRaw` unlinks a context from the GC list before freeing it
+  when its class table cannot be allocated (upstream left a dangling entry
+  that crashed the next collection).
 - `JS_DropRuntimeException(rt)`: clears the runtime's pending exception when
   a context failed to build and none is left to take it from; the slot is
   shared by every widget.

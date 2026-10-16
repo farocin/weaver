@@ -59,8 +59,6 @@ const Shared = struct {
     runtime: *c.JSRuntime,
     heap: js_heap.Heap,
     engines: usize = 0,
-    /// Heap ranges handed to live engines.
-    owners_in_use: std.StaticBitSet(max_engines) = .initEmpty(),
 };
 
 var shared: ?Shared = null;
@@ -181,10 +179,7 @@ fn chargeShared(_: ?*c.JSRuntime, restore: ?*anyopaque) callconv(.c) ?*anyopaque
 
 fn releaseShared(owner: js_heap.Owner) void {
     const state = &shared.?;
-    // Empty unless something the runtime shares still lives there (an atom
-    // another widget uses); then the range is left as it is.
-    if (state.heap.usedBytes(owner) == 0) state.heap.resetRange(owner);
-    state.owners_in_use.unset(owner);
+    state.heap.releaseOwner(owner);
     state.engines -= 1;
     if (state.engines != 0) return;
     state.heap.current = state.heap.hostOwner();
@@ -220,11 +215,7 @@ pub const Engine = struct {
         const self = allocator.create(Engine) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
         const state = acquireShared() catch return error.OutOfMemory;
-        const owner: js_heap.Owner = @intCast(blk: {
-            var free = state.owners_in_use.complement().iterator(.{});
-            break :blk free.next() orelse return error.OutOfMemory;
-        });
-        state.owners_in_use.set(owner);
+        const owner = state.heap.acquireOwner() orelse return error.OutOfMemory;
         state.engines += 1;
         errdefer releaseShared(owner);
         const previous_owner = state.heap.current;
@@ -1241,6 +1232,49 @@ test "a realm that runs out of memory while it is built leaves no exception behi
         if (created) |engine| engine.destroy(std.testing.allocator) else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(!c.JS_HasException(survivor.context));
     }
+}
+
+test "a range holding an atom another widget uses goes to a new widget only once freed" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    const leaving = try widgets.engine(0);
+    const leaving_owner = leaving.owner;
+    // The same 4 MiB property name in both realms is one runtime atom, made
+    // in the leaving widget's range.
+    const make = "globalThis.name = 'k'.repeat(4 * 1024 * 1024); globalThis.held = { [name]: 1 };";
+    try leaving.evaluate(make, "leaving.js");
+    try survivor.evaluate(make, "survivor.js");
+    leaving.destroy(std.testing.allocator);
+    try std.testing.expect(heap().usedBytes(leaving_owner) > 0);
+
+    const next = try widgets.engine(0);
+    try std.testing.expect(next.owner != leaving_owner);
+    try next.evaluate("globalThis.big = new ArrayBuffer(30 * 1024 * 1024);", "next.js");
+    next.destroy(std.testing.allocator);
+
+    try survivor.evaluate("delete globalThis.held; delete globalThis.name;", "drop.js");
+    c.JS_RunGC(survivor.runtime);
+    try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(leaving_owner));
+    const reused = try widgets.engine(0);
+    defer reused.destroy(std.testing.allocator);
+    try std.testing.expectEqual(leaving_owner, reused.owner);
+}
+
+test "a realm whose class table cannot be allocated leaves the collector intact" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    test_allocations_left = 1;
+    const created = widgets.engine(0);
+    test_allocations_left = null;
+    if (created) |engine| engine.destroy(std.testing.allocator) else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    c.JS_RunGC(survivor.runtime);
+    try survivor.evaluate("globalThis.ok = true;", "after.js");
 }
 
 test "a destroyed widget's range comes back whole, queued jobs and all" {

@@ -64,7 +64,14 @@ const Range = struct {
     /// Per class, the first granule with a free block.
     open: [class_sizes.len]u16 = @splat(none),
     free_runs: ?*FreeRun = null,
+    holder: Holder = .none,
 };
+
+/// Who a widget range belongs to. A released range that still holds
+/// something the runtime shares (an atom or shape another widget uses) is
+/// retired until its last block is freed: a new owner gets an empty range
+/// while there is one, so its cap is exact.
+const Holder = enum { none, owner, retired };
 
 /// Sizes the heap: `owners` ranges of `range_bytes` each.
 pub const Layout = struct {
@@ -114,14 +121,49 @@ pub const Heap = struct {
         return self.ranges[owner].used;
     }
 
+    /// A widget range for a new owner: an empty one, or else the retired
+    /// one holding least (shared blocks every widget's reloads leave, such
+    /// as atoms for common names, would otherwise use up the ranges). What a
+    /// retired range still holds counts against its new owner's cap.
+    pub fn acquireOwner(self: *Heap) ?Owner {
+        var least: ?usize = null;
+        for (self.ranges[0 .. self.ranges.len - 1], 0..) |*range, owner| {
+            switch (range.holder) {
+                .none => {
+                    range.holder = .owner;
+                    return @intCast(owner);
+                },
+                .retired => if (least == null or range.used < self.ranges[least.?].used) {
+                    least = owner;
+                },
+                .owner => {},
+            }
+        }
+        const owner = least orelse return null;
+        self.ranges[owner].holder = .owner;
+        return @intCast(owner);
+    }
+
+    /// The owner is gone. An empty range is reset for the next owner; one
+    /// that still holds shared blocks is retired until they are freed.
+    pub fn releaseOwner(self: *Heap, owner: Owner) void {
+        if (self.ranges[owner].used == 0) self.resetRange(owner) else self.ranges[owner].holder = .retired;
+    }
+
     /// Give an empty range back whole: the empty granules its size classes
     /// keep for reuse would otherwise sit scattered through it, and the next
     /// owner could not get one run as long as the range allows.
-    pub fn resetRange(self: *Heap, owner: Owner) void {
+    fn resetRange(self: *Heap, owner: Owner) void {
         const range = &self.ranges[owner];
         std.debug.assert(range.used == 0);
         if (range.committed > 0) decommit(self.rangeBase(owner), range.committed);
         range.* = .{};
+    }
+
+    /// A retired range whose last shared block was just freed is free again.
+    fn settle(self: *Heap, owner: Owner) void {
+        const range = &self.ranges[owner];
+        if (range.holder == .retired and range.used == 0) self.resetRange(owner);
     }
 
     /// Bytes of `owner`'s heap area below its top: the most that can be
@@ -359,12 +401,14 @@ pub const Heap = struct {
                 self.close(owner, kind, granule);
                 self.freeGranules(owner, granule, 1);
             }
+            self.settle(owner);
             return;
         }
         std.debug.assert(kind == run_start);
         const count = runCount(ptr);
         range.used -= count * granule_bytes - header_bytes;
         self.freeGranules(owner, granule, count);
+        self.settle(owner);
     }
 
     /// Grow or shrink in the block's own range, so an object stays with the
