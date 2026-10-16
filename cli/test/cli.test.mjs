@@ -351,7 +351,11 @@ ${body}
 `, "utf8");
     const result = spawnSync(process.execPath, ["cli/dist/index.js", "bundle", widget], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
-    return readFileSync(join(widget, "dist", "bundle.js"), "utf8");
+    const bundle = readFileSync(join(widget, "dist", "bundle.js"), "utf8");
+    // A trimmed bundle ships what it left out beside it, for anything the
+    // analysis missed (the capture smoke runs those cases).
+    assert.equal(existsSync(join(widget, "dist", "sdk-fallback.js")), !bundle.includes(classCompiler) || !bundle.includes(palette));
+    return bundle;
   };
   const classCompiler = "arrives in M2+";
   const palette = '"orange-950"';

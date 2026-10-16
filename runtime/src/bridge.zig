@@ -26,7 +26,16 @@ pub const State = struct {
     fetches: [max_fetches]FetchSlot = [_]FetchSlot{.{}} ** max_fetches,
     render_failed: bool = false,
     emit_error_logs: bool = true,
+    /// `sdk-fallback.js` beside the widget's bundle: the SDK runtime that
+    /// `weaver bundle` left out because the source showed no use for it.
+    /// Null when the bundle carries the whole SDK.
+    sdk_fallback_path: ?[]const u8 = null,
 };
+
+// SDK fallback receipt (2026-10-15): the class compiler and gradient
+// serializer bundle to 26,659 bytes. 256 KiB is a tripwire for a broken build, not
+// a budget a widget can reach.
+pub const max_sdk_fallback_bytes: usize = 256 * 1024;
 
 // Timer receipt (2026-07-29): executing every shipped widget measured one
 // simultaneously active interval. Sixteen leaves 16x headroom for clocks,
@@ -119,6 +128,7 @@ pub fn install(ctx: *c.JSContext, bridge_state: *State) !void {
     try setFunction(ctx, native, "storageRead", storageRead, 0);
     try setFunction(ctx, native, "storageWrite", storageWrite, 1);
     try setFunction(ctx, native, "log", log, 1);
+    try setFunction(ctx, native, "loadSdkFallback", loadSdkFallback, 0);
     // The bridge object is the widget sandbox boundary. In particular, the
     // runtime-owned captureMode bit must not be replaceable by widget prelude
     // code before the SDK evaluates.
@@ -1071,6 +1081,20 @@ fn log(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueCo
     defer c.JS_FreeCString(js, value.raw);
     std.log.info("widget: {s}", .{value.bytes});
     return qjs.undefinedValue();
+}
+
+/// Evaluate the widget's `sdk-fallback.js` and return its exports: the SDK
+/// calls this once, the first time it needs a part `weaver bundle` left out.
+fn loadSdkFallback(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, _: [*c]c.JSValueConst) callconv(.c) c.JSValue {
+    const js = ctx orelse return qjs.exceptionValue();
+    if (argc != 0) return fail(js, "loadSdkFallback expects no arguments");
+    const bridge_state = state(js);
+    const path = bridge_state.sdk_fallback_path orelse return fail(js, "this widget's bundle carries the whole SDK; there is no sdk-fallback.js to load");
+    const source = std.Io.Dir.cwd().readFileAllocOptions(bridge_state.storage.io, path, std.heap.page_allocator, .limited(max_sdk_fallback_bytes), .of(u8), 0) catch |err|
+        return failFmt(js, "cannot read {s}: {s}; rebuild the widget with weaver bundle", .{ path, @errorName(err) });
+    defer std.heap.page_allocator.free(source);
+    std.log.info("widget loaded the SDK fallback: weaver bundle could not show its class or background use was complete", .{});
+    return c.JS_Eval(js, source.ptr, source.len, "sdk-fallback.js", c.JS_EVAL_TYPE_GLOBAL);
 }
 
 fn consoleLog(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {
