@@ -1212,6 +1212,11 @@ JS_EXTERN int JS_ExecuteContextJob(JSContext *ctx);
    allocation fails. */
 typedef void *JSChargeJobFunc(JSContext *ctx, void *restore);
 JS_EXTERN void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func);
+/* Drop the runtime's pending exception without a context. */
+JS_EXTERN void JS_DropRuntimeException(JSRuntime *rt);
+/* A DOMException's name and message, without calling its getters; false
+   when the value is not one. The caller frees both. */
+JS_EXTERN bool JS_GetDOMExceptionFields(JSContext *ctx, JSValueConst val, JSValue *name, JSValue *message);
 JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 
 /* Structure to retrieve (de)serialized SharedArrayBuffer objects. */

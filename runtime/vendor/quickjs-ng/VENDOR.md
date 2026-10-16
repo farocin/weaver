@@ -23,3 +23,9 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
   around allocating a job, so a garbage collection in one widget's turn
   charges another widget's queued cleanup job to that widget's heap.
+- `JS_DropRuntimeException(rt)`: clears the runtime's pending exception when
+  a context failed to build and none is left to take it from; the slot is
+  shared by every widget.
+- `JS_GetDOMExceptionFields(ctx, val, &name, &message)`: reads a
+  DOMException's fields without its prototype getters, so diagnostics can
+  show one without running code.

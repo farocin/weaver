@@ -195,8 +195,14 @@ pub const Engine = struct {
         state.heap.current = owner;
         defer state.heap.current = previous_owner;
         const runtime = state.runtime;
-        const context = c.JS_NewContext(runtime) orelse return error.OutOfMemory;
+        const context = c.JS_NewContext(runtime) orelse {
+            // Building the realm can throw (out of memory) into the shared
+            // exception slot with no context left to take it from.
+            c.JS_DropRuntimeException(runtime);
+            return error.OutOfMemory;
+        };
         errdefer c.JS_FreeContext(context);
+        errdefer if (c.JS_HasException(context)) c.JS_FreeValue(context, c.JS_GetException(context));
         self.* = .{
             .runtime = runtime,
             .context = context,
@@ -618,6 +624,15 @@ fn valueDetails(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []co
 
 fn formatValue(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []const u8 {
     if (c.JS_IsError(value)) return errorValueDetails(context, value, buffer);
+    var dom_name: c.JSValue = undefined;
+    var dom_message: c.JSValue = undefined;
+    if (c.JS_GetDOMExceptionFields(context, value, &dom_name, &dom_message)) {
+        // Built-ins such as atob throw these; their name and message live
+        // in the object, not in properties.
+        defer c.JS_FreeValue(context, dom_name);
+        defer c.JS_FreeValue(context, dom_message);
+        return errorFields(context, dom_name, dom_message, value, buffer);
+    }
     if (c.JS_IsSymbol(value)) return "a thrown Symbol";
     if (c.JS_IsObject(value)) return "a thrown object that is not an Error (throw new Error(...) to see its message and stack)";
     var len: usize = 0;
@@ -630,7 +645,9 @@ fn formatValue(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []con
 
 /// The string data property `name` of `object` or its prototypes, as a
 /// value the caller frees; null when it is absent, an accessor, not a
-/// string, or behind a Proxy.
+/// string, or behind a Proxy. (A module namespace on the chain could still
+/// throw for an uninitialized export; widgets load as global scripts, so
+/// none reaches here.)
 fn stringDataProperty(context: *c.JSContext, object: c.JSValueConst, name: [*:0]const u8) ?c.JSValue {
     const atom = c.JS_NewAtom(context, name);
     defer c.JS_FreeAtom(context, atom);
@@ -660,6 +677,12 @@ fn errorValueDetails(context: *c.JSContext, value: c.JSValueConst, buffer: []u8)
     defer c.JS_FreeValue(context, name_value);
     const message_value = stringDataProperty(context, value, "message") orelse qjs.undefinedValue();
     defer c.JS_FreeValue(context, message_value);
+    return errorFields(context, name_value, message_value, value, buffer);
+}
+
+/// "name: message" and the stack of an error-like `value`, from string
+/// values already read without running widget code.
+fn errorFields(context: *c.JSContext, name_value: c.JSValueConst, message_value: c.JSValueConst, value: c.JSValueConst, buffer: []u8) []const u8 {
     const stack_value = stringDataProperty(context, value, "stack") orelse qjs.undefinedValue();
     defer c.JS_FreeValue(context, stack_value);
 
@@ -1069,6 +1092,22 @@ test "diagnostics format thrown values without running widget code" {
     defer c.JS_FreeValue(engine.context, error_value);
     try std.testing.expectEqualStrings("TypeError: plain message", valueDetails(engine.context, error_value, &buffer));
     try engine.evaluate("if (ran.length !== 0) throw new Error('diagnostics ran widget code: ' + ran.join(', '));", "check.js");
+}
+
+test "a built-in's DOMException keeps its name and message in diagnostics" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const engine = try widgets.engine(0);
+    defer engine.destroy(std.testing.allocator);
+    try engine.evaluate("try { atob('!'); } catch (error) { globalThis.thrown = error; }", "dom.js");
+    const global = c.JS_GetGlobalObject(engine.context);
+    defer c.JS_FreeValue(engine.context, global);
+    const thrown = c.JS_GetPropertyStr(engine.context, global, "thrown");
+    defer c.JS_FreeValue(engine.context, thrown);
+    var buffer: [max_exception_detail_bytes]u8 = undefined;
+    const details = valueDetails(engine.context, thrown, &buffer);
+    try std.testing.expect(std.mem.startsWith(u8, details, "InvalidCharacterError: "));
 }
 
 test "a hot-swap capture too big to convert leaves the exception slot empty" {

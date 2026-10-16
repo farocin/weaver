@@ -7682,6 +7682,14 @@ bool JS_HasException(JSContext *ctx)
     return !JS_IsUninitialized(ctx->rt->current_exception);
 }
 
+/* Weaver: drop the runtime's pending exception when no context is left to
+   take it from, as after a context that failed to build. */
+void JS_DropRuntimeException(JSRuntime *rt)
+{
+    JS_FreeValueRT(rt, rt->current_exception);
+    rt->current_exception = JS_UNINITIALIZED;
+}
+
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
 {
     uint32_t a;
@@ -62242,6 +62250,18 @@ static const JSDOMExceptionNameDef js_dom_exception_names_table[] = {
     { "InvalidNodeTypeError", "INVALID_NODE_TYPE_ERR" },
     { "DataCloneError", "DATA_CLONE_ERR" }
 };
+
+/* Weaver: a DOMException's name and message, read from its own fields
+   without calling the prototype's getters. False when val is not one. */
+bool JS_GetDOMExceptionFields(JSContext *ctx, JSValueConst val, JSValue *name, JSValue *message)
+{
+    JSDOMExceptionData *s = JS_GetOpaque(val, JS_CLASS_DOM_EXCEPTION);
+    if (!s)
+        return false;
+    *name = js_dup(s->name);
+    *message = js_dup(s->message);
+    return true;
+}
 
 static void js_domexception_finalizer(JSRuntime *rt, JSValueConst val)
 {
