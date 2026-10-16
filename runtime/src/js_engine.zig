@@ -125,8 +125,23 @@ fn acquireShared() !*Shared {
         c.JS_SetMaxStackSize(runtime, max_stack_bytes);
         c.JS_SetInterruptHandler(runtime, interruptHandler, null);
         c.JS_SetHostPromiseRejectionTracker(runtime, promiseRejectionTracker, null);
+        c.JS_SetChargeJobFunc(runtime, chargeJob);
     }
     return &shared.?;
+}
+
+/// `JS_EnqueueJob` asks this around allocating a job: a collection in one
+/// widget's turn can queue another widget's FinalizationRegistry callback,
+/// whose entry is that widget's. The token is the owner to restore, plus one
+/// so it is never null.
+fn chargeJob(context: ?*c.JSContext, restore: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const js = context orelse {
+        heap().current = @intCast(@intFromPtr(restore) - 1);
+        return null;
+    };
+    const previous = heap().current;
+    if (engineOf(js)) |engine| heap().current = engine.owner;
+    return @ptrFromInt(@as(usize, previous) + 1);
 }
 
 fn releaseShared(owner: js_heap.Owner) void {
@@ -881,6 +896,56 @@ test "another widget's collection queues a cleanup that waits for its owner" {
     try owner.evaluate("globalThis.next = true;", "next.js");
     try std.testing.expect(owner.heapBytes() >= owner_bytes + 1024 * 1024);
     try owner.evaluate("if (!(globalThis.cleaned instanceof ArrayBuffer)) throw new Error('cleanup did not run');", "owner-check.js");
+}
+
+test "cleanups another widget's collection queues are charged to their owner" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const owner = try widgets.engine(0);
+    defer owner.destroy(std.testing.allocator);
+    const bystander = try widgets.engine(1);
+    defer bystander.destroy(std.testing.allocator);
+
+    try owner.evaluate("globalThis.registry = new FinalizationRegistry(() => {}); globalThis.targets = [];", "owner.js");
+    for (0..10) |_| try owner.evaluate(
+        \\for (let index = 0; index < 1000; index += 1) {
+        \\  const target = {}; target.self = target; registry.register(target, index); targets.push(target);
+        \\}
+    , "register.js");
+    // Unreachable now, but cycles: only a collection frees them.
+    try owner.evaluate("globalThis.targets = null;", "drop.js");
+    // The collection runs in the bystander's turn, as a GC its own
+    // allocations triggered would.
+    const bystander_bytes = bystander.heapBytes();
+    heap().current = bystander.owner;
+    c.JS_RunGC(owner.runtime);
+    heap().current = heap().hostOwner();
+    try std.testing.expect(c.JS_IsContextJobPending(owner.context));
+    try std.testing.expect(bystander.heapBytes() < bystander_bytes + 16 * 1024);
+}
+
+test "a media callback that throws while its widget unloads takes nothing with it" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    const leaving = try widgets.engine(0);
+    try leaving.evaluate("globalThis.callback = () => { throw new ArrayBuffer(20 * 1024 * 1024); };", "leaving.js");
+    // A media command still waiting for its acknowledgement: unloading
+    // settles it, and its callback throws.
+    const global = c.JS_GetGlobalObject(leaving.context);
+    defer c.JS_FreeValue(leaving.context, global);
+    const index = try leaving.bridge_state.media_tracker.add(1, 0);
+    leaving.bridge_state.media_callbacks[index] = c.JS_GetPropertyStr(leaving.context, global, "callback");
+    leaving.destroy(std.testing.allocator);
+
+    // The runtime's exception slot is shared; the thrown 20 MiB went with
+    // the widget, so its range is whole for the next one.
+    const next = try widgets.engine(0);
+    defer next.destroy(std.testing.allocator);
+    try next.evaluate("globalThis.big = new ArrayBuffer(28 * 1024 * 1024);", "next.js");
 }
 
 test "an endless microtask chain stops at its own widget's budget" {

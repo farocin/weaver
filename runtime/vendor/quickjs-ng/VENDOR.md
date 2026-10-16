@@ -20,3 +20,6 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   `JS_ExecutePendingJob` scan contexts in creation order. A context marks
   its queued jobs for the collector and frees them with itself, so a
   dropped context's jobs never outlive it.
+- `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
+  around allocating a job, so a garbage collection in one widget's turn
+  charges another widget's queued cleanup job to that widget's heap.

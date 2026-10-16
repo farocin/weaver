@@ -285,6 +285,8 @@ struct JSRuntime {
     JSClass *class_array;
 
     struct list_head context_list; /* list of JSContext.link */
+    /* Weaver: charges a job's allocation to its context (JS_SetChargeJobFunc). */
+    JSChargeJobFunc *charge_job;
     /* list of JSGCObjectHeader.link. List of allocated GC objects (used
        by the garbage collector) */
     struct list_head gc_obj_list;
@@ -2147,7 +2149,14 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 
     assert(!rt->in_free);
 
-    e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+    /* Weaver: a collection in one context can queue another context's
+       job; the embedder charges the entry to the job's context. */
+    {
+        void *restore = rt->charge_job ? rt->charge_job(ctx, NULL) : NULL;
+        e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+        if (rt->charge_job)
+            rt->charge_job(NULL, restore);
+    }
     if (!e)
         return -1;
     e->ctx = ctx;
@@ -2159,6 +2168,11 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     /* Weaver: each realm queues its own jobs (see JSContext.job_list). */
     list_add_tail(&e->link, &ctx->job_list);
     return 0;
+}
+
+void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func)
+{
+    rt->charge_job = func;
 }
 
 /* Weaver: the first context with a pending job, in creation order. */

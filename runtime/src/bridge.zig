@@ -133,7 +133,12 @@ pub fn install(ctx: *c.JSContext, bridge_state: *State) !void {
 }
 
 pub fn deinit(ctx: *c.JSContext, bridge_state: *State) void {
-    settleAllMedia(ctx, bridge_state, "MediaCommandShutdown");
+    if (!settleAllMedia(ctx, bridge_state, "MediaCommandShutdown")) {
+        // The runtime's pending-exception slot is shared by every widget;
+        // this one is unloading, so its exception goes with it.
+        c.JS_FreeValue(ctx, c.JS_GetException(ctx));
+        std.log.warn("a media callback threw while the widget unloaded; its exception was dropped with the widget", .{});
+    }
     for (&bridge_state.timers) |*timer| {
         c.JS_FreeValue(ctx, timer.callback);
         timer.* = .{};
@@ -1033,24 +1038,28 @@ fn settleMedia(ctx: *c.JSContext, bridge_state: *State, index: usize, ok: ?bool,
     return succeeded;
 }
 
-fn settleAllMedia(ctx: *c.JSContext, bridge_state: *State, error_name: []const u8) void {
-    for (0..max_media_pending) |index| _ = settleMedia(ctx, bridge_state, index, null, error_name);
+/// Settle every pending media command with `error_name`. False when a
+/// callback threw; its exception is left pending for the caller.
+fn settleAllMedia(ctx: *c.JSContext, bridge_state: *State, error_name: []const u8) bool {
+    var settled = true;
+    for (0..max_media_pending) |index| {
+        if (!settleMedia(ctx, bridge_state, index, null, error_name)) settled = false;
+    }
+    return settled;
 }
 
 /// Ack delivery shares the provider app-loop turn but never shares the
 /// provider frame queue or installs another JS dispatcher.
 pub fn dispatchMediaAcks(ctx: *c.JSContext, bridge_state: *State) bool {
     if (bridge_state.provider.protocolFailed()) {
-        settleAllMedia(ctx, bridge_state, "MalformedMediaAck");
-        return true;
+        return settleAllMedia(ctx, bridge_state, "MalformedMediaAck");
     }
     while (bridge_state.provider.takeAck()) |ack| {
         const index = bridge_state.media_tracker.indexOf(ack.id) orelse continue;
         if (!settleMedia(ctx, bridge_state, index, ack.ok, null)) return false;
     }
     if (bridge_state.provider.isDisconnected()) {
-        settleAllMedia(ctx, bridge_state, "MediaChannelDisconnected");
-        return true;
+        return settleAllMedia(ctx, bridge_state, "MediaChannelDisconnected");
     }
     const now_ms = bridge_state.provider.nowMilliseconds();
     for (0..max_media_pending) |index| {
