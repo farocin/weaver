@@ -11,8 +11,12 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
 
 ## Local changes
 
-- `JS_DropPendingJobs(rt, ctx)` (`quickjs.c`, `quickjs.h`): drops the queued
-  jobs of one context. Weaver's widgets share one runtime (ADR 0021), so a
-  widget's realm can go while other realms keep running; upstream only drops
-  jobs when the whole runtime is freed. It returns how many it dropped and
-  also drops jobs queued while freeing the dropped jobs' arguments.
+- Each context queues its own jobs (`JSContext.job_list` in `quickjs.c`).
+  Weaver's widgets share one runtime, one context each (ADR 0021); with the
+  runtime's single queue, one widget's promise jobs ran in another's turn.
+  `JS_EnqueueJob` appends to the job's context; `JS_ExecuteContextJob(ctx)`
+  and `JS_IsContextJobPending(ctx)` (`quickjs.h`) run and check one context's
+  queue; the runtime-wide `JS_IsJobPending`, `JS_GetPendingJobContext` and
+  `JS_ExecutePendingJob` scan contexts in creation order. A context marks
+  its queued jobs for the collector and frees them with itself, so a
+  dropped context's jobs never outlive it.

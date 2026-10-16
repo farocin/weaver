@@ -67,11 +67,6 @@ var shared: ?Shared = null;
 /// The engine whose turn is running: the interrupt budget is its.
 var executing_engine: ?*Engine = null;
 
-/// Set by the host: route logs and the crash breadcrumb to `engine`'s
-/// widget, whose code is about to run inside another widget's turn (one of
-/// its queued jobs, see `pumpJobs`).
-pub var enter_widget: ?*const fn (engine: *Engine) void = null;
-
 /// The engine whose realm `context` is, through its opaque: the engine's
 /// bridge state. Null once the engine is being destroyed.
 fn engineOf(context: *c.JSContext) ?*Engine {
@@ -153,8 +148,6 @@ pub const Engine = struct {
     context: *c.JSContext,
     /// This engine's heap range: what it allocates, and its memory cap.
     owner: js_heap.Owner,
-    /// The host's handle for this engine's widget, for `enter_widget`.
-    host_widget: ?*anyopaque = null,
     bridge_state: bridge.State,
     provider: *provider_mod.Client,
     deadline_ms: u64 = 0,
@@ -211,26 +204,20 @@ pub const Engine = struct {
         const previous_owner = state.heap.current;
         state.heap.current = self.owner;
         self.flushStorage();
-        // The job queue is the shared runtime's: this realm's queued jobs
-        // would otherwise run in another widget's turn, after the bridge
-        // state they call into is gone.
-        _ = c.JS_DropPendingJobs(state.runtime, self.context);
+        // Settling the bridge's outstanding callbacks can reject promises,
+        // so its teardown comes before the rejections are released.
+        bridge.deinit(self.context, &self.bridge_state);
         for (&self.pending_rejections) |*pending| {
             c.JS_FreeValue(self.context, pending.promise);
             c.JS_FreeValue(self.context, pending.reason);
             pending.* = .{};
         }
-        bridge.deinit(self.context, &self.bridge_state);
         c.JS_SetContextOpaque(self.context, null);
         c.JS_FreeContext(self.context);
-        if (state.engines > 1) {
-            // The realm's cycles go now, not at some later widget's GC, so
-            // the range is empty before another engine takes it. Collecting
-            // them can queue the realm's FinalizationRegistry callbacks,
-            // whose arguments hold more of it: drop those and collect again.
-            c.JS_RunGC(state.runtime);
-            while (c.JS_DropPendingJobs(state.runtime, self.context) > 0) c.JS_RunGC(state.runtime);
-        }
+        // The realm's cycles, its queued jobs among them (the context owns
+        // its job queue), go now, not at some later widget's GC, so the
+        // range is empty before another engine takes it.
+        if (state.engines > 1) c.JS_RunGC(state.runtime);
         state.heap.current = if (previous_owner == self.owner) state.heap.hostOwner() else previous_owner;
         releaseShared(self.owner);
         allocator.destroy(self);
@@ -458,75 +445,19 @@ pub const Engine = struct {
         return count;
     }
 
-    /// Run the queue empty, each job in a turn of the widget whose realm
-    /// queued it. The queue is the shared runtime's: a garbage collection in
-    /// this turn can queue another widget's FinalizationRegistry callbacks,
-    /// and a job left behind would run in the next widget's turn. A job that
-    /// throws is reported and the rest still run. An empty queue is the
-    /// checkpoint where a rejection nobody handled is final, for every widget
-    /// whose jobs ran.
+    /// Run this realm's queued jobs. Each realm keeps its own queue (a
+    /// change to the vendored QuickJS), so a widget's jobs run only in its
+    /// own turns, as they did with a runtime each. After a job throws, the
+    /// rest wait for the widget's next turn.
     fn pumpJobs(self: *Engine) Error!void {
-        var failure: ?Error = null;
-        var visited: [max_engines]*Engine = undefined;
-        var visited_count: usize = 0;
-        while (c.JS_GetPendingJobContext(self.runtime)) |job_context| {
-            const job_engine = engineOf(job_context) orelse {
-                // A realm whose engine is being destroyed.
-                _ = c.JS_DropPendingJobs(self.runtime, job_context);
-                continue;
-            };
-            if (job_engine == self) {
-                self.runJob() catch |err| {
-                    failure = err;
-                };
-                continue;
+        while (true) {
+            const result = c.JS_ExecuteContextJob(self.context);
+            if (result == 0) {
+                self.flushUnhandledRejections();
+                return;
             }
-            self.runJobsOf(job_engine);
-            if (std.mem.indexOfScalar(*Engine, visited[0..visited_count], job_engine) == null) {
-                visited[visited_count] = job_engine;
-                visited_count += 1;
-            }
+            if (result < 0) return self.reportException();
         }
-        for (visited[0..visited_count]) |other| self.switchTo(other, flushUnhandledRejections);
-        if (failure) |err| return err;
-        self.flushUnhandledRejections();
-    }
-
-    fn runJob(self: *Engine) Error!void {
-        var job_context: ?*c.JSContext = null;
-        if (c.JS_ExecutePendingJob(self.runtime, &job_context) < 0) return self.reportExceptionFrom(job_context orelse self.context);
-    }
-
-    /// Run the jobs at the head of the queue that are this realm's.
-    fn runOwnHeadJobs(self: *Engine) void {
-        while (c.JS_GetPendingJobContext(self.runtime) == self.context) {
-            // A failure is already in this widget's log.
-            self.runJob() catch {};
-        }
-    }
-
-    /// Run `other`'s jobs at the head of the queue as one turn of `other`:
-    /// one budget for the whole chain, its heap, its log. This turn then
-    /// resumes with the budget it had left.
-    fn runJobsOf(self: *Engine, other: *Engine) void {
-        const remaining_ms = self.deadline_ms -| platform.monotonicMilliseconds();
-        if (enter_widget) |enter| enter(other);
-        other.enterTurn();
-        other.runOwnHeadJobs();
-        other.leaveTurn();
-        if (enter_widget) |enter| enter(self);
-        self.deadline_ms = platform.monotonicMilliseconds() + remaining_ms;
-        executing_engine = self;
-        heap().current = self.owner;
-    }
-
-    /// Run `work` for `other` (its heap, its log) inside this turn.
-    fn switchTo(self: *Engine, other: *Engine, comptime work: fn (*Engine) void) void {
-        if (enter_widget) |enter| enter(other);
-        heap().current = other.owner;
-        work(other);
-        if (enter_widget) |enter| enter(self);
-        heap().current = self.owner;
     }
 
     /// Charge QuickJS allocations to this engine outside a turn; returns
@@ -554,17 +485,6 @@ pub const Engine = struct {
     }
 
     fn beginTurn(self: *Engine) void {
-        self.enterTurn();
-    }
-
-    /// Every turn ends with the job queue empty; a turn that threw skipped
-    /// its own pump.
-    fn endTurn(self: *Engine) void {
-        self.pumpJobs() catch {};
-        self.leaveTurn();
-    }
-
-    fn enterTurn(self: *Engine) void {
         // QuickJS records its C-stack top when the runtime is created, but
         // platform callbacks can enter from a materially deeper native
         // dispatch path (notably canvas resize during a near-cap rebuild).
@@ -577,7 +497,7 @@ pub const Engine = struct {
         heap().current = self.owner;
     }
 
-    fn leaveTurn(self: *Engine) void {
+    fn endTurn(self: *Engine) void {
         self.executing = false;
         executing_engine = null;
         heap().current = heap().hostOwner();
@@ -887,33 +807,6 @@ test "a widget at its memory cap leaves its neighbour's realm untouched" {
     try neighbour.evaluate("if (kept.length !== 1000 || kept[999] !== 7) throw new Error('neighbour lost its state');", "neighbour-check.js");
 }
 
-test "a throwing job does not leave the widget's later jobs to another widget's turn" {
-    var tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
-    defer tree.deinit();
-    var provider: provider_mod.Client = .{};
-    try provider.init(std.testing.io, null);
-    defer provider.deinit();
-    var store: storage_mod.Store = .{
-        .io = std.testing.io,
-        .allocator = std.testing.allocator,
-        .directory = ".",
-        .path = "weaver-js-engine-test-storage.json",
-        .temporary_path = "weaver-js-engine-test-storage.tmp",
-    };
-    const engine = try createTestEngine(&tree, &store, &provider);
-    defer engine.destroy(std.testing.allocator);
-    engine.bridge_state.emit_error_logs = false;
-
-    try std.testing.expectError(error.ScriptException, engine.evaluate(
-        \\queueMicrotask(() => { throw new Error("first job"); });
-        \\queueMicrotask(() => { globalThis.second = true; });
-    , "jobs.js"));
-    // The runtime's job queue is shared: whatever is left would run in the
-    // next widget's turn.
-    try std.testing.expect(!c.JS_IsJobPending(engine.runtime));
-    try engine.evaluate("if (globalThis.second !== true) throw new Error('second job did not run');", "jobs-check.js");
-}
-
 const TestWidgets = struct {
     provider: provider_mod.Client = .{},
     store: storage_mod.Store = undefined,
@@ -941,15 +834,30 @@ const TestWidgets = struct {
     }
 };
 
-var test_entered: [4]?*Engine = @splat(null);
-var test_entered_count: usize = 0;
+test "a widget's queued jobs run only in its own turns" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const owner = try widgets.engine(0);
+    defer owner.destroy(std.testing.allocator);
+    owner.bridge_state.emit_error_logs = false;
+    const bystander = try widgets.engine(1);
+    defer bystander.destroy(std.testing.allocator);
 
-fn recordEnteredWidget(engine: *Engine) void {
-    if (test_entered_count < test_entered.len) test_entered[test_entered_count] = engine;
-    test_entered_count += 1;
+    // After a job throws, the rest wait for the widget's next turn.
+    try std.testing.expectError(error.ScriptException, owner.evaluate(
+        \\queueMicrotask(() => { throw new Error("first job"); });
+        \\queueMicrotask(() => { globalThis.second = true; });
+    , "jobs.js"));
+    try std.testing.expect(c.JS_IsContextJobPending(owner.context));
+    try bystander.evaluate("globalThis.ran = true;", "bystander.js");
+    try std.testing.expect(c.JS_IsContextJobPending(owner.context));
+    try owner.evaluate("globalThis.next = true;", "next.js");
+    try std.testing.expect(!c.JS_IsContextJobPending(owner.context));
+    try owner.evaluate("if (globalThis.second !== true) throw new Error('second job did not run');", "jobs-check.js");
 }
 
-test "another widget's queued job runs as that widget's turn" {
+test "another widget's collection queues a cleanup that waits for its owner" {
     var widgets: TestWidgets = .{};
     try widgets.init();
     defer widgets.deinit();
@@ -963,43 +871,40 @@ test "another widget's queued job runs as that widget's turn" {
         \\// A cycle: only the collector frees it, not its last reference.
         \\(() => { const target = {}; target.self = target; registry.register(target, "token"); })();
     , "owner.js");
-    // A collection anywhere queues the owner's cleanup callback; the
-    // bystander's turn is the next to pump the shared queue.
     c.JS_RunGC(owner.runtime);
-    try std.testing.expect(c.JS_IsJobPending(owner.runtime));
-    const owner_bytes = owner.heapBytes();
+    try std.testing.expect(c.JS_IsContextJobPending(owner.context));
     const bystander_bytes = bystander.heapBytes();
-    test_entered_count = 0;
-    enter_widget = recordEnteredWidget;
-    defer enter_widget = null;
     try bystander.evaluate("globalThis.ran = true;", "bystander.js");
-
-    try std.testing.expect(!c.JS_IsJobPending(owner.runtime));
-    try std.testing.expect(owner.heapBytes() >= owner_bytes + 1024 * 1024);
+    try std.testing.expect(c.JS_IsContextJobPending(owner.context));
     try std.testing.expect(bystander.heapBytes() < bystander_bytes + 64 * 1024);
-    // The owner's job, then its rejection checkpoint, each entered and left.
-    try std.testing.expectEqual(@as(usize, 4), test_entered_count);
-    try std.testing.expectEqualSlices(?*Engine, &.{ owner, bystander, owner, bystander }, &test_entered);
+    const owner_bytes = owner.heapBytes();
+    try owner.evaluate("globalThis.next = true;", "next.js");
+    try std.testing.expect(owner.heapBytes() >= owner_bytes + 1024 * 1024);
     try owner.evaluate("if (!(globalThis.cleaned instanceof ArrayBuffer)) throw new Error('cleanup did not run');", "owner-check.js");
 }
 
-test "a turn that throws still runs its queued jobs" {
+test "an endless microtask chain stops at its own widget's budget" {
     var widgets: TestWidgets = .{};
     try widgets.init();
     defer widgets.deinit();
-    const survivor = try widgets.engine(1);
-    defer survivor.destroy(std.testing.allocator);
-    const failed = try widgets.engine(0);
-    defer failed.destroy(std.testing.allocator);
-    failed.bridge_state.emit_error_logs = false;
-    try std.testing.expectError(error.ScriptException, failed.evaluate(
-        \\Promise.resolve().then(() => { globalThis.jobRan = true; });
-        \\throw new Error("load failed");
-    , "failed.js"));
-    // The queue is shared: nothing of this widget's may wait for another
-    // widget's turn.
-    try std.testing.expect(!c.JS_IsJobPending(survivor.runtime));
-    try failed.evaluate("if (globalThis.jobRan !== true) throw new Error('job did not run');", "failed-check.js");
+    const spinner = try widgets.engine(0);
+    defer spinner.destroy(std.testing.allocator);
+    spinner.bridge_state.emit_error_logs = false;
+    const bystander = try widgets.engine(1);
+    defer bystander.destroy(std.testing.allocator);
+
+    const started = platform.monotonicMilliseconds();
+    try std.testing.expectError(error.ScriptException, spinner.evaluate(
+        \\function again() { queueMicrotask(again); for (;;) {} }
+        \\queueMicrotask(again);
+    , "spin.js"));
+    try std.testing.expect(platform.monotonicMilliseconds() - started < 4 * turn_budget_ms);
+    // The next job waits in the spinner's own queue, never in a neighbour's
+    // turn.
+    const before_bystander = platform.monotonicMilliseconds();
+    try bystander.evaluate("globalThis.ran = true;", "bystander.js");
+    try std.testing.expect(platform.monotonicMilliseconds() - before_bystander < turn_budget_ms);
+    try std.testing.expect(c.JS_IsContextJobPending(spinner.context));
 }
 
 test "freed small blocks give their capacity back to the widget" {
@@ -1017,70 +922,27 @@ test "freed small blocks give their capacity back to the widget" {
     try engine.evaluate("globalThis.big = new ArrayBuffer(24 * 1024 * 1024);", "big.js");
 }
 
-test "another widget's endless microtask chain stops at that widget's budget" {
-    var widgets: TestWidgets = .{};
-    try widgets.init();
-    defer widgets.deinit();
-    const owner = try widgets.engine(0);
-    defer owner.destroy(std.testing.allocator);
-    owner.bridge_state.emit_error_logs = false;
-    const bystander = try widgets.engine(1);
-    defer bystander.destroy(std.testing.allocator);
-
-    try owner.evaluate(
-        \\globalThis.registry = new FinalizationRegistry(() => {
-        \\  const spin = () => Promise.resolve().then(spin);
-        \\  spin();
-        \\});
-        \\(() => { const target = {}; target.self = target; registry.register(target, "token"); })();
-    , "owner.js");
-    c.JS_RunGC(owner.runtime);
-    const started = platform.monotonicMilliseconds();
-    try bystander.evaluate("globalThis.ran = true;", "bystander.js");
-    // One budget for the whole chain, not one per job.
-    try std.testing.expect(platform.monotonicMilliseconds() - started < 4 * turn_budget_ms);
-    try std.testing.expect(!c.JS_IsJobPending(owner.runtime));
-}
-
-test "another widget's rejection handled a microtask later is not a failure" {
-    var widgets: TestWidgets = .{};
-    try widgets.init();
-    defer widgets.deinit();
-    const owner = try widgets.engine(0);
-    defer owner.destroy(std.testing.allocator);
-    const bystander = try widgets.engine(1);
-    defer bystander.destroy(std.testing.allocator);
-
-    try owner.evaluate(
-        \\globalThis.registry = new FinalizationRegistry(() => {
-        \\  const late = Promise.reject(new Error("handled later"));
-        \\  Promise.resolve().then(() => late.catch(() => { globalThis.caught = true; }));
-        \\});
-        \\(() => { const target = {}; target.self = target; registry.register(target, "token"); })();
-    , "owner.js");
-    c.JS_RunGC(owner.runtime);
-    try bystander.evaluate("globalThis.ran = true;", "bystander.js");
-    try std.testing.expect(!owner.renderFailed());
-    try owner.evaluate("if (globalThis.caught !== true) throw new Error('catch did not run');", "owner-check.js");
-}
-
-test "a destroyed widget's range comes back whole" {
+test "a destroyed widget's range comes back whole, queued jobs and all" {
     var widgets: TestWidgets = .{};
     try widgets.init();
     defer widgets.deinit();
     const survivor = try widgets.engine(1);
     defer survivor.destroy(std.testing.allocator);
     const leaving = try widgets.engine(0);
-    try leaving.evaluate(
-        \\// Held values that are themselves registered targets: each
-        \\// collection frees the next link only after a cleanup job goes.
+    leaving.bridge_state.emit_error_logs = false;
+    // A queued job holds 20 MiB, and registered targets hold each other
+    // through held values.
+    try std.testing.expectError(error.ScriptException, leaving.evaluate(
         \\globalThis.registry = new FinalizationRegistry(() => {});
-        \\const links = [0, 1, 2, 3].map(() => ({ pad: new ArrayBuffer(4 * 1024 * 1024) }));
+        \\const links = [0, 1, 2, 3].map(() => ({ pad: new ArrayBuffer(1024 * 1024) }));
         \\for (let index = 0; index < 3; index += 1) registry.register(links[index], links[index + 1]);
         \\globalThis.first = links[0];
-    , "leaving.js");
+        \\const held = new ArrayBuffer(20 * 1024 * 1024);
+        \\queueMicrotask(() => { throw new Error("stops the pump"); });
+        \\queueMicrotask(() => held.byteLength);
+    , "leaving.js"));
+    try std.testing.expect(c.JS_IsContextJobPending(leaving.context));
     leaving.destroy(std.testing.allocator);
-    try std.testing.expect(!c.JS_IsJobPending(survivor.runtime));
 
     const next = try widgets.engine(0);
     defer next.destroy(std.testing.allocator);

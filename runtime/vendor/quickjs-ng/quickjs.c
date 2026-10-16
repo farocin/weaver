@@ -482,6 +482,9 @@ struct JSContext {
     JSGCObjectHeader header; /* must come first */
     JSRuntime *rt;
     struct list_head link;
+    /* Weaver: this realm's pending jobs (JSJobEntry.link), owned like its
+       other fields: marked by JS_MarkContext, freed with the context. */
+    struct list_head job_list;
 
     uint16_t binary_object_count;
     uint32_t binary_object_size : 31;
@@ -2153,70 +2156,51 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
-    list_add_tail(&e->link, &rt->job_list);
+    /* Weaver: each realm queues its own jobs (see JSContext.job_list). */
+    list_add_tail(&e->link, &ctx->job_list);
     return 0;
 }
 
-bool JS_IsJobPending(JSRuntime *rt)
+/* Weaver: the first context with a pending job, in creation order. */
+static JSContext *js_first_context_with_jobs(JSRuntime *rt)
 {
-    return !list_empty(&rt->job_list);
-}
+    struct list_head *el;
 
-JSContext *JS_GetPendingJobContext(JSRuntime *rt)
-{
-    if (JS_IsJobPending(rt)) {
-        return list_entry(rt->job_list.next, JSJobEntry, link)->ctx;
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx = list_entry(el, JSContext, link);
+        if (!list_empty(&ctx->job_list))
+            return ctx;
     }
     return NULL;
 }
 
-/* Weaver: drop the queued jobs of one context, as JS_FreeRuntime drops
-   every job, and return how many went. Freeing a job's arguments can queue
-   more jobs for the context (finalization callbacks); those go too. Only
-   compares 'ctx', so it may already be freed. */
-int JS_DropPendingJobs(JSRuntime *rt, JSContext *ctx)
+bool JS_IsJobPending(JSRuntime *rt)
 {
-    struct list_head *el;
-    JSJobEntry *e;
-    int i, dropped = 0;
-
-    for(;;) {
-        e = NULL;
-        list_for_each(el, &rt->job_list) {
-            JSJobEntry *candidate = list_entry(el, JSJobEntry, link);
-            if (candidate->ctx == ctx) {
-                e = candidate;
-                break;
-            }
-        }
-        if (!e)
-            return dropped;
-        list_del(&e->link);
-        for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        js_free_rt(rt, e);
-        dropped++;
-    }
+    return js_first_context_with_jobs(rt) != NULL;
 }
 
-/* return < 0 if exception, 0 if no job pending, 1 if a job was
-   executed successfully. the context of the job is stored in '*pctx' */
-int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+JSContext *JS_GetPendingJobContext(JSRuntime *rt)
 {
-    JSContext *ctx;
+    return js_first_context_with_jobs(rt);
+}
+
+bool JS_IsContextJobPending(JSContext *ctx)
+{
+    return !list_empty(&ctx->job_list);
+}
+
+/* Weaver: run the first pending job of 'ctx'. Return < 0 if exception, 0 if
+   no job is pending, 1 if a job was executed successfully. */
+int JS_ExecuteContextJob(JSContext *ctx)
+{
     JSJobEntry *e;
     JSValue res;
     int i, ret;
 
-    if (list_empty(&rt->job_list)) {
-        *pctx = NULL;
+    if (list_empty(&ctx->job_list))
         return 0;
-    }
-
-    /* get the first pending job and execute it */
-    e = list_entry(rt->job_list.next, JSJobEntry, link);
+    e = list_entry(ctx->job_list.next, JSJobEntry, link);
     list_del(&e->link);
-    ctx = e->ctx;
     res = e->job_func(e->ctx, e->argc, vc(e->argv));
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
@@ -2226,8 +2210,35 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         ret = 1;
     JS_FreeValue(ctx, res);
     js_free(ctx, e);
-    *pctx = ctx;
     return ret;
+}
+
+/* return < 0 if exception, 0 if no job pending, 1 if a job was
+   executed successfully. the context of the job is stored in '*pctx' */
+int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+{
+    JSContext *ctx = js_first_context_with_jobs(rt);
+
+    *pctx = ctx;
+    if (!ctx)
+        return 0;
+    return JS_ExecuteContextJob(ctx);
+}
+
+/* Weaver: free a context's pending jobs. Freeing their arguments can queue
+   more (finalization callbacks); those go too. */
+static void js_free_jobs(JSContext *ctx)
+{
+    JSJobEntry *e;
+    int i;
+
+    while (!list_empty(&ctx->job_list)) {
+        e = list_entry(ctx->job_list.next, JSJobEntry, link);
+        list_del(&e->link);
+        for(i = 0; i < e->argc; i++)
+            JS_FreeValue(ctx, e->argv[i]);
+        js_free(ctx, e);
+    }
 }
 
 static inline uint32_t atom_get_free(const JSAtomStruct *p)
@@ -2538,6 +2549,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
         return NULL;
     }
     ctx->rt = rt;
+    init_list_head(&ctx->job_list);
     list_add_tail(&ctx->link, &rt->context_list);
     for(i = 0; i < rt->class_count; i++)
         ctx->class_proto[i] = JS_NULL;
@@ -2663,6 +2675,12 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->global_obj, mark_func);
     JS_MarkValue(rt, ctx->global_var_obj, mark_func);
 
+    list_for_each(el, &ctx->job_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        for(i = 0; i < e->argc; i++)
+            JS_MarkValue(rt, e->argv[i], mark_func);
+    }
+
     JS_MarkValue(rt, ctx->throw_type_error, mark_func);
     JS_MarkValue(rt, ctx->eval_obj, mark_func);
 
@@ -2740,6 +2758,7 @@ void JS_FreeContext(JSContext *ctx)
     }
 #endif
 
+    js_free_jobs(ctx);
     js_free_modules(ctx, JS_FREE_MODULE_ALL);
 
     JS_FreeValue(ctx, ctx->global_obj);
