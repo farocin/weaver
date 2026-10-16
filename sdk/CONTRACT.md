@@ -40,9 +40,10 @@ export default widget({
 });
 ```
 
-The runtime keeps no source text for widget functions: `String(fn)` and
-`fn.toString()` read like a built-in function's, with `[native code]` for a
-body. Error stacks keep their `bundle.js:line:column` positions.
+The runtime keeps no source text for the bundle's functions: `String(fn)`
+and `fn.toString()` read like a built-in function's, with `[native code]`
+for a body. Functions made at run time by `eval` or `new Function` keep
+theirs. Error stacks keep their `bundle.js:line:column` positions.
 
 ## `widget(config, component)`
 
