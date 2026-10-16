@@ -972,9 +972,10 @@ test "freed small blocks give their capacity back to the widget" {
     defer widgets.deinit();
     const engine = try widgets.engine(0);
     defer engine.destroy(std.testing.allocator);
-    // 100,000 short strings, in turns that each fit the turn budget.
+    // 100,000 short strings, in turns far inside the turn budget even in a
+    // Debug build on a slow runner.
     try engine.evaluate("globalThis.strings = [];", "churn.js");
-    for (0..10) |_| try engine.evaluate("for (let index = 0; index < 10000; index += 1) strings.push('x'.repeat(100) + index);", "churn.js");
+    for (0..100) |_| try engine.evaluate("for (let index = 0; index < 1000; index += 1) strings.push('x'.repeat(100) + strings.length);", "churn.js");
     try engine.evaluate("globalThis.strings = null;", "churn.js");
     c.JS_RunGC(engine.runtime);
     try engine.evaluate("globalThis.big = new ArrayBuffer(24 * 1024 * 1024);", "big.js");
