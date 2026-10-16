@@ -92,8 +92,8 @@ pub const Model = struct {
     /// Where `publishBackendStatus` tells the daemon this widget's renderer.
     backend_status_path: ?[]const u8 = null,
     /// This widget's declared fonts, in `fonts` order, under the ids their
-    /// contents were registered with (`contentFontId`).
-    font_registrations: []const HostApp.FontRegistration = &.{},
+    /// contents were registered with (`assignFontIds`).
+    font_registrations: []HostApp.FontRegistration = &.{},
     /// This widget's log; a Model that never loaded a widget (tests) logs
     /// nowhere.
     log: *widget_log.Sink = &unopened_log,
@@ -1429,6 +1429,13 @@ fn contentFontId(ttf: []const u8) !native_sdk.canvas.FontId {
     return id;
 }
 
+/// Give a loaded widget's faces their content ids. Only a widget that
+/// loaded takes entries in the table: one that fails never registers its
+/// faces, and must not use up ids the host can never give back.
+fn assignFontIds(model: *Model) !void {
+    for (model.font_registrations) |*registration| registration.id = try contentFontId(registration.ttf);
+}
+
 /// Register a widget's faces the runtime does not have yet: an anchored
 /// host loads widgets after its app installed its fonts.
 fn registerWidgetFonts(runtime: *native_sdk.Runtime, model: *const Model) !void {
@@ -1442,9 +1449,9 @@ fn registerWidgetFonts(runtime: *native_sdk.Runtime, model: *const Model) !void 
     }
 }
 
-/// A widget's declared faces, read from its directory, under the ids of
-/// their contents.
-fn fontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, fonts: []const manifest_mod.Font) ![]const HostApp.FontRegistration {
+/// A widget's declared faces, read from its directory and checked; their
+/// ids come once it has loaded (`assignFontIds`).
+fn fontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, fonts: []const manifest_mod.Font) ![]HostApp.FontRegistration {
     const registrations = try allocator.alloc(HostApp.FontRegistration, fonts.len);
     for (fonts, 0..) |font, index| {
         for (fonts[0..index]) |earlier| {
@@ -1461,7 +1468,7 @@ fn fontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []cons
             std.log.err("font \"{s}\" ({s}) failed to parse: {s}", .{ font.name, font.file, native_sdk.canvas.font_ttf.parseFailureReason(bytes) orelse "not a parseable TrueType face" });
             return error.FontParseFailed;
         };
-        registrations[index] = .{ .id = try contentFontId(bytes), .name = font.name, .ttf = bytes };
+        registrations[index] = .{ .id = 0, .name = font.name, .ttf = bytes };
     }
     return registrations;
 }
@@ -1850,6 +1857,7 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     // (`contentFontId`).
     var fonts: std.ArrayList(HostApp.FontRegistration) = .empty;
     for (widgets.items) |model| {
+        try assignFontIds(model);
         for (model.font_registrations) |registration| {
             const known = for (fonts.items) |font| {
                 if (font.id == registration.id) break true;
@@ -2270,6 +2278,7 @@ fn addWidget(host: *Host, effects: *Effects, add: host_control.Add) anyerror!voi
         unloadWidget(model);
         freeModel(model);
     }
+    try assignFontIds(model);
     try registerWidgetFonts(diagnostic_runtime.?, model);
     host.widgets[add.id] = model;
     initEffects(enter(model), .{ .fx = effects, .slot = add.id });
@@ -3333,7 +3342,7 @@ test "showcase headline keeps exact registered face through bold and text shadow
     }};
     model.fonts = &fonts;
     // Registered under the id of its contents, not its manifest id.
-    const registrations = [_]HostApp.FontRegistration{.{ .id = 70, .name = "GeistPixel-Square.ttf", .ttf = "" }};
+    var registrations = [_]HostApp.FontRegistration{.{ .id = 70, .name = "GeistPixel-Square.ttf", .ttf = "" }};
     model.font_registrations = &registrations;
 
     var ui = WidgetUi.init(arena_state.allocator());
