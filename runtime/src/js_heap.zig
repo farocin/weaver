@@ -423,9 +423,14 @@ pub const Heap = struct {
         const usable = self.usableSize(old);
         if (size <= usable) return old;
         const owner = self.ownerOf(old);
+        // A block another widget grows is one they share (an atom or a
+        // shape): it moves to the widget growing it, which pays for the
+        // growth, instead of growing in a range whose owner may since have
+        // gone and been replaced.
+        const target = if (self.current != owner and self.current != self.hostOwner()) self.current else owner;
         const range = &self.ranges[owner];
         const granule = self.granuleOf(owner, old);
-        if (size > small_max and self.granules(owner)[granule].kind == run_start) {
+        if (target == owner and size > small_max and self.granules(owner)[granule].kind == run_start) {
             const count = runCount(old);
             const wanted = runGranules(size);
             if (granule + count == range.bump and granule + wanted <= self.layout.granulesPerRange() and
@@ -437,7 +442,7 @@ pub const Heap = struct {
                 return old;
             }
         }
-        const moved = self.allocFor(owner, size) orelse return null;
+        const moved = self.allocFor(target, size) orelse return null;
         @memcpy(@as([*]u8, @ptrCast(moved))[0..usable], @as([*]const u8, @ptrCast(old))[0..usable]);
         self.free(old);
         return moved;

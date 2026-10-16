@@ -289,6 +289,8 @@ struct JSRuntime {
     JSChargeJobFunc *charge_job;
     /* Weaver: charges runtime-wide tables to no context (JS_SetChargeSharedFunc). */
     JSChargeSharedFunc *charge_shared;
+    /* Weaver: a per-context collection trigger (JS_SetGCTriggerFunc). */
+    JSGCTriggerFunc *gc_trigger;
     /* list of JSGCObjectHeader.link. List of allocated GC objects (used
        by the garbage collector) */
     struct list_head gc_obj_list;
@@ -1594,7 +1596,8 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
     force_gc = true;
 #else
     force_gc = ((rt->malloc_state.malloc_size + size) >
-                rt->malloc_gc_threshold);
+                rt->malloc_gc_threshold) ||
+               (rt->gc_trigger && rt->gc_trigger(rt, size));
 #endif
     if (force_gc) {
 #ifdef ENABLE_DUMPS // JS_DUMP_GC
@@ -2186,6 +2189,11 @@ void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func)
 void JS_SetChargeSharedFunc(JSRuntime *rt, JSChargeSharedFunc *func)
 {
     rt->charge_shared = func;
+}
+
+void JS_SetGCTriggerFunc(JSRuntime *rt, JSGCTriggerFunc *func)
+{
+    rt->gc_trigger = func;
 }
 
 /* Weaver: allocate a runtime-wide table outside the running context's

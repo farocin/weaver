@@ -1219,6 +1219,11 @@ JS_EXTERN void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func);
    to switch back. */
 typedef void *JSChargeSharedFunc(JSRuntime *rt, void *restore);
 JS_EXTERN void JS_SetChargeSharedFunc(JSRuntime *rt, JSChargeSharedFunc *func);
+/* Asked at each point QuickJS may collect, besides its own runtime-wide
+   threshold: true collects now. An embedder that caps memory per context
+   collects when one context nears its own threshold. */
+typedef bool JSGCTriggerFunc(JSRuntime *rt, size_t size);
+JS_EXTERN void JS_SetGCTriggerFunc(JSRuntime *rt, JSGCTriggerFunc *func);
 /* Drop the runtime's pending exception without a context. */
 JS_EXTERN void JS_DropRuntimeException(JSRuntime *rt);
 /* A DOMException's name and message, without calling its getters; false

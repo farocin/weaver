@@ -28,6 +28,10 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   the table is charged to the host's heap, not to the widget whose turn grew
   it; otherwise it stayed in that widget's range after the widget was gone,
   and the next widget given the range had less room.
+- `JS_SetGCTriggerFunc(rt, func)` (`quickjs.h`): `js_trigger_gc` also
+  collects when `func` says so. The runtime-wide threshold follows the total
+  of every widget's memory, so one widget could reach its own cap with its
+  garbage uncollected while others held a lot.
 - `JS_NewContextRaw` unlinks a context from the GC list before freeing it
   when its class table cannot be allocated (upstream left a dangling entry
   that crashed the next collection).

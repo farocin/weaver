@@ -59,6 +59,13 @@ const Shared = struct {
     runtime: *c.JSRuntime,
     heap: js_heap.Heap,
     engines: usize = 0,
+    /// Per widget range, the used bytes that start a collection; zero until
+    /// first set. QuickJS's own threshold follows every widget's total, so
+    /// one widget could reach its cap with garbage left uncollected.
+    gc_thresholds: [max_engines + 1]usize = @splat(0),
+    /// Ranges whose threshold is due a reset: every range after a
+    /// collection, since it frees garbage in all of them.
+    gc_settle: std.StaticBitSet(max_engines + 1) = .initFull(),
 };
 
 var shared: ?Shared = null;
@@ -142,6 +149,7 @@ fn acquireShared() !*Shared {
         c.JS_SetHostPromiseRejectionTracker(runtime, promiseRejectionTracker, null);
         c.JS_SetChargeJobFunc(runtime, chargeJob);
         c.JS_SetChargeSharedFunc(runtime, chargeShared);
+        c.JS_SetGCTriggerFunc(runtime, gcTrigger);
     }
     return &shared.?;
 }
@@ -175,6 +183,27 @@ fn chargeShared(_: ?*c.JSRuntime, restore: ?*anyopaque) callconv(.c) ?*anyopaque
     if (previous == heap().hostOwner()) return null;
     heap().current = heap().hostOwner();
     return @ptrFromInt(@as(usize, previous) + 1);
+}
+
+/// QuickJS's starting runtime-wide collection threshold (`JS_NewRuntime2`),
+/// used as the floor of a widget's own.
+const gc_threshold_floor: usize = 256 * 1024;
+
+/// `JS_SetGCTriggerFunc`: collect when the running widget's range has grown
+/// half again past what it held after the last collection, the rule QuickJS
+/// applies to the runtime as a whole.
+fn gcTrigger(_: ?*c.JSRuntime, size: usize) callconv(.c) bool {
+    const state = &shared.?;
+    const owner = state.heap.current;
+    if (owner == state.heap.hostOwner()) return false;
+    const used = state.heap.usedBytes(owner);
+    if (state.gc_settle.isSet(owner)) {
+        state.gc_thresholds[owner] = @max(used + used / 2, gc_threshold_floor);
+        state.gc_settle.unset(owner);
+    }
+    if (used + size <= state.gc_thresholds[owner]) return false;
+    state.gc_settle = .initFull();
+    return true;
 }
 
 fn releaseShared(owner: js_heap.Owner) void {
@@ -216,6 +245,7 @@ pub const Engine = struct {
         errdefer allocator.destroy(self);
         const state = acquireShared() catch return error.OutOfMemory;
         const owner = state.heap.acquireOwner() orelse return error.OutOfMemory;
+        state.gc_settle.set(owner);
         state.engines += 1;
         errdefer releaseShared(owner);
         const previous_owner = state.heap.current;
@@ -1275,6 +1305,51 @@ test "a realm whose class table cannot be allocated leaves the collector intact"
     if (created) |engine| engine.destroy(std.testing.allocator) else |err| try std.testing.expectEqual(error.OutOfMemory, err);
     c.JS_RunGC(survivor.runtime);
     try survivor.evaluate("globalThis.ok = true;", "after.js");
+}
+
+test "a shape a widget grows after its maker is gone moves to that widget" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const keeper = try widgets.engine(1);
+    defer keeper.destroy(std.testing.allocator);
+    const maker = try widgets.engine(0);
+    const maker_owner = maker.owner;
+    // The same property sequence on a null prototype is one runtime shape,
+    // made in the first widget's range.
+    const make = "globalThis.o = Object.create(null); o.a = 1; o.b = 2; o.c = 3;";
+    try maker.evaluate(make, "maker.js");
+    try keeper.evaluate(make, "keeper.js");
+    maker.destroy(std.testing.allocator);
+    const retired = heap().usedBytes(maker_owner);
+    try std.testing.expect(retired > 0);
+    // One more property grows the shape in place (its hash size holds):
+    // that must not grow the retired range.
+    try keeper.evaluate("o.d = 4;", "grow.js");
+    try std.testing.expect(heap().usedBytes(maker_owner) < retired);
+}
+
+test "a widget's garbage is collected before it reaches its own cap" {
+    // Four trees are too big for the test stack.
+    const trees = try std.testing.allocator.alloc(tree_mod.Tree, 4);
+    defer std.testing.allocator.free(trees);
+    for (trees) |*tree| tree.* = .{ .allocator = std.testing.allocator };
+    defer for (trees) |*tree| tree.deinit();
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    // Three neighbours each hold 24 MiB, so the runtime-wide threshold
+    // sits far above any one widget's cap.
+    var neighbours: [3]*Engine = undefined;
+    for (&neighbours, 0..) |*neighbour, index| {
+        neighbour.* = try createTestEngine(&trees[index], &widgets.store, &widgets.provider);
+        try neighbour.*.evaluate("globalThis.held = new ArrayBuffer(24 * 1024 * 1024);", "held.js");
+    }
+    defer for (neighbours) |neighbour| neighbour.destroy(std.testing.allocator);
+    const churner = try createTestEngine(&trees[3], &widgets.store, &widgets.provider);
+    defer churner.destroy(std.testing.allocator);
+    // Each round leaves a 4 MiB cycle that only a collection frees.
+    for (0..12) |_| try churner.evaluate("{ const node = { pad: new ArrayBuffer(4 * 1024 * 1024) }; node.self = node; }", "churn.js");
 }
 
 test "a destroyed widget's range comes back whole, queued jobs and all" {
