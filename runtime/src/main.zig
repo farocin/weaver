@@ -1782,6 +1782,9 @@ const WidgetChannels = struct {
 /// QuickJS recursion guard.
 const loader_stack_bytes: usize = 16 * 1024 * 1024;
 
+/// Stack for the control-pipe reader (`serveControl`).
+const control_stack_bytes: usize = 256 * 1024;
+
 /// Run every widget in `directories` in this one process: one Native app,
 /// one window per widget. Slot 0 is the scene's main window. A single
 /// directory is the ordinary one-widget runtime.
@@ -2876,7 +2879,11 @@ fn startRendererDiagnostics(context: *anyopaque, runtime: *native_sdk.Runtime) !
     if (wake_pending) try runtime.options.platform.services.requestFrame();
     // Commands wake the runtime, so they are read only once it can be woken.
     if (control_pipe) |pipe| {
-        const thread = try std.Thread.spawn(.{}, serveControl, .{pipe});
+        // Zig's default spawn commits 16 MiB of stack on Windows. This
+        // thread blocks on a pipe and parses one small JSON line at a time:
+        // the provider reader's shape (provider_windows.zig's receipt sizes
+        // that at 256 KiB, 9x its live locals) with smaller locals.
+        const thread = try std.Thread.spawn(.{ .stack_size = control_stack_bytes }, serveControl, .{pipe});
         thread.detach();
     }
 }
