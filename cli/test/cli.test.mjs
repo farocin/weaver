@@ -354,7 +354,9 @@ ${body}
     const bundle = readFileSync(join(widget, "dist", "bundle.js"), "utf8");
     // A trimmed bundle ships what it left out beside it, for anything the
     // analysis missed (the capture smoke runs those cases).
-    assert.equal(existsSync(join(widget, "dist", "sdk-fallback.js")), !bundle.includes(classCompiler) || !bundle.includes(palette));
+    const fallback = readdirSync(join(widget, "dist")).find((name) => /^sdk-fallback-[0-9a-f]{16}\.js$/.test(name));
+    assert.equal(fallback !== undefined, !bundle.includes(classCompiler) || !bundle.includes(palette));
+    if (fallback) assert.ok(bundle.includes(fallback), "the bundle names the fallback it was built with");
     return bundle;
   };
   const classCompiler = "arrives in M2+";

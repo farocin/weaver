@@ -26,10 +26,10 @@ pub const State = struct {
     fetches: [max_fetches]FetchSlot = [_]FetchSlot{.{}} ** max_fetches,
     render_failed: bool = false,
     emit_error_logs: bool = true,
-    /// `sdk-fallback.js` beside the widget's bundle: the SDK runtime that
-    /// `weaver bundle` left out because the source showed no use for it.
-    /// Null when the bundle carries the whole SDK.
-    sdk_fallback_path: ?[]const u8 = null,
+    /// The directory of the widget's bundle, where `weaver bundle` writes
+    /// `sdk-fallback-<hash>.js`: the SDK runtime it left out because the
+    /// source showed no use for it.
+    bundle_directory: ?[]const u8 = null,
 };
 
 // SDK fallback receipt (2026-10-15): the class compiler and gradient
@@ -128,7 +128,7 @@ pub fn install(ctx: *c.JSContext, bridge_state: *State) !void {
     try setFunction(ctx, native, "storageRead", storageRead, 0);
     try setFunction(ctx, native, "storageWrite", storageWrite, 1);
     try setFunction(ctx, native, "log", log, 1);
-    try setFunction(ctx, native, "loadSdkFallback", loadSdkFallback, 0);
+    try setFunction(ctx, native, "loadSdkFallback", loadSdkFallback, 1);
     // The bridge object is the widget sandbox boundary. In particular, the
     // runtime-owned captureMode bit must not be replaceable by widget prelude
     // code before the SDK evaluates.
@@ -1083,18 +1083,37 @@ fn log(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueCo
     return qjs.undefinedValue();
 }
 
-/// Evaluate the widget's `sdk-fallback.js` and return its exports: the SDK
-/// calls this once, the first time it needs a part `weaver bundle` left out.
-fn loadSdkFallback(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, _: [*c]c.JSValueConst) callconv(.c) c.JSValue {
+/// Evaluate the named `sdk-fallback-<hash>.js` beside the widget's bundle
+/// and return its exports: the SDK calls this once, the first time it needs
+/// a part `weaver bundle` left out. The bundle names the file it was built
+/// with, so an engine running an earlier bundle loads the matching one.
+fn loadSdkFallback(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {
     const js = ctx orelse return qjs.exceptionValue();
-    if (argc != 0) return fail(js, "loadSdkFallback expects no arguments");
+    if (argc != 1) return fail(js, "loadSdkFallback expects the fallback's file name");
+    const name = stringArg(js, argv[0]) catch return fail(js, "loadSdkFallback expects the fallback's file name");
+    defer c.JS_FreeCString(js, name.raw);
+    if (!isSdkFallbackName(name.bytes)) return failFmt(js, "loadSdkFallback: \"{s}\" is not an sdk-fallback-<hash>.js name", .{name.bytes});
     const bridge_state = state(js);
-    const path = bridge_state.sdk_fallback_path orelse return fail(js, "this widget's bundle carries the whole SDK; there is no sdk-fallback.js to load");
+    const directory = bridge_state.bundle_directory orelse return fail(js, "loadSdkFallback: this widget has no bundle directory");
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}{c}{s}", .{ directory, std.fs.path.sep, name.bytes }) catch return fail(js, "loadSdkFallback: the bundle directory's path is too long");
     const source = std.Io.Dir.cwd().readFileAllocOptions(bridge_state.storage.io, path, std.heap.page_allocator, .limited(max_sdk_fallback_bytes), .of(u8), 0) catch |err|
         return failFmt(js, "cannot read {s}: {s}; rebuild the widget with weaver bundle", .{ path, @errorName(err) });
     defer std.heap.page_allocator.free(source);
     std.log.info("widget loaded the SDK fallback: weaver bundle could not show its class or background use was complete", .{});
     return c.JS_Eval(js, source.ptr, source.len, "sdk-fallback.js", c.JS_EVAL_TYPE_GLOBAL);
+}
+
+/// `sdk-fallback-` and 16 lowercase hex digits: a name, never a path.
+fn isSdkFallbackName(name: []const u8) bool {
+    const prefix = "sdk-fallback-";
+    const suffix = ".js";
+    if (name.len != prefix.len + 16 + suffix.len) return false;
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return false;
+    for (name[prefix.len .. prefix.len + 16]) |digit| {
+        if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return false;
+    }
+    return true;
 }
 
 fn consoleLog(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {

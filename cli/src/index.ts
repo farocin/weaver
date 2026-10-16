@@ -305,9 +305,11 @@ async function bundleWidget(directory: string): Promise<BundleResult> {
   if (project.usesIcons) {
     copyFileSync(iconLicenseSource, join(outputDirectory, iconLicenseFile));
   }
+  // Written before the bundle that names it, and never deleted: a widget
+  // still running an earlier bundle (a dev hot swap the runtime rejected
+  // keeps it) loads the fallback that bundle was built with.
+  if (sdkFallback) writeAtomic(join(outputDirectory, sdkFallback.name), sdkFallback.contents);
   writeAtomic(join(outputDirectory, "bundle.js"), bundle);
-  if (sdkFallback) writeAtomic(join(outputDirectory, sdkFallbackFile), sdkFallback);
-  else rmSync(join(outputDirectory, sdkFallbackFile), { force: true });
   const manifest: RuntimeManifest = {
     name: project.config.name,
     size: project.config.size,
@@ -777,11 +779,16 @@ function nowMicroseconds(): number {
   return Number(process.hrtime.bigint() / 1000n);
 }
 
-/** Beside bundle.js: the SDK runtime the bundle left out (sdkTrimPlugin). */
-const sdkFallbackFile = "sdk-fallback.js";
+interface SdkFallback {
+  /** sdk-fallback-<hash>.js beside bundle.js, named by its contents. */
+  name: string;
+  contents: Uint8Array;
+}
 
-async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<{ bundle: Uint8Array; sdkFallback: Uint8Array | null }> {
+async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<{ bundle: Uint8Array; sdkFallback: SdkFallback | null }> {
   const use = sdkUse(project);
+  const trimmed = use.classes !== null || !use.backgroundProps;
+  const sdkFallback = trimmed ? await compileSdkFallback() : null;
   const built = await build({
     entryPoints: [project.sourcePath],
     outfile,
@@ -794,15 +801,14 @@ async function compileWidgetBundle(project: SourceProject, outfile: string): Pro
     legalComments: "none",
     minify: true,
     plugins: [
-      sdkTrimPlugin(use),
+      ...(sdkFallback ? [sdkTrimPlugin(use, sdkFallback.name)] : []),
       iconLoweringPlugin(project.directory, () => { project.usesIcons = true; }),
       weaverResolutionPlugin(project.directory),
     ],
     logLevel: "silent",
     write: false,
   });
-  const trimmed = use.classes !== null || !use.backgroundProps;
-  return { bundle: built.outputFiles[0].contents, sdkFallback: trimmed ? await compileSdkFallback() : null };
+  return { bundle: built.outputFiles[0].contents, sdkFallback };
 }
 
 /**
@@ -811,7 +817,7 @@ async function compileWidgetBundle(project: SourceProject, outfile: string): Pro
  * gradient serializer, as one script whose value is their exports. The
  * runtime evaluates it only when the bundle first needs it.
  */
-async function compileSdkFallback(): Promise<Uint8Array> {
+async function compileSdkFallback(): Promise<SdkFallback> {
   const built = await build({
     stdin: {
       contents: `export { compileClass, classUsesGradientBackground } from "./class-compiler.js";
@@ -831,7 +837,8 @@ export { serializeBackground } from "./gradients.js";
     logLevel: "silent",
     write: false,
   });
-  return built.outputFiles[0].contents;
+  const contents = built.outputFiles[0].contents;
+  return { name: `sdk-fallback-${createHash("sha256").update(contents).digest("hex").slice(0, 16)}.js`, contents };
 }
 
 async function packWidget(directory: string): Promise<void> {
@@ -1461,10 +1468,10 @@ function weaverResolutionPlugin(sourceRoot: string): import("esbuild").Plugin {
  * A class or background the lookup cannot serve loads sdk-fallback.js once,
  * so a widget the analysis misread still renders, at the old memory cost.
  */
-function sdkTrimPlugin(use: SdkUse): import("esbuild").Plugin {
+function sdkTrimPlugin(use: SdkUse, fallbackName: string): import("esbuild").Plugin {
   const modules = new Map<string, string>([["fallback", `let fallback;
 export function sdkFallback() {
-  if (fallback === undefined) fallback = native.loadSdkFallback();
+  if (fallback === undefined) fallback = native.loadSdkFallback(${JSON.stringify(fallbackName)});
   return fallback;
 }
 `]]);

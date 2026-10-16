@@ -41,8 +41,9 @@ pub const Model = struct {
     storage: ?*storage_mod.Store = null,
     origins: []const []const u8 = &.{},
     bundle_path: []const u8 = &.{},
-    /// The SDK runtime `weaver bundle` left out, beside the bundle (bridge.zig).
-    sdk_fallback_path: ?[]const u8 = null,
+    /// Where the bundle is, and the SDK runtime `weaver bundle` left out
+    /// beside it (bridge.zig).
+    bundle_directory: ?[]const u8 = null,
     dev_seen_mtime: i128 = 0,
     timer_fires: u64 = 0,
     armed_timers: [bridgeTimerCapacity()]ArmedTimer = [_]ArmedTimer{.{}} ** bridgeTimerCapacity(),
@@ -444,7 +445,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
         false,
     );
     errdefer candidate.destroy(std.heap.page_allocator);
-    candidate.bridge_state.sdk_fallback_path = model.sdk_fallback_path;
+    candidate.bridge_state.bundle_directory = model.bundle_directory;
     if (seed) |value| try candidate.setHotSwapSeed(value);
     try candidate.evaluate(source, "bundle.js");
     if (candidate.renderFailed()) return error.CandidateFirstRenderFailed;
@@ -1448,7 +1449,6 @@ pub fn main(init: std.process.Init) !void {
     var storage = try storage_mod.Store.init(init.io, allocator, data_root, loaded.manifest.name);
     const bundle_path = try std.fs.path.join(allocator, &.{ directory, "bundle.js" });
     const bundle_stat = try std.Io.Dir.cwd().statFile(init.io, bundle_path, .{});
-    const sdk_fallback_path = try std.fs.path.join(allocator, &.{ directory, "sdk-fallback.js" });
     var geometry_store = try geometry_mod.Store.init(init.io, allocator, data_root, loaded.manifest.name);
     // A dragged position outranks the manifest anchor, but only while it
     // still lands on an attached display; a stale record (monitor
@@ -1574,7 +1574,7 @@ pub fn main(init: std.process.Init) !void {
         app_state.model.media_transport_enabled,
         capture_state_root != null,
     );
-    engine.bridge_state.sdk_fallback_path = sdk_fallback_path;
+    engine.bridge_state.bundle_directory = directory;
     if (capture_state_root != null) {
         if (init.environ_map.get("WEAVER_CAPTURE_CLOCK_EPOCH_MS")) |value| {
             const epoch_ms = std.fmt.parseInt(u64, value, 10) catch return error.CaptureClockInvalid;
@@ -1587,7 +1587,7 @@ pub fn main(init: std.process.Init) !void {
     app_state.model.storage = &storage;
     app_state.model.origins = loaded.manifest.origins;
     app_state.model.bundle_path = bundle_path;
-    app_state.model.sdk_fallback_path = sdk_fallback_path;
+    app_state.model.bundle_directory = directory;
     app_state.model.dev_seen_mtime = bundle_stat.mtime.nanoseconds;
     for (loaded.manifest.subscribe) |provider| {
         if (std.mem.eql(u8, provider, "audio")) app_state.model.provider_poll_interval_ms = 33;
