@@ -266,6 +266,9 @@ const Host = struct {
     /// No default: only the slot count is written at startup (initDefaults).
     slots: supervisor.Slots(@FieldType(Slot, "platform")),
     next_sweep_ms: u64 = 0,
+    /// The sidecar fingerprint of the last status.json written, from the
+    /// same reads that wrote it.
+    published_sidecars: u64 = 0,
     sampler: providers.Sampler = .{},
     audio_provider: audio.Provider = .{},
     media_provider: media.Provider = .{},
@@ -884,14 +887,24 @@ const Host = struct {
     fn sidecarFingerprint(self: *Host, now_ms: u64) u64 {
         var hash = std.hash.Wyhash.init(0);
         for (self.slots.all()) |*slot| {
-            if (!slot.used or (slot.platform.process == null and !slot.platform.hosted) or slot.platform.backend_path_len == 0) continue;
+            if (!hasSidecar(slot)) continue;
             const backend = small_fs.readAlloc(self.allocator, slot.platform.backendPath(), 16) catch null;
             defer if (backend) |bytes| self.allocator.free(bytes);
-            hash.update(backend orelse "-");
-            const silent = backend == null and now_ms -| slot.started_ms >= 10_000;
-            hash.update(std.mem.asBytes(&silent));
+            hashSidecar(&hash, slot, backend, now_ms);
         }
         return hash.final();
+    }
+
+    fn hasSidecar(slot: *const Slot) bool {
+        return slot.used and (slot.platform.process != null or slot.platform.hosted) and slot.platform.backend_path_len > 0;
+    }
+
+    /// One widget's part of the sidecar fingerprint: what status.json shows
+    /// from its backend sidecar, as read once by the caller.
+    fn hashSidecar(hash: *std.hash.Wyhash, slot: *const Slot, backend: ?[]const u8, now_ms: u64) void {
+        hash.update(backend orelse "-");
+        const silent = backend == null and now_ms -| slot.started_ms >= 10_000;
+        hash.update(std.mem.asBytes(&silent));
     }
 
     fn sampleCosts(self: *Host, now_ms: u64) void {
@@ -1144,13 +1157,15 @@ const Host = struct {
             };
             entry_count += 1;
         }
+        var sidecars = std.hash.Wyhash.init(0);
         for (self.slots.all(), 0..) |*slot, slot_index| {
             if (!slot.used) continue;
             const average = slot.platform.averages();
             var backend: []const u8 = "-";
-            if ((slot.platform.process != null or slot.platform.hosted) and slot.platform.backend_path_len > 0) {
+            if (hasSidecar(slot)) {
                 backend_allocations[slot_index] = small_fs.readAlloc(self.allocator, slot.platform.backendPath(), 16) catch null;
                 if (backend_allocations[slot_index]) |value| backend = value;
+                hashSidecar(&sidecars, slot, backend_allocations[slot_index], now_ms);
             }
             const slot_reason = slot.reason();
             const reason = if (slot_reason.len > 0)
@@ -1199,6 +1214,7 @@ const Host = struct {
             return false;
         };
         self.noteStatusWriteRecovery();
+        self.published_sidecars = sidecars.final();
         return true;
     }
 
@@ -1358,8 +1374,9 @@ fn run(init: std.process.Init) !void {
         work_event = null;
     }
     var next_provider_ms: u64 = 0;
-    var published_state: u64 = 0;
-    var published_sidecars: u64 = 0;
+    // Null until the first status.json is written: the first pass publishes
+    // whatever the registry holds, even nothing, without waiting.
+    var published_state: ?u64 = null;
     while (true) {
         // Sleep until something happens: a signal, queued pipe work, a
         // child process exiting, or a deadline the loop owns. Live audio
@@ -1379,6 +1396,8 @@ fn run(init: std.process.Init) !void {
             10
         else if (host.hasMediaSubscribers())
             250
+        else if (published_state == null)
+            0
         else if (host.nextDeadlineMs(next_provider_ms)) |deadline_ms|
             @intCast(@min(deadline_ms -| now_before, 60_000))
         else
@@ -1408,7 +1427,7 @@ fn run(init: std.process.Init) !void {
         var sidecars_changed = false;
         if (now >= host.next_sweep_ms) {
             host.noteHostedLoadFailures();
-            sidecars_changed = host.sidecarFingerprint(now) != published_sidecars;
+            sidecars_changed = host.sidecarFingerprint(now) != host.published_sidecars;
             host.next_sweep_ms = now + sweep_interval_ms;
         }
         if (wait == c.WAIT_OBJECT_0 + 2) {
@@ -1420,14 +1439,10 @@ fn run(init: std.process.Init) !void {
             host.sampleCostsNow(now);
             if (host.writeStatus(now)) {
                 published_state = host.stateFingerprint();
-                published_sidecars = host.sidecarFingerprint(now);
                 _ = c.SetEvent(status_ready_event);
             }
-        } else if (sidecars_changed or host.stateFingerprint() != published_state) {
-            if (host.writeStatus(now)) {
-                published_state = host.stateFingerprint();
-                published_sidecars = host.sidecarFingerprint(now);
-            }
+        } else if (sidecars_changed or published_state != host.stateFingerprint()) {
+            if (host.writeStatus(now)) published_state = host.stateFingerprint();
         }
     }
     host.stopSharedHost(true);
