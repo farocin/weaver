@@ -59,8 +59,8 @@ const Shared = struct {
     runtime: *c.JSRuntime,
     heap: js_heap.Heap,
     engines: usize = 0,
-    /// Per widget range, the used bytes that start a collection; zero until
-    /// first set. QuickJS's own threshold follows every widget's total, so
+    /// Per widget range, the used bytes that start a collection (see
+    /// `gcTrigger`). QuickJS's own threshold follows every widget's total, so
     /// one widget could reach its cap with garbage left uncollected.
     gc_thresholds: [max_engines + 1]usize = @splat(0),
     /// Ranges whose threshold is due a reset: every range after a
@@ -185,20 +185,20 @@ fn chargeShared(_: ?*c.JSRuntime, restore: ?*anyopaque) callconv(.c) ?*anyopaque
     return @ptrFromInt(@as(usize, previous) + 1);
 }
 
-/// QuickJS's starting runtime-wide collection threshold (`JS_NewRuntime2`),
-/// used as the floor of a widget's own.
-const gc_threshold_floor: usize = 256 * 1024;
-
-/// `JS_SetGCTriggerFunc`: collect when the running widget's range has grown
-/// half again past what it held after the last collection, the rule QuickJS
-/// applies to the runtime as a whole.
+/// `JS_SetGCTriggerFunc`: a safety net under a widget's cap, not a pacing
+/// rule (QuickJS's runtime-wide threshold keeps pacing collections). A
+/// widget collects once its range passes halfway from what it held after
+/// the last collection to its cap; a clock never gets near, and one holding
+/// most of its cap collects ever more often only as it closes in. Each
+/// collection walks every widget's heap, so a tighter rule cost CPU for
+/// everyone.
 fn gcTrigger(_: ?*c.JSRuntime, size: usize) callconv(.c) bool {
     const state = &shared.?;
     const owner = state.heap.current;
     if (owner == state.heap.hostOwner()) return false;
     const used = state.heap.usedBytes(owner);
     if (state.gc_settle.isSet(owner)) {
-        state.gc_thresholds[owner] = @max(used + used / 2, gc_threshold_floor);
+        state.gc_thresholds[owner] = used + (memory_limit_bytes -| used) / 2;
         state.gc_settle.unset(owner);
     }
     if (used + size <= state.gc_thresholds[owner]) return false;
@@ -1239,7 +1239,9 @@ test "the runtime's own tables leave nothing in a destroyed widget's range" {
     // Each object gets a shape of its own, so the runtime's shape table
     // grows during this widget's turns.
     try leaving.evaluate("globalThis.kept = [];", "kept.js");
-    for (0..35) |_| try leaving.evaluate("for (let i = 0; i < 2000; i += 1) kept.push(Object.create({}));", "shapes.js");
+    // 50,000 shapes grow the table well past its start, and stay below the
+    // point where this widget would collect inside a turn.
+    for (0..25) |_| try leaving.evaluate("for (let i = 0; i < 2000; i += 1) kept.push(Object.create({}));", "shapes.js");
     leaving.destroy(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(owner));
 
