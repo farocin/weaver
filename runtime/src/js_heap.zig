@@ -556,8 +556,9 @@ test "a range refuses past its capacity, the cap" {
     heap.current = 0;
     var count: usize = 0;
     while (heap.alloc(4096) != null) count += 1;
-    // (256 KiB - a 4 KiB granule map) / 5 granules per 4 KiB block.
-    try std.testing.expectEqual(@as(usize, 50), count);
+    // The range less its granule map (a page or more), 5 granules per
+    // 4 KiB block.
+    try std.testing.expectEqual(heap.layout.granulesPerRange() / 5, count);
     // The other range is untouched by the first one's exhaustion.
     heap.current = 1;
     try std.testing.expect(heap.alloc(4096) != null);

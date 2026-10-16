@@ -36,12 +36,14 @@ Same session, alternating builds, `E:\w\rm-bench\multi-measure.ps1` and
 `weaver-measure.ps1`.
 
 The promise job queue belongs to the runtime, so it is now shared. Every
-turn runs the queue empty before it ends, and each job runs as a turn of
-the Widget whose realm queued it (its budget, heap and log): a collection in
+turn ends with the queue empty, a turn that throws included. A collection in
 one Widget's turn can queue another Widget's `FinalizationRegistry`
-callbacks. A destroyed Widget's queued jobs are dropped with
-`JS_DropPendingJobs`, a small addition to the vendored QuickJS
-(`runtime/vendor/quickjs-ng/VENDOR.md`).
+callbacks, so jobs are routed: a Widget's jobs at the head of the queue run
+as one turn of that Widget (one budget for the chain, its heap, its log),
+and a rejection nobody handled is reported once the queue is empty. A
+destroyed Widget's jobs, including ones queued while its realm is
+collected, are dropped with `JS_DropPendingJobs`, a small addition to the
+vendored QuickJS (`runtime/vendor/quickjs-ng/VENDOR.md`).
 
 ## What this gives up
 
