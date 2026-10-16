@@ -19,9 +19,8 @@ const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
 
-/// Small objects that live as long as a widget: its engine and the image
-/// resolver's paths. The C heap packs them; `page_allocator` rounded each to
-/// its own 4 KiB page.
+/// Small objects that live as long as a widget, such as its engine. The C
+/// heap packs them; `page_allocator` rounded each to its own 4 KiB page.
 const small_allocator = std.heap.c_allocator;
 
 comptime {
@@ -1511,7 +1510,7 @@ pub fn main(init: std.process.Init) !void {
     const fonts = try loadFonts(init.io, allocator, directory, loaded.manifest.fonts);
     var image_resolver = try image_paths.Resolver.init(
         init.io,
-        small_allocator,
+        std.heap.page_allocator,
         directory,
         if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
     );
