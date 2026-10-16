@@ -431,16 +431,20 @@ pub const Engine = struct {
         return count;
     }
 
+    /// Run every queued job before the turn ends. The job queue is the
+    /// shared runtime's: a job left behind would run in the next widget's
+    /// turn, on its budget and its heap. A job that throws is reported and
+    /// the rest still run, as each is its own callback.
     fn pumpJobs(self: *Engine) Error!void {
+        var failure: ?Error = null;
         while (true) {
             var job_context: ?*c.JSContext = null;
             const result = c.JS_ExecutePendingJob(self.runtime, &job_context);
-            if (result == 0) {
-                self.flushUnhandledRejections();
-                return;
-            }
-            if (result < 0) return self.reportExceptionFrom(job_context orelse self.context);
+            if (result == 0) break;
+            if (result < 0) failure = self.reportExceptionFrom(job_context orelse self.context);
         }
+        if (failure) |err| return err;
+        self.flushUnhandledRejections();
     }
 
     fn callGlobal(self: *Engine, name: [*:0]const u8) Error!c.JSValue {
@@ -491,15 +495,15 @@ pub const Engine = struct {
         if (!c.JS_IsFunction(self.context, callback)) return;
         const result = c.JS_Call(self.context, callback, qjs.undefinedValue(), 0, null);
         defer c.JS_FreeValue(self.context, result);
-        if (c.JS_IsException(result)) logExceptionFrom(self.context);
+        if (c.JS_IsException(result)) logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
     }
 
     fn reportException(self: *Engine) Error {
         return self.reportExceptionFrom(self.context);
     }
 
-    fn reportExceptionFrom(_: *Engine, context: *c.JSContext) Error {
-        logExceptionFrom(context);
+    fn reportExceptionFrom(self: *Engine, context: *c.JSContext) Error {
+        logExceptionFrom(context, self.bridge_state.emit_error_logs);
         return error.ScriptException;
     }
 
@@ -526,9 +530,12 @@ pub const Engine = struct {
     }
 };
 
-fn logExceptionFrom(context: *c.JSContext) void {
+/// Takes the pending exception off `context`; logs it unless a test has
+/// silenced the engine's error logs.
+fn logExceptionFrom(context: *c.JSContext, emit: bool) void {
     const exception = c.JS_GetException(context);
     defer c.JS_FreeValue(context, exception);
+    if (!emit) return;
     var buffer: [max_exception_detail_bytes]u8 = undefined;
     widget_diagnostic.report("widget JavaScript exception:\n{s}", .{valueDetails(context, exception, &buffer)});
 }
@@ -779,4 +786,31 @@ test "a widget at its memory cap leaves its neighbour's realm untouched" {
 
     try std.testing.expectEqual(neighbour_bytes, neighbour.heapBytes());
     try neighbour.evaluate("if (kept.length !== 1000 || kept[999] !== 7) throw new Error('neighbour lost its state');", "neighbour-check.js");
+}
+
+test "a throwing job does not leave the widget's later jobs to another widget's turn" {
+    var tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
+    defer tree.deinit();
+    var provider: provider_mod.Client = .{};
+    try provider.init(std.testing.io, null);
+    defer provider.deinit();
+    var store: storage_mod.Store = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .directory = ".",
+        .path = "weaver-js-engine-test-storage.json",
+        .temporary_path = "weaver-js-engine-test-storage.tmp",
+    };
+    const engine = try createTestEngine(&tree, &store, &provider);
+    defer engine.destroy(std.testing.allocator);
+    engine.bridge_state.emit_error_logs = false;
+
+    try std.testing.expectError(error.ScriptException, engine.evaluate(
+        \\queueMicrotask(() => { throw new Error("first job"); });
+        \\queueMicrotask(() => { globalThis.second = true; });
+    , "jobs.js"));
+    // The runtime's job queue is shared: whatever is left would run in the
+    // next widget's turn.
+    try std.testing.expect(!c.JS_IsJobPending(engine.runtime));
+    try engine.evaluate("if (globalThis.second !== true) throw new Error('second job did not run');", "jobs-check.js");
 }
