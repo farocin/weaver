@@ -165,6 +165,9 @@ const WindowsSlotState = struct {
     /// The widget runs inside the shared host (`SharedHost`) rather than
     /// a process of its own; `process` stays null.
     hosted: bool = false,
+    /// Its slot in the shared host while it is being added or runs there:
+    /// the `id` of its control commands, and its breadcrumb less one.
+    host_slot: ?u16 = null,
 
     fn backendPath(self: *const WindowsSlotState) []const u8 {
         return self.backend_path_buffer[0..self.backend_path_len];
@@ -234,10 +237,15 @@ const SharedHost = struct {
 
 /// The host's answer to one control command.
 const ControlAnswer = struct {
-    ok: bool,
+    ok: bool = false,
+    buffer: [128]u8 = undefined,
+    error_start: usize = 0,
+    error_len: usize = 0,
+
     /// The error that stopped the command; empty when it took effect.
-    error_name: []const u8,
-    buffer: [128]u8,
+    fn errorName(self: *const ControlAnswer) []const u8 {
+        return self.buffer[self.error_start..][0..self.error_len];
+    }
 };
 
 const Host = struct {
@@ -455,23 +463,23 @@ const Host = struct {
     /// starting the host if it is not running. The widgets already in it
     /// keep running.
     fn startHostedWidgets(self: *Host, now_ms: u64) void {
-        for (&self.slots, 0..) |*slot, index| {
+        for (&self.slots) |*slot| {
             if (!slot.used or !slot.enabled or slot.dev or slot.platform.hosted) continue;
             const due = slot.state == .starting or (slot.state == .backoff and now_ms >= slot.next_restart_ms);
             if (!due or !self.sourceExists(slot.source())) continue;
-            self.addHosted(slot, index, now_ms);
+            self.addHosted(slot, now_ms);
         }
     }
 
-    fn addHosted(self: *Host, slot: *Slot, index: usize, now_ms: u64) void {
-        if (index >= max_hosted_widgets) {
+    fn addHosted(self: *Host, slot: *Slot, now_ms: u64) void {
+        slot.platform.host_slot = self.freeHostSlot() orelse {
             slot.state = .stopped;
-            slot.setReason("the shared widget host holds at most {d} widgets (max_hosted_widgets) and this is widget {d}; remove another widget, then reinstall this one", .{ max_hosted_widgets, index + 1 });
+            slot.setReason("the shared widget host already runs {d} widgets, its limit (max_hosted_widgets); remove one, then reinstall this one", .{max_hosted_widgets});
             return;
-        }
+        };
         self.prepareSlot(slot, now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
         self.ensureSharedHost(now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
-        const line = self.addCommand(slot, index) catch |err| return self.failLaunch(slot, now_ms, err);
+        const line = self.addCommand(slot) catch |err| return self.failLaunch(slot, now_ms, err);
         defer self.allocator.free(line);
         const process = self.shared.process.process.?;
         const pid = self.shared.process.pid;
@@ -492,8 +500,9 @@ const Host = struct {
             // Loading is deterministic (a broken bundle or manifest), so
             // the slot stops until it is reinstalled or its source changes.
             self.closePipe(slot);
+            slot.platform.host_slot = null;
             slot.state = .stopped;
-            slot.setReason("widget did not load in the shared host: {s}; see 'weaver logs {s}'", .{ answer.error_name, slot.name() });
+            slot.setReason("widget did not load in the shared host: {s}; see 'weaver logs {s}'", .{ answer.errorName(), slot.name() });
             if (self.hostedCount() == 0) self.stopSharedHost(true);
             return;
         }
@@ -508,15 +517,36 @@ const Host = struct {
 
     fn failLaunch(self: *Host, slot: *Slot, now_ms: u64, err: anyerror) void {
         self.closePipe(slot);
+        slot.platform.host_slot = null;
         supervisor.recordLaunchFailure(slot, now_ms, err);
     }
 
-    fn addCommand(self: *Host, slot: *Slot, index: usize) ![]u8 {
+    /// The lowest shared-host slot no widget holds.
+    fn freeHostSlot(self: *const Host) ?u16 {
+        var taken: [max_hosted_widgets]bool = @splat(false);
+        for (&self.slots) |*slot| {
+            if (slot.platform.host_slot) |host_slot| taken[host_slot] = true;
+        }
+        for (taken, 0..) |is_taken, host_slot| {
+            if (!is_taken) return @intCast(host_slot);
+        }
+        return null;
+    }
+
+    /// The registry slot running in shared-host slot `host_slot`.
+    fn slotInHost(self: *Host, host_slot: u16) ?*Slot {
+        for (&self.slots) |*slot| {
+            if (slot.platform.hosted and slot.platform.host_slot == host_slot) return slot;
+        }
+        return null;
+    }
+
+    fn addCommand(self: *Host, slot: *Slot) ![]u8 {
         const dist = try self.distPath(slot);
         defer self.allocator.free(dist);
         var line: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer line.deinit();
-        try line.writer.print("{{\"add\":{{\"id\":{d},\"dir\":{f},\"backend\":{f}", .{ index, std.json.fmt(dist, .{}), std.json.fmt(slot.platform.backendPath(), .{}) });
+        try line.writer.print("{{\"add\":{{\"id\":{d},\"dir\":{f},\"backend\":{f}", .{ slot.platform.host_slot.?, std.json.fmt(dist, .{}), std.json.fmt(slot.platform.backendPath(), .{}) });
         if (slot.platform.pipe_name_len > 0) try line.writer.print(",\"pipe\":{f}", .{std.json.fmt(slot.platform.pipeName(), .{})});
         try line.writer.writeAll("}}\n");
         return line.toOwnedSlice();
@@ -526,11 +556,11 @@ const Host = struct {
     /// host stops with its last widget.
     fn removeHosted(self: *Host, slot: *Slot) void {
         var buffer: [48]u8 = undefined;
-        const line = std.fmt.bufPrint(&buffer, "{{\"remove\":{{\"id\":{d}}}}}\n", .{self.slotIndex(slot)}) catch unreachable;
+        const line = std.fmt.bufPrint(&buffer, "{{\"remove\":{{\"id\":{d}}}}}\n", .{slot.platform.host_slot.?}) catch unreachable;
         const answer = self.controlRequest(line);
         self.releaseHostedSlot(slot);
         if (answer) |result| {
-            if (!result.ok) std.log.warn("shared widget host could not remove '{s}': {s}", .{ slot.name(), result.error_name });
+            if (!result.ok) std.log.warn("shared widget host could not remove '{s}': {s}", .{ slot.name(), result.errorName() });
         } else |err| {
             // Gone or wedged: stop it, and the others start again in a new one.
             std.log.warn("shared widget host did not answer removing '{s}': {s}; restarting it", .{ slot.name(), @errorName(err) });
@@ -543,10 +573,6 @@ const Host = struct {
         var count: usize = 0;
         for (&self.slots) |*slot| count += @intFromBool(slot.platform.hosted);
         return count;
-    }
-
-    fn slotIndex(self: *const Host, slot: *const Slot) usize {
-        return (@intFromPtr(slot) - @intFromPtr(&self.slots[0])) / @sizeOf(Slot);
     }
 
     /// Start the shared host with no widgets, unless it is running: a
@@ -603,7 +629,7 @@ const Host = struct {
         while (written < line.len) {
             written += try controlIo(.write, shared.control, shared.control_event, @constCast(line[written..]), process, deadline);
         }
-        var answer: ControlAnswer = .{ .ok = false, .error_name = "", .buffer = undefined };
+        var answer: ControlAnswer = .{};
         var filled: usize = 0;
         while (std.mem.indexOfScalar(u8, answer.buffer[0..filled], '\n') == null) {
             if (filled == answer.buffer.len) return error.ControlAnswerTooLong;
@@ -615,8 +641,12 @@ const Host = struct {
         const Wire = struct { ok: bool = false, @"error": []const u8 = "" };
         const wire = std.json.parseFromSliceLeaky(Wire, fixed.allocator(), text, .{ .ignore_unknown_fields = true }) catch return error.ControlAnswerInvalid;
         answer.ok = wire.ok;
-        // The name is a substring of the answer: an error name needs no escapes.
-        answer.error_name = if (std.mem.indexOf(u8, text, wire.@"error")) |at| answer.buffer[at .. at + wire.@"error".len] else "";
+        // The name is a substring of the answer: an error name needs no
+        // escapes. Kept as a position, so the answer can be copied.
+        if (std.mem.indexOf(u8, text, wire.@"error")) |at| {
+            answer.error_start = at;
+            answer.error_len = wire.@"error".len;
+        }
         return answer;
     }
 
@@ -662,21 +692,22 @@ const Host = struct {
         if (c.WaitForSingleObject(process, 0) != c.WAIT_OBJECT_0) return;
         var exit_code: c.DWORD = 1;
         _ = c.GetExitCodeProcess(process, &exit_code);
+        // The breadcrumb is the running widget's host slot plus one.
         const crumb = if (self.shared.breadcrumb) |view| view.* else 0;
-        const blamed: ?usize = if (crumb == 0 or crumb > max_widgets or !self.slots[crumb - 1].platform.hosted) null else crumb - 1;
-        for (&self.slots, 0..) |*slot, index| {
+        const blamed: ?*Slot = if (crumb == 0 or crumb > max_hosted_widgets) null else self.slotInHost(@intCast(crumb - 1));
+        for (&self.slots) |*slot| {
             if (!slot.platform.hosted) continue;
             self.releaseHostedSlot(slot);
             if (!self.sourceExists(slot.source())) {
                 _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
-            } else if (blamed == null or blamed.? == index) {
+            } else if (blamed == null or blamed.? == slot) {
                 supervisor.recordCrash(slot, now_ms, exit_code);
             } else {
                 slot.state = .starting;
                 slot.next_restart_ms = 0;
             }
         }
-        if (blamed) |index| std.log.warn("shared widget host exited with code {d} while running '{s}'", .{ exit_code, self.slots[index].name() });
+        if (blamed) |slot| std.log.warn("shared widget host exited with code {d} while running '{s}'", .{ exit_code, slot.name() });
         self.closeSharedHost();
     }
 
@@ -702,6 +733,7 @@ const Host = struct {
     fn releaseHostedSlot(self: *Host, slot: *Slot) void {
         self.closePipe(slot);
         slot.platform.hosted = false;
+        slot.platform.host_slot = null;
         slot.platform.pid = 0;
     }
 
