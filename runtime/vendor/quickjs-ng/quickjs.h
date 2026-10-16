@@ -1205,9 +1205,11 @@ JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 /* Weaver additions: each context queues its own jobs; see VENDOR.md. */
 JS_EXTERN bool JS_IsContextJobPending(JSContext *ctx);
 JS_EXTERN int JS_ExecuteContextJob(JSContext *ctx);
-/* Called with a job's context before QuickJS allocates the job, then with
-   NULL and the value the first call returned: an embedder that charges
-   memory per context charges the job to its own context. */
+/* Called with a job's context before QuickJS allocates the job. An
+   embedder that charges memory per context and had to switch to the job's
+   context returns non-NULL; QuickJS then calls it again with NULL and that
+   value to switch back, and drops the job without throwing if the
+   allocation fails. */
 typedef void *JSChargeJobFunc(JSContext *ctx, void *restore);
 JS_EXTERN void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func);
 JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

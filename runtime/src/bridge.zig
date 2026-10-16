@@ -1039,13 +1039,17 @@ fn settleMedia(ctx: *c.JSContext, bridge_state: *State, index: usize, ok: ?bool,
 }
 
 /// Settle every pending media command with `error_name`. False when a
-/// callback threw; its exception is left pending for the caller.
+/// callback threw; the first exception is left pending for the caller, held
+/// aside while the later callbacks run so none of them can replace it.
 fn settleAllMedia(ctx: *c.JSContext, bridge_state: *State, error_name: []const u8) bool {
-    var settled = true;
+    var first: ?c.JSValue = null;
     for (0..max_media_pending) |index| {
-        if (!settleMedia(ctx, bridge_state, index, null, error_name)) settled = false;
+        if (settleMedia(ctx, bridge_state, index, null, error_name)) continue;
+        const exception = c.JS_GetException(ctx);
+        if (first == null) first = exception else c.JS_FreeValue(ctx, exception);
     }
-    return settled;
+    _ = c.JS_Throw(ctx, first orelse return true);
+    return false;
 }
 
 /// Ack delivery shares the provider app-loop turn but never shares the
@@ -1189,6 +1193,39 @@ test "native mediaCommand exists only for a declared runtime capability" {
 
     try std.testing.expect(!try Probe.hasMediaCommand(false));
     try std.testing.expect(try Probe.hasMediaCommand(true));
+}
+
+test "settling every media command reports the first callback's exception" {
+    const runtime = c.JS_NewRuntime() orelse return error.OutOfMemory;
+    defer c.JS_FreeRuntime(runtime);
+    const context = c.JS_NewContext(runtime) orelse return error.OutOfMemory;
+    defer c.JS_FreeContext(context);
+    var provider: provider_mod.Client = .{};
+    try provider.init(std.testing.io, null);
+    defer provider.deinit();
+    var bridge_state: State = .{
+        .tree = undefined,
+        .storage = undefined,
+        .provider = &provider,
+        .origins = &.{},
+    };
+    // The first callback throws; the second throws and catches its own
+    // error, which must not erase the first.
+    const source =
+        \\[() => { throw new Error("first callback"); }, () => { try { throw new Error("second"); } catch {} }]
+    ;
+    const callbacks = c.JS_Eval(context, source.ptr, source.len, "callbacks.js", c.JS_EVAL_TYPE_GLOBAL);
+    defer c.JS_FreeValue(context, callbacks);
+    for (0..2) |index| {
+        const slot = try bridge_state.media_tracker.add(index + 1, 0);
+        bridge_state.media_callbacks[slot] = c.JS_GetPropertyUint32(context, callbacks, @intCast(index));
+    }
+    try std.testing.expect(!settleAllMedia(context, &bridge_state, "MediaCommandShutdown"));
+    const exception = c.JS_GetException(context);
+    defer c.JS_FreeValue(context, exception);
+    const message = c.JS_ToCString(context, exception) orelse return error.QuickJs;
+    defer c.JS_FreeCString(context, message);
+    try std.testing.expectEqualStrings("Error: first callback", std.mem.span(message));
 }
 
 test "media callback is installed before send and rollback releases its slot" {

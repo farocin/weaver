@@ -132,15 +132,17 @@ fn acquireShared() !*Shared {
 
 /// `JS_EnqueueJob` asks this around allocating a job: a collection in one
 /// widget's turn can queue another widget's FinalizationRegistry callback,
-/// whose entry is that widget's. The token is the owner to restore, plus one
-/// so it is never null.
+/// whose entry is that widget's. Null when the job is the running owner's;
+/// otherwise the owner to restore, plus one so it is never null.
 fn chargeJob(context: ?*c.JSContext, restore: ?*anyopaque) callconv(.c) ?*anyopaque {
     const js = context orelse {
         heap().current = @intCast(@intFromPtr(restore) - 1);
         return null;
     };
+    const engine = engineOf(js) orelse return null;
     const previous = heap().current;
-    if (engineOf(js)) |engine| heap().current = engine.owner;
+    if (engine.owner == previous) return null;
+    heap().current = engine.owner;
     return @ptrFromInt(@as(usize, previous) + 1);
 }
 
@@ -227,6 +229,9 @@ pub const Engine = struct {
             c.JS_FreeValue(self.context, pending.reason);
             pending.* = .{};
         }
+        // Teardown ran widget code outside a turn; the shared exception slot
+        // must not keep this realm alive.
+        if (c.JS_HasException(self.context)) logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
         c.JS_SetContextOpaque(self.context, null);
         c.JS_FreeContext(self.context);
         // The realm's cycles, its queued jobs among them (the context owns
@@ -490,6 +495,7 @@ pub const Engine = struct {
         defer c.JS_FreeValue(self.context, global);
         const callback = c.JS_GetPropertyStr(self.context, global, name);
         defer c.JS_FreeValue(self.context, callback);
+        if (c.JS_IsException(callback)) return self.reportException();
         if (!c.JS_IsFunction(self.context, callback)) return error.QuickJs;
         const result = c.JS_Call(self.context, callback, qjs.undefinedValue(), 0, null);
         if (c.JS_IsException(result)) {
@@ -513,6 +519,9 @@ pub const Engine = struct {
     }
 
     fn endTurn(self: *Engine) void {
+        // The runtime's pending-exception slot is shared by every widget:
+        // nothing of this turn may be left in it for the next one.
+        if (c.JS_HasException(self.context)) logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
         self.executing = false;
         executing_engine = null;
         heap().current = heap().hostOwner();
@@ -528,6 +537,7 @@ pub const Engine = struct {
         defer c.JS_FreeValue(self.context, global);
         const callback = c.JS_GetPropertyStr(self.context, global, "__weaverFlushStorage");
         defer c.JS_FreeValue(self.context, callback);
+        if (c.JS_IsException(callback)) return logExceptionFrom(self.context, self.bridge_state.emit_error_logs);
         if (!c.JS_IsFunction(self.context, callback)) return;
         const result = c.JS_Call(self.context, callback, qjs.undefinedValue(), 0, null);
         defer c.JS_FreeValue(self.context, result);
@@ -576,7 +586,16 @@ fn logExceptionFrom(context: *c.JSContext, emit: bool) void {
     widget_diagnostic.report("widget JavaScript exception:\n{s}", .{valueDetails(context, exception, &buffer)});
 }
 
+/// Format `value` for a diagnostic. Formatting runs widget code (toString,
+/// getters) that can itself throw; that exception is dropped here so it
+/// cannot outlive the diagnostic in the runtime's shared exception slot.
 fn valueDetails(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []const u8 {
+    const details = formatValue(context, value, buffer);
+    if (c.JS_HasException(context)) c.JS_FreeValue(context, c.JS_GetException(context));
+    return details;
+}
+
+fn formatValue(context: *c.JSContext, value: c.JSValueConst, buffer: []u8) []const u8 {
     if (c.JS_IsError(value)) return errorValueDetails(context, value, buffer);
     var len: usize = 0;
     const raw = c.JS_ToCStringLen2(context, &len, value, false) orelse return "JavaScript value could not be formatted";
@@ -943,6 +962,30 @@ test "a media callback that throws while its widget unloads takes nothing with i
 
     // The runtime's exception slot is shared; the thrown 20 MiB went with
     // the widget, so its range is whole for the next one.
+    const next = try widgets.engine(0);
+    defer next.destroy(std.testing.allocator);
+    try next.evaluate("globalThis.big = new ArrayBuffer(28 * 1024 * 1024);", "next.js");
+}
+
+test "widget code that throws while the runtime handles its error leaves nothing behind" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    const leaving = try widgets.engine(0);
+    leaving.bridge_state.emit_error_logs = false;
+    // Formatting the unhandled rejection's reason throws 10 MiB, and so
+    // does reading the hot-swap hook.
+    try leaving.evaluate(
+        \\Promise.reject({ toString() { throw new ArrayBuffer(10 * 1024 * 1024); } });
+        \\Object.defineProperty(globalThis, "__weaverCaptureHotSwap", { get() { throw new ArrayBuffer(10 * 1024 * 1024); } });
+    , "leaving.js");
+    try std.testing.expect(leaving.renderFailed());
+    try std.testing.expectEqual(@as(?[]u8, null), leaving.captureHotSwap(std.testing.allocator));
+    try std.testing.expect(!c.JS_HasException(survivor.context));
+    leaving.destroy(std.testing.allocator);
+
     const next = try widgets.engine(0);
     defer next.destroy(std.testing.allocator);
     try next.evaluate("globalThis.big = new ArrayBuffer(28 * 1024 * 1024);", "next.js");

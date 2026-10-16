@@ -43,7 +43,10 @@ heap and log. So each realm keeps its own queue, a small change to the
 vendored QuickJS (`runtime/vendor/quickjs-ng/VENDOR.md`): a Widget's jobs run
 only in its own turns, as they did with a runtime each. The context owns
 its queue like its other fields, so a destroyed Widget's leftover jobs are
-collected with its realm.
+collected with its realm. The pending-exception slot is the runtime's too:
+every turn and every teardown leaves it empty, logging whatever widget code
+left in it, so one Widget's exception neither reaches another's error
+report nor keeps a destroyed realm alive.
 
 ## What this gives up
 

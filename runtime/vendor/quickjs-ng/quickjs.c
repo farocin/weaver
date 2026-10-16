@@ -2150,15 +2150,21 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     assert(!rt->in_free);
 
     /* Weaver: a collection in one context can queue another context's
-       job; the embedder charges the entry to the job's context. */
+       job; the embedder charges the entry to the job's context, and says
+       so by returning non-NULL. When that context is full the job is
+       dropped without throwing: the running context's pending exception
+       is not this job's to replace. */
     {
         void *restore = rt->charge_job ? rt->charge_job(ctx, NULL) : NULL;
-        e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
-        if (rt->charge_job)
+        e = js_malloc_rt(rt, sizeof(*e) + argc * sizeof(JSValue));
+        if (restore)
             rt->charge_job(NULL, restore);
+        if (!e) {
+            if (!restore)
+                JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
     }
-    if (!e)
-        return -1;
     e->ctx = ctx;
     e->job_func = job_func;
     e->argc = argc;
