@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
-import { compileClass, UtilityError } from "../../sdk/src/class-compiler.js";
+import { compileClass, UtilityError, type ClassProps } from "../../sdk/src/class-compiler.js";
+import { iconClass } from "../../sdk/src/icon-class.js";
 import { signalDevReload } from "./dev-reload.js";
 import { createDevRebuildLoop } from "./dev-rebuild-loop.js";
 import { endDevRegistration } from "./dev-registration.js";
@@ -775,6 +776,7 @@ function nowMicroseconds(): number {
 }
 
 async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<Uint8Array> {
+  const use = sdkUse(project);
   const built = await build({
     entryPoints: [project.sourcePath],
     outfile,
@@ -787,6 +789,7 @@ async function compileWidgetBundle(project: SourceProject, outfile: string): Pro
     legalComments: "none",
     minify: true,
     plugins: [
+      sdkTrimPlugin(use),
       iconLoweringPlugin(project.directory, () => { project.usesIcons = true; }),
       weaverResolutionPlugin(project.directory),
     ],
@@ -1034,6 +1037,62 @@ function jsxClassVariants(attribute: ts.JsxAttribute, context: StaticExpressionC
   if (ts.isStringLiteral(initializer)) return [initializer.text];
   if (ts.isJsxExpression(initializer) && initializer.expression) return context.stringVariants(initializer.expression);
   return null;
+}
+
+/** One spelling per class string: the class compiler reads utilities split
+ * on whitespace, so strings that differ only in spacing compile the same. */
+function normalizedClass(className: string): string {
+  return className.trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+/** What of the SDK's runtime a widget's source can reach. */
+interface SdkUse {
+  /** Every class string the widget can render, compiled; null when the set
+   * is not provably complete and the runtime class compiler must ship. */
+  classes: Map<string, ClassProps> | null;
+  /** Whether a `background={...}` gradient can reach the runtime serializer. */
+  backgroundProps: boolean;
+}
+
+/**
+ * Read from the source what of the SDK's runtime the widget can reach. The
+ * class set is complete when each JSX `class` is statically enumerable
+ * (`weaver check` already requires it), no built-in element takes spread
+ * props, and nothing calls `h` directly; then no class string can reach the
+ * runtime that the CLI has not compiled. A gradient object reaches the
+ * serializer only through a built-in element's `background` prop or a
+ * direct `serializeBackground` call.
+ */
+function sdkUse(project: SourceProject): SdkUse {
+  const everything: SdkUse = { classes: null, backgroundProps: true };
+  const bindings = hFactoryBindings(project.directory, project.sourceFiles);
+  if ([...bindings.values()].some((binding) => binding.identifiers.size > 0 || binding.namespaces.size > 0)) return everything;
+  if (project.sourceFiles.some((sourceFile) => sourceFile.text.includes("@weaver/sdk/jsx-runtime") || sourceFile.text.includes("serializeBackground"))) return everything;
+  const classes = new Set<string>([""]);
+  let backgroundProps = false;
+  for (const sourceFile of project.sourceFiles) {
+    const incomplete = walkSourceWithStaticExpressions(sourceFile, (node, context) => {
+      if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && node.tagName.getText(sourceFile) === "icon" &&
+          !node.attributes.properties.some((property) => ts.isJsxAttribute(property) && property.name.getText(sourceFile) === "class")) {
+        classes.add(iconClass(undefined));
+      }
+      if (ts.isJsxSpreadAttribute(node)) return /^[a-z]/.test(node.parent.parent.tagName.getText(sourceFile));
+      if (!ts.isJsxAttribute(node)) return false;
+      const tag = node.parent.parent.tagName.getText(sourceFile);
+      const name = node.name.getText(sourceFile);
+      if (name === "background" && /^[a-z]/.test(tag)) backgroundProps = true;
+      if (name !== "class") return false;
+      const variants = jsxClassVariants(node, context);
+      if (variants === null) return true;
+      // The SDK composes an <icon>'s class at run time; compile that string.
+      for (const variant of variants) classes.add(normalizedClass(tag === "icon" ? iconClass(variant) : variant));
+      return false;
+    });
+    if (incomplete) return everything;
+  }
+  const compiled = new Map<string, ClassProps>();
+  for (const className of classes) compiled.set(className, compileClass(className));
+  return { classes: compiled, backgroundProps };
 }
 
 interface HFactoryBindings {
@@ -1354,6 +1413,47 @@ function weaverResolutionPlugin(sourceRoot: string): import("esbuild").Plugin {
         }
         return null;
       });
+    },
+  };
+}
+
+/**
+ * Leave out the SDK runtime a widget cannot reach: the class compiler, when
+ * its classes are compiled here, and the gradient serializer with its color
+ * palette, when no `background` prop exists. Each costs every widget tens of
+ * KiB of JavaScript heap (about 60 KiB apiece for a clock, 2026-10-15). A
+ * stand-in that is reached anyway names the miss instead of failing quietly.
+ */
+function sdkTrimPlugin(use: SdkUse): import("esbuild").Plugin {
+  const modules = new Map<string, string>();
+  if (use.classes) {
+    modules.set("class-compiler.js", `const classes = new Map(${JSON.stringify([...use.classes])});
+const normalized = (className) => className.trim().split(/\\s+/).filter(Boolean).join(" ");
+export function compileClass(className) {
+  const compiled = classes.get(className) ?? classes.get(normalized(className));
+  if (compiled === undefined) throw new Error(\`class "\${className}" was not among the classes weaver bundle compiled for this widget; this is a weaver bug, please report it with the widget source\`);
+  return compiled;
+}
+export function classUsesGradientBackground(className) {
+  return compileClass(className).backgroundGradient !== undefined;
+}
+`);
+  }
+  if (!use.backgroundProps) {
+    modules.set("gradients.js", `export function serializeBackground() {
+  throw new Error("weaver bundle found no background prop in this widget and left the gradient serializer out; this is a weaver bug, please report it with the widget source");
+}
+`);
+  }
+  return {
+    name: "weaver-sdk-trim",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /^\.\/(class-compiler|gradients)\.js$/ }, (args) => {
+        if (!args.importer || !(pathsEqual(args.importer, sdkRoot) || pathInside(sdkRoot, args.importer))) return null;
+        const name = args.path.slice(2);
+        return modules.has(name) ? { path: name, namespace: "weaver-sdk-trim" } : null;
+      });
+      pluginBuild.onLoad({ filter: /.*/, namespace: "weaver-sdk-trim" }, (args) => ({ contents: modules.get(args.path)!, loader: "js" }));
     },
   };
 }

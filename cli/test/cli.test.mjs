@@ -338,6 +338,45 @@ export default widget({ name: "System Card", size: [200, 100], subscribe: ["cpu"
   }
 });
 
+test("bundles carry only the SDK runtime the widget can reach", () => {
+  const root = mkdtempSync(join(tmpdir(), "weaver-sdk-trim-"));
+  const bundleOf = (name, body) => {
+    const widget = join(root, name);
+    assert.equal(spawnSync(process.execPath, [fileURLToPath(new URL("../dist/index.js", import.meta.url)), "init", name], { cwd: root, encoding: "utf8" }).status, 0);
+    writeFileSync(join(widget, "widget.tsx"), `import { useState, widget } from "@weaver/sdk";
+export default widget({ name: "${name}", size: [200, 100] }, () => {
+  const [on] = useState(false);
+${body}
+});
+`, "utf8");
+    const result = spawnSync(process.execPath, ["cli/dist/index.js", "bundle", widget], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return readFileSync(join(widget, "dist", "bundle.js"), "utf8");
+  };
+  const classCompiler = "arrives in M2+";
+  const palette = '"orange-950"';
+  try {
+    // Every class is known: both sides of the conditional arrive compiled,
+    // and neither the class compiler nor the gradient palette ships.
+    const known = bundleOf("known", `  return <column class="p-2 gap-1"><text class={on ? "text-red-500" : "text-zinc-800"}>hi</text></column>;`);
+    assert.ok(known.includes("#FB2C36FF") && known.includes("#27272AFF"));
+    assert.ok(!known.includes(classCompiler));
+    assert.ok(!known.includes(palette));
+
+    // A background prop needs the runtime gradient serializer.
+    const gradient = bundleOf("gradient", `  return <column background={{ type: "linear", stops: [{ offset: 0, color: "red-500" }, { offset: 1, color: "zinc-800" }] }}><text>hi</text></column>;`);
+    assert.ok(gradient.includes(palette));
+    assert.ok(!gradient.includes(classCompiler));
+
+    // Spread props can carry a class the CLI never saw.
+    const spread = bundleOf("spread", `  const props = { class: on ? "p-2" : "p-4" };
+  return <column {...props}><text>hi</text></column>;`);
+    assert.ok(spread.includes(classCompiler));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("gradient-only widgets select the GPU renderer", () => {
   const root = mkdtempSync(join(tmpdir(), "weaver-gradient-backend-"));
   const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
