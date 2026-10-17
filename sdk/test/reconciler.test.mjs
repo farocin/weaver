@@ -69,6 +69,7 @@ test("widget renders one native generation and providers use native timers", asy
   let sliderValue = 0;
   let retainedCanvasContext;
   let transport;
+  const beforeRender = Date.now();
   sdk.widget({ name: "Test", size: [100, 50], subscribe: ["time", "cpu", "audio", "media"], capabilities: ["media-transport"] }, () => {
     const time = sdk.useProvider("time");
     const cpu = sdk.useProvider("cpu");
@@ -145,7 +146,16 @@ test("widget renders one native generation and providers use native timers", asy
   });
   assert.equal(operations.filter(([name]) => name === "beginBatch").length, 1);
   assert.equal(operations.filter(([name]) => name === "endBatch").length, 1);
-  assert.deepEqual(operations.filter(([name]) => name === "setInterval").map((operation) => operation[1]), [1000, 2500]);
+  const [timeInterval, hookInterval] = operations.filter(([name]) => name === "setInterval").map((operation) => operation[1]);
+  assert.equal(hookInterval, 2500);
+  // The time provider's first tick lands 20 ms past the next wall-clock
+  // second (render took a few ms of the clock, so it is up to that early),
+  // and is never a sub-40 ms timer.
+  assert.ok(timeInterval >= 40 && timeInterval <= 1020, `time interval ${timeInterval}`);
+  // How much earlier than 20 ms past the second, measured from before the
+  // render: the render's own time, well under 60 ms.
+  const early = (20 - ((beforeRender + timeInterval) % 1000) + 1000) % 1000;
+  assert.ok(early <= 60, `first tick lands ${20 - early} ms past the second`);
   assert.equal(callbacks.size, 2);
   const rootColumnId = operations.find((operation) => operation[0] === "createNode" && operation[1] === "column")[2];
   for (const [key, value] of [
