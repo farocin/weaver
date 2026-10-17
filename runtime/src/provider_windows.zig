@@ -99,6 +99,7 @@ pub const Client = struct {
         }
         if (self.thread) |thread| thread.join();
         self.thread = null;
+        self.queues.deinit();
         if (self.handle != win.INVALID_HANDLE_VALUE) {
             _ = win.CloseHandle(self.handle);
             self.handle = win.INVALID_HANDLE_VALUE;

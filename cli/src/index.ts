@@ -2219,7 +2219,12 @@ const nativeWidgetCanvasLimit = 8;
 const nativeWidgetImageLimit = 16;
 
 interface LoweredTreeMetrics {
+  /** Native nodes buildNode emits (painted layouts and <panel> are two). */
   nodes: number;
+  /** Retained-tree nodes the reconciler creates: one per host element and
+   * per text value outside <text>, including leaf descendants Native never
+   * receives. */
+  retainedNodes: number;
   roots: number;
   depth: number;
   maxChildren: number;
@@ -2390,20 +2395,62 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     if (!attribute) return [""];
     return staticClassVariants.get(attribute) ?? null;
   };
+  // A layout element lowers to a painted panel around its layout node when
+  // the runtime's hasPaintStyle (runtime/src/main.zig) holds for it, read
+  // through the bridge's unset values: empty colors and shadows are null,
+  // unset corner radii and interaction opacity are -1, and an interaction
+  // `shadow-none` is the explicit override "none".
+  const paintsOwnBox = (props: ClassProps): boolean => {
+    const color = (value: string | undefined) => value !== undefined && value !== "";
+    const count = (value: number | undefined) => value !== undefined && value >= 0;
+    return color(props.background) || color(props.backgroundGradient) || color(props.borderColor) ||
+      (props.borderWidth ?? 0) > 0 || (props.radius ?? 0) > 0 ||
+      count(props.radiusTopLeft) || count(props.radiusTopRight) || count(props.radiusBottomRight) || count(props.radiusBottomLeft) ||
+      color(props.shadow) ||
+      color(props.hoverBackground) || color(props.hoverTextColor) || count(props.hoverOpacity) || color(props.hoverBorderColor) || color(props.hoverShadow) ||
+      color(props.pressedBackground) || color(props.pressedTextColor) || count(props.pressedOpacity) || color(props.pressedBorderColor) || color(props.pressedShadow);
+  };
+  // The explicit `background` prop is a gradient (the class form compiles to
+  // backgroundGradient), so any statically present value paints.
+  const hasBackgroundProp = (node: ts.JsxElement | ts.JsxSelfClosingElement): boolean => {
+    const { attributes } = tagAndAttributes(node);
+    const sourceFile = node.getSourceFile();
+    const definitelyAbsent = (expression: ts.Expression): boolean => {
+      let current = expression;
+      while (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isNonNullExpression(current) ||
+        ts.isTypeAssertionExpression(current) || ts.isSatisfiesExpression(current)) {
+        current = current.expression;
+      }
+      // null is not absent: the reconciler serializes it and rejects it.
+      return ts.isVoidExpression(current) || (ts.isIdentifier(current) && current.text === "undefined");
+    };
+    return attributes.properties.some((attribute) => {
+      if (!ts.isJsxAttribute(attribute) || attribute.name.getText(sourceFile) !== "background") return false;
+      const initializer = attribute.initializer;
+      if (!initializer || !ts.isJsxExpression(initializer) || !initializer.expression) return true;
+      return !definitelyAbsent(initializer.expression);
+    });
+  };
+  // Mirrors buildNode: <panel> is always a painted box around a column.
   const isPaintedLayout = (node: ts.JsxElement | ts.JsxSelfClosingElement, tag: string): boolean => {
+    if (tag === "panel") return true;
     if (tag !== "row" && tag !== "column" && tag !== "stack") return false;
+    if (hasBackgroundProp(node)) return true;
     for (const classText of classVariants(node) ?? []) {
       try {
-        const compiled = compileClass(classText);
-        if (Object.keys(compiled).some((key) => key === "background" || key === "radius" || key.startsWith("radius") || key.startsWith("border") || key.toLowerCase().includes("shadow"))) return true;
+        if (paintsOwnBox(compileClass(classText))) return true;
       } catch {
         // The ordinary class validator reports the malformed utility.
       }
     }
     return false;
   };
+  // Leaves draw themselves; buildNode never emits their children, so those
+  // add no Native depth. (They still count as retained nodes below.)
+  const leafTags = new Set(["text", "slider", "icon", "image", "canvas"]);
   const maximum = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: Math.max(0, ...values.map((value) => value.nodes)),
+    retainedNodes: Math.max(0, ...values.map((value) => value.retainedNodes)),
     roots: Math.max(0, ...values.map((value) => value.roots)),
     depth: Math.max(0, ...values.map((value) => value.depth)),
     maxChildren: Math.max(0, ...values.map((value) => value.maxChildren)),
@@ -2422,11 +2469,12 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     return null;
   };
   const emptyMetrics = (): LoweredTreeMetrics => ({
-    nodes: 0, roots: 0, depth: 0, maxChildren: 0, canvases: 0, images: 0, maxTextBytes: 0,
+    nodes: 0, retainedNodes: 0, roots: 0, depth: 0, maxChildren: 0, canvases: 0, images: 0, maxTextBytes: 0,
     opacityCanvas: false,
   });
   const combineSiblings = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: values.reduce((sum, value) => sum + value.nodes, 0),
+    retainedNodes: values.reduce((sum, value) => sum + value.retainedNodes, 0),
     roots: values.reduce((sum, value) => sum + value.roots, 0),
     depth: Math.max(0, ...values.map((value) => value.depth)),
     maxChildren: Math.max(0, ...values.map((value) => value.maxChildren)),
@@ -2455,11 +2503,11 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
         if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child) || ts.isJsxFragment(child)) {
           result.push(metrics(child, visiting));
         } else if (parentTag !== "text" && ts.isJsxText(child) && child.getText().trim() !== "") {
-          result.push({ ...emptyMetrics(), nodes: 1, roots: 1, depth: 1 });
+          result.push({ ...emptyMetrics(), nodes: 1, retainedNodes: 1, roots: 1, depth: 1 });
         } else if (parentTag !== "text" && ts.isJsxExpression(child) && child.expression) {
           const roots = expressionRoots(child.expression);
           if (roots.length > 0) result.push(maximum(roots.map((root) => metrics(root, visiting))));
-          else if (staticPrimitiveText(child.expression) !== null) result.push({ ...emptyMetrics(), nodes: 1, roots: 1, depth: 1 });
+          else if (staticPrimitiveText(child.expression) !== null) result.push({ ...emptyMetrics(), nodes: 1, retainedNodes: 1, roots: 1, depth: 1 });
         }
       }
       return result;
@@ -2496,9 +2544,10 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     const directChildren = combinedChildren.roots;
     const hasOpacityLayer = canvasHasOpacityLayer(node);
     return {
-      nodes: ownDepth + combinedChildren.nodes,
+      nodes: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.nodes),
+      retainedNodes: 1 + combinedChildren.retainedNodes,
       roots: 1,
-      depth: ownDepth + combinedChildren.depth,
+      depth: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.depth),
       maxChildren: Math.max(combinedChildren.maxChildren, directChildren, ownDepth === 2 ? 1 : 0),
       canvases: combinedChildren.canvases + (tag === "canvas" ? 1 : 0),
       images: combinedChildren.images + (tag === "image" ? 1 : 0),
@@ -2680,11 +2729,14 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
   const lowered = maximum(roots.map((root) => metrics(root, new Set())));
   const evidenceNode = roots[0];
   const limitation = " The static estimate follows the exported widget through local components and one level of relative imports; runtime limits remain authoritative for dynamic collections and unresolved component output.";
+  if (lowered.retainedNodes > nativeWidgetNodeLimit) {
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `RetainedWidgetNodeLimit: this tree creates ${lowered.retainedNodes} retained nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.retainedNodes}, headroom=${nativeWidgetNodeLimit - lowered.retainedNodes}. Each host element is one retained node, as is each text value outside a <text> element (a <text> joins its own children); descendants of a <slider> or <image> stay retained even though they are never drawn.${limitation}`));
+  }
   if (lowered.nodes > nativeWidgetNodeLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Painted <row>/<column>/<stack> elements add an inner layout node.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Every <panel>, and each <row>/<column>/<stack> that paints its own box, adds an inner layout node.${limitation}`));
   }
   if (lowered.depth > nativeWidgetDepthLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); painted <row>/<column>/<stack> elements add one nesting level.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); every <panel>, and each <row>/<column>/<stack> that paints its own box (background, border, radius, shadow, or a hover:/pressed: style), adds one nesting level.${limitation}`));
   }
   if (lowered.maxChildren > nativeWidgetChildLimit) {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetChildLimit: one authored parent lowers to ${lowered.maxChildren} direct Native children; child capacity exhausted: max_children=${nativeWidgetChildLimit}, asked for ${lowered.maxChildren}, headroom=${nativeWidgetChildLimit - lowered.maxChildren}.${limitation}`));
