@@ -8,6 +8,7 @@ const gradient_mod = @import("gradients.zig");
 const dev_reload = @import("dev_reload.zig");
 const image_paths = @import("image_paths.zig");
 const js_engine = @import("js_engine.zig");
+
 const manifest_mod = @import("manifest.zig");
 const provider_mod = @import("provider.zig");
 const platform = @import("platform/root.zig");
@@ -17,6 +18,10 @@ const tree_mod = @import("tree.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
+
+/// Small objects that live as long as a widget, such as its engine. The C
+/// heap packs them; `page_allocator` rounded each to its own 4 KiB page.
+const small_allocator = std.heap.c_allocator;
 
 comptime {
     if (native_sdk.platform.max_windows != 1 or
@@ -146,6 +151,11 @@ var backend_status_io: ?std.Io = null;
 var backend_status_path: ?[]const u8 = null;
 var projection_failed_this_view: bool = false;
 var projection_failure_latched: bool = false;
+/// The current view was refused by `depthLimitPanel`; capture fails on it
+/// like a render exception so the receipt names the problem.
+var depth_limit_exceeded: bool = false;
+/// Its own latch, so another projection failure cannot swallow the report.
+var depth_limit_reported: bool = false;
 
 fn initEffects(model: *Model, effects: *Effects) void {
     for (model.images[0..model.image_count]) |image| {
@@ -400,7 +410,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
     // update callback's stack frame, where it would consume most of
     // QuickJS's recorded C-stack allowance.
     const candidate_tree = try std.heap.page_allocator.create(tree_mod.Tree);
-    candidate_tree.* = .{};
+    tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
     var candidate_tree_moved = false;
     defer {
         if (!candidate_tree_moved) candidate_tree.deinit();
@@ -411,7 +421,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
         error.HotSwapMismatch => block: {
             preserved = false;
             candidate_tree.deinit();
-            candidate_tree.* = .{};
+            tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
             break :block try evaluateCandidate(model, candidate_tree, source, null);
         },
         else => return err,
@@ -424,7 +434,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
     candidate_tree_moved = true;
     candidate.setTree(&model.tree);
     model.engine = candidate;
-    old_engine.destroy(std.heap.page_allocator);
+    old_engine.destroy(small_allocator);
     model.dev_seen_mtime = mtime;
     syncTimers(model, effects);
     std.log.info("dev hot swap applied ({s} root hook state)", .{if (preserved) "preserved" else "fresh"});
@@ -433,7 +443,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
 fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, seed: ?[]const u8) !*js_engine.Engine {
     const storage = model.storage orelse return error.MissingStorage;
     const candidate = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         tree,
         storage,
         model.origins,
@@ -441,7 +451,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
         model.media_transport_enabled,
         false,
     );
-    errdefer candidate.destroy(std.heap.page_allocator);
+    errdefer candidate.destroy(small_allocator);
     if (seed) |value| try candidate.setHotSwapSeed(value);
     try candidate.evaluate(source, "bundle.js");
     if (candidate.renderFailed()) return error.CandidateFirstRenderFailed;
@@ -697,6 +707,10 @@ fn view(ui: *WidgetUi, model: *const Model) WidgetUi.Node {
     }
     projection_failed_this_view = false;
     const root_id = model.tree.root orelse return projectionFailurePanel(ui, true);
+    const depth = loweredDepth(model, root_id);
+    depth_limit_exceeded = depth > native_sdk.canvas.max_widget_depth;
+    if (depth_limit_exceeded) return depthLimitPanel(ui, depth);
+    depth_limit_reported = false;
     const result = buildNode(ui, model, root_id, true);
     if (!projection_failed_this_view and projection_failure_latched) {
         std.log.info("widget native projection recovered after a degraded frame", .{});
@@ -800,6 +814,71 @@ fn projectionFailurePanel(ui: *WidgetUi, is_root: bool) WidgetUi.Node {
         .grow = 1,
         .style = .{ .background = native_sdk.canvas.Color.rgba8(98, 16, 28, 255) },
     }, .{});
+}
+
+/// Whether `buildNode` emits a node's retained children. Leaves (text,
+/// slider, icon, image, canvas) draw themselves and drop any children.
+fn emitsChildren(kind: tree_mod.Kind) bool {
+    return switch (kind) {
+        .column, .row, .stack, .panel, .button => true,
+        .text, .slider, .icon, .image, .canvas => false,
+    };
+}
+
+/// Native levels `buildNode` emits for this subtree. Painted layouts and
+/// `<panel>` lower to a panel around a layout node (two levels), as does a
+/// failed image's labelled box. `weaver check` estimates this statically
+/// (`LoweredWidgetDepthLimit` in cli/src/index.ts); this count is the
+/// authoritative one.
+fn loweredDepth(model: *const Model, id: tree_mod.NodeId) usize {
+    const node = model.tree.nodeConst(id) catch return 1;
+    const own: usize = switch (node.kind) {
+        .panel => 2,
+        .column, .row, .stack => if (hasPaintStyle(node)) 2 else 1,
+        .image => if (findImageStateConst(model, id)) |image_state| (if (image_state.failure != null) 2 else 1) else 1,
+        else => 1,
+    };
+    if (!emitsChildren(node.kind)) return own;
+    var deepest: usize = 0;
+    for (node.children[0..node.child_count]) |child| deepest = @max(deepest, loweredDepth(model, child));
+    return own + deepest;
+}
+
+/// Native's layout refuses a tree deeper than `max_widget_depth`, which left
+/// the widget blank with no error, and building a tree a few hundred levels
+/// deep overflowed the native stack first (~70 KiB per level) and killed the
+/// process. Refuse the whole view by name before building any of it.
+fn depthLimitPanel(ui: *WidgetUi, depth: usize) WidgetUi.Node {
+    const limit = native_sdk.canvas.max_widget_depth;
+    if (!depth_limit_reported) {
+        depth_limit_reported = true;
+        widget_diagnostic.report(
+            "WidgetDepthExceeded: the widget tree nests {d} levels; the limit is max_widget_depth={d}, asked for {d}. Painted <row>/<column>/<stack> elements and <panel> count as two levels. Flatten nested containers or move deep content into a <canvas>.",
+            .{ depth, limit, depth },
+        );
+    }
+    projection_failed_this_view = true;
+    projection_failure_latched = true;
+    const foreground = native_sdk.canvas.Color.rgba8(255, 226, 230, 255);
+    const message = std.fmt.allocPrint(ui.arena, "WidgetDepthExceeded\nThis widget nests {d} levels; the limit is {d}. Flatten nested containers.", .{ depth, limit }) catch
+        "WidgetDepthExceeded\nThis widget nests too many levels. Flatten nested containers.";
+    const label = ui.text(.{
+        .text_scale = 0.86,
+        .wrap = true,
+        .text_max_lines = 5,
+        .style = .{ .foreground = foreground },
+    }, message);
+    return ui.panel(.{
+        .window_drag = true,
+        .padding = 12,
+        .grow = 1,
+        .cross = .center,
+        .main = .center,
+        .style = .{
+            .background = native_sdk.canvas.Color.rgba8(52, 12, 18, 255),
+            .foreground = foreground,
+        },
+    }, .{label});
 }
 
 fn hasPaintStyle(node: *const tree_mod.Node) bool {
@@ -1030,14 +1109,17 @@ fn buildNode(ui: *WidgetUi, model: *const Model, id: tree_mod.NodeId, is_root: b
         }};
         return attachEffects(ui, retained, resolveFontId(retained, model.fonts), ui.paragraph(options, &span));
     }
-    const children = ui.arena.alloc(WidgetUi.Node, retained.child_count) catch |err| {
+    // Leaves drop their retained children; building them anyway would only
+    // spend stack (and, deep enough, overflow it) for nodes nobody draws.
+    const child_count: usize = if (emitsChildren(retained.kind)) retained.child_count else 0;
+    const children = ui.arena.alloc(WidgetUi.Node, child_count) catch |err| {
         noteProjectionFailure(
             "widget child projection capacity exhausted: node={d}, asked for {d}, cause={s}",
             .{ id, retained.child_count, @errorName(err) },
         );
         return projectionFailurePanel(ui, is_root);
     };
-    for (retained.children[0..retained.child_count], 0..) |child_id, index| {
+    for (retained.children[0..child_count], 0..) |child_id, index| {
         children[index] = buildNode(ui, model, child_id, false);
     }
     const result = switch (retained.kind) {
@@ -1379,6 +1461,24 @@ fn nativeWindowLayers(manifest_layer: []const u8) NativeWindowLayers {
     return .{ .shell = .normal, .startup = .normal };
 }
 
+/// `WidgetApp.create` default-initializes the Model with `self.model = .{}`,
+/// which copies its whole default image: 4.3 MB, almost all of it the retained
+/// tree's node and canvas arenas, made resident in every Widget before the
+/// tree uses a slot. Setting the Model one field at a time, and the tree
+/// through `resetEmpty`, leaves the arenas untouched until nodes occupy them.
+fn createWidgetApp(options: WidgetApp.Options) !*WidgetApp {
+    const app = try std.heap.page_allocator.create(WidgetApp);
+    WidgetApp.initInPlace(app, std.heap.page_allocator, options);
+    inline for (std.meta.fields(Model)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "tree")) {
+            tree_mod.resetEmpty(&app.model.tree, std.heap.page_allocator);
+        } else {
+            @field(app.model, field.name) = field.defaultValue().?;
+        }
+    }
+    return app;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -1513,7 +1613,7 @@ pub fn main(init: std.process.Init) !void {
 
     var tokens = native_sdk.canvas.DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark });
     tokens.colors.background = native_sdk.canvas.Color.rgba8(0, 0, 0, 0);
-    const app_state = try WidgetApp.create(std.heap.page_allocator, .{
+    const app_state = try createWidgetApp(.{
         .name = loaded.manifest.name,
         .scene = scene,
         .canvas_label = "widget-canvas",
@@ -1562,7 +1662,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, capability, "media-transport")) break true;
     } else false;
     const engine = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         &app_state.model.tree,
         &storage,
         loaded.manifest.origins,
@@ -1577,7 +1677,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     app_state.model.engine = engine;
-    defer if (app_state.model.engine) |current| current.destroy(std.heap.page_allocator);
+    defer if (app_state.model.engine) |current| current.destroy(small_allocator);
     app_state.model.io = init.io;
     app_state.model.storage = &storage;
     app_state.model.origins = loaded.manifest.origins;
@@ -1722,6 +1822,7 @@ fn validateCapture(context: *anyopaque) !void {
     if (app_state.model.engine) |engine| {
         if (engine.renderFailed()) return error.CaptureWidgetFailed;
     }
+    if (depth_limit_exceeded) return error.CaptureWidgetFailed;
     reportCanvasLayoutMismatches(&app_state.model);
 }
 
@@ -2269,6 +2370,53 @@ test "painted boxes without a rounded utility project square corners, not the th
     var zero_ui = WidgetUi.init(arena_state.allocator());
     const built_zero = try zero_ui.finalize(buildNodeForTest(&zero_ui, &model, zero, true));
     try std.testing.expectEqual(@as(?f32, 0), built_zero.root.style.radius);
+}
+
+fn nestColumns(model: *Model, levels: usize, painted: bool) !tree_mod.NodeId {
+    var inner = try model.tree.createNode(.text);
+    for (0..levels) |_| {
+        const column = try model.tree.createNode(.column);
+        if (painted) try model.tree.setNumberProp(column, "radius", 4);
+        try model.tree.appendChild(column, inner);
+        inner = column;
+    }
+    return inner;
+}
+
+test "lowered depth counts painted layouts as two Native levels" {
+    var model: Model = .{};
+    // 31 plain columns around a text leaf is 32 levels, the most Native's
+    // layout accepts (receipt: weaver capture renders 31 and is blank at 32).
+    try std.testing.expectEqual(@as(usize, 32), loweredDepth(&model, try nestColumns(&model, 31, false)));
+    try std.testing.expectEqual(@as(usize, 33), loweredDepth(&model, try nestColumns(&model, 16, true)));
+    // A leaf's retained children are never built, so they add no depth.
+    const slider = try model.tree.createNode(.slider);
+    try model.tree.appendChild(slider, try nestColumns(&model, 40, false));
+    try std.testing.expectEqual(@as(usize, 1), loweredDepth(&model, slider));
+}
+
+test "a tree deeper than max_widget_depth shows a named error instead of building" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var model: Model = .{};
+    // Deep enough that building it would recurse far past the limit.
+    try model.tree.setRoot(try nestColumns(&model, 300, false));
+    // Pre-latch so the one-time diagnostic (a std.log.err, which fails a
+    // Zig test) is skipped here; `weaver capture` covers that line.
+    depth_limit_reported = true;
+    defer {
+        projection_failure_latched = false;
+        projection_failed_this_view = false;
+        depth_limit_exceeded = false;
+        depth_limit_reported = false;
+    }
+    var ui = WidgetUi.init(arena_state.allocator());
+    const built = try ui.finalize(view(&ui, &model));
+    try std.testing.expect(projection_failed_this_view);
+    try std.testing.expect(depth_limit_exceeded);
+    try std.testing.expectEqual(native_sdk.canvas.WidgetKind.panel, built.root.kind);
+    try std.testing.expectEqual(@as(usize, 1), built.root.children.len);
+    try std.testing.expect(std.mem.startsWith(u8, built.root.children[0].text, "WidgetDepthExceeded"));
 }
 
 test "panel lowers to a painted box around a column so children stack vertically" {

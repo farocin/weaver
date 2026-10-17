@@ -1,0 +1,1 @@
+fix: **Smaller Widget memory**: each Widget process now holds about 7.3 MiB of private working set instead of 11.4 MiB. The runtime no longer writes its retained tree's full 4.3 MB node and canvas capacity at startup, on a JavaScript rollback, or on a dev reload; only slots the Widget actually uses become resident.
