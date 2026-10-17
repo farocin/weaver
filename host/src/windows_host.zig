@@ -256,6 +256,8 @@ const HostRecord = extern struct {
 
     const magic_value: u32 = 0x5248_5657;
     const version_value: u32 = 1;
+    const state_running: u32 = 1;
+    const state_stopped: u32 = 2;
     /// The crash happened while that widget's own code ran.
     const crash_widget_turn: u32 = 1;
 
@@ -396,6 +398,28 @@ const Host = struct {
         const parsed = try registry.parse(self.allocator, bytes);
         defer parsed.deinit();
         try supervisor.reconcile(&self.slots, parsed.value.widgets, self);
+        self.pruneLedger();
+    }
+
+    /// Drop quarantines of widgets no longer registered: an uninstall ends
+    /// one, and the ledger holds at most one entry per registered widget,
+    /// so it never fills.
+    fn pruneLedger(self: *Host) void {
+        var pruned = false;
+        var index: usize = 0;
+        while (index < self.ledger.count) {
+            const name = self.ledger.entries[index].nameSlice();
+            const registered = for (&self.slots) |*slot| {
+                if (slot.used and std.mem.eql(u8, slot.name(), name)) break true;
+            } else false;
+            if (registered) {
+                index += 1;
+                continue;
+            }
+            self.ledger.remove(index);
+            pruned = true;
+        }
+        if (pruned) self.writeLedger();
     }
 
     pub fn running(self: *const Host, index: usize) bool {
@@ -640,7 +664,10 @@ const Host = struct {
     }
 
     fn quarantine(self: *Host, slot: *Slot, code: u32) void {
-        const artifact = self.artifactMtime(slot.source());
+        // The bundle that crashed is the one it was launched with
+        // (`markRunning` noted its time), not whatever is on disk now: a
+        // fixed bundle built while the old one ran must not inherit this.
+        const artifact = if (slot.artifact_mtime != 0) slot.artifact_mtime else self.artifactMtime(slot.source());
         slot.artifact_mtime = artifact;
         slot.state = .stopped;
         slot.setReason("quarantined: its code crashed the widget host (exception 0x{X:0>8}); reinstall or update it to run it again", .{code});
@@ -671,6 +698,8 @@ const Host = struct {
         if (read.len != bytes.len) return null;
         const record = std.mem.bytesToValue(HostRecord, &bytes);
         if (record.magic != HostRecord.magic_value or record.version != HostRecord.version_value or record.pid != pid) return null;
+        // `open` writes `running` last; anything else was never finished.
+        if (record.state != HostRecord.state_running and record.state != HostRecord.state_stopped) return null;
         var created: c.FILETIME = undefined;
         var unused: c.FILETIME = undefined;
         if (c.GetProcessTimes(process, &created, &unused, &unused, &unused) == 0) return null;

@@ -304,6 +304,9 @@ pub const Engine = struct {
         if (executing_engine == null) c.JS_UpdateStackTop(state.runtime);
         const previous_owner = state.heap.current;
         state.heap.current = self.owner;
+        // Teardown runs its code (a storage flush can call its toJSON): a
+        // crash here is this widget's, as in a turn.
+        if (self.crash_slot) |slot| crash_record.beginTurn(slot, self.crash_bundle);
         self.flushStorage();
         // Settling the bridge's outstanding callbacks can reject promises,
         // so its teardown comes before the rejections are released.
@@ -318,6 +321,7 @@ pub const Engine = struct {
         self.drainExceptions();
         c.JS_SetContextOpaque(self.context, null);
         c.JS_FreeContext(self.context);
+        if (self.crash_slot != null) crash_record.endTurn();
         // The realm's cycles, its queued jobs among them (the context owns
         // its job queue), go now, not at some later widget's GC, so the
         // range is empty before another engine takes it.

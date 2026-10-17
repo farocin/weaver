@@ -106,10 +106,13 @@ pub fn open(path: []const u8) !void {
     wide[length] = 0;
     const generic_read: u32 = 0x8000_0000;
     const generic_write: u32 = 0x4000_0000;
-    const share_all: u32 = 0x1 | 0x2 | 0x4;
+    // Readers (the daemon) and deletion may share it; another writer may
+    // not: two hosts on one record would mix one's identity with the
+    // other's crash. A second host runs without attribution instead.
+    const share_read_delete: u32 = 0x1 | 0x4;
     const open_always: u32 = 4;
-    const file = CreateFileW(&wide, generic_read | generic_write, share_all, null, open_always, 0, null);
-    if (file == windows.INVALID_HANDLE_VALUE) return error.OpenFailed;
+    const file = CreateFileW(&wide, generic_read | generic_write, share_read_delete, null, open_always, 0, null);
+    if (file == windows.INVALID_HANDLE_VALUE) return error.RecordInUse;
     defer _ = CloseHandle(file);
     // A mapping larger than the file extends it.
     const page_readwrite: u32 = 0x04;
