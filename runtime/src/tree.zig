@@ -266,6 +266,48 @@ pub const CanvasState = struct {
 /// Immediate canvas pixels have their own `canvas_generation`, so a draw-only
 /// frame does not trigger unrelated authored-tree work such as image-source
 /// synchronization.
+/// The heap slices a node owns, freed with it.
+const owned_slices = .{ "source", "icon_path", "background_gradient" };
+
+/// What an open authored batch changed, recorded as it happens so an abort
+/// can put it back: the tree's scalars and occupancy as the batch began, and
+/// each node and canvas as it was before the batch first touched it. Copying
+/// the whole tree at every batch kept a second 1,928-byte copy of every
+/// occupied node resident; this keeps only the nodes a batch touches,
+/// usually the one or two a render updates. The record lives in the tree;
+/// the prior values in `UndoStorage`, allocated with the first batch and
+/// touched only as far as a batch fills it.
+const Undo = struct {
+    root: ?NodeId = null,
+    generation: u64 = 0,
+    canvas_generation: u64 = 0,
+    next_node_lifetime: u64 = 1,
+    batch_changed: bool = false,
+    occupied: std.StaticBitSet(max_nodes) = .initEmpty(),
+    canvas_occupied: std.StaticBitSet(max_canvases) = .initEmpty(),
+    /// Nodes with a prior value in `storage.entries`.
+    saved: std.StaticBitSet(max_nodes) = .initEmpty(),
+    entry_count: usize = 0,
+    /// Canvases with a prior value at their own slot in `storage.canvases`.
+    saved_canvases: std.StaticBitSet(max_canvases) = .initEmpty(),
+    storage: ?*UndoStorage = null,
+
+    fn savedNode(self: *const Undo, index: usize) ?*const Node {
+        if (!self.saved.isSet(index)) return null;
+        for (self.storage.?.entries[0..self.entry_count]) |*entry| {
+            if (entry.index == index) return &entry.node;
+        }
+        unreachable;
+    }
+};
+
+const UndoStorage = struct {
+    entries: [max_nodes]Entry,
+    canvases: [max_canvases]CanvasState,
+
+    const Entry = struct { index: u16, node: Node };
+};
+
 pub const Tree = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     // Occupancy makes the large node arena a lazy reservation: never inspect
@@ -280,11 +322,15 @@ pub const Tree = struct {
     next_node_lifetime: u64 = 1,
     batch_depth: u8 = 0,
     batch_changed: bool = false,
-    transaction_snapshot: ?*Tree = null,
-    snapshot_storage: ?*Tree = null,
+    /// Rollback record of the open batch; see `Undo`.
+    undo: Undo = .{},
+    /// A batch is open and `undo` records what it changes.
+    recording: bool = false,
 
     pub fn deinit(self: *Tree) void {
-        self.destroySnapshots();
+        self.keepBatch();
+        if (self.undo.storage) |storage| self.allocator.destroy(storage);
+        self.undo.storage = null;
         self.deinitNodes();
     }
 
@@ -301,17 +347,19 @@ pub const Tree = struct {
 
     pub fn beginBatch(self: *Tree) Error!void {
         if (self.batch_depth == 0) {
-            const snapshot = if (self.snapshot_storage) |storage| reuse: {
-                self.snapshot_storage = null;
-                break :reuse storage;
-            } else try self.allocator.create(Tree);
-            errdefer {
-                snapshot.deinitNodes();
-                resetEmpty(snapshot, self.allocator);
-                self.snapshot_storage = snapshot;
-            }
-            try self.cloneInto(snapshot);
-            self.transaction_snapshot = snapshot;
+            if (self.undo.storage == null) self.undo.storage = try self.allocator.create(UndoStorage);
+            const undo = &self.undo;
+            undo.root = self.root;
+            undo.generation = self.generation;
+            undo.canvas_generation = self.canvas_generation;
+            undo.next_node_lifetime = self.next_node_lifetime;
+            undo.batch_changed = self.batch_changed;
+            undo.occupied = self.occupied;
+            undo.canvas_occupied = self.canvas_occupied;
+            undo.saved = .initEmpty();
+            undo.entry_count = 0;
+            undo.saved_canvases = .initEmpty();
+            self.recording = true;
         }
         self.batch_depth +|= 1;
     }
@@ -331,7 +379,7 @@ pub const Tree = struct {
             self.batch_changed = false;
             self.generation +%= 1;
         }
-        self.recycleSnapshot();
+        self.keepBatch();
     }
 
     pub fn endBatch(self: *Tree) void {
@@ -341,23 +389,81 @@ pub const Tree = struct {
 
     /// Restore the exact tree that was visible before the outermost authored
     /// batch. A JavaScript exception may occur after arbitrary create/remove/
-    /// prop operations; copying the bounded tree is deliberately boring and
-    /// makes the renderer's contract absolute: a failed generation is never
-    /// observable.
+    /// prop operations; every node and canvas the batch touched was recorded
+    /// first (`node`, `canvasState`, `createNode`), so a failed generation is
+    /// never observable.
     pub fn abortBatch(self: *Tree) void {
-        const snapshot = self.transaction_snapshot orelse {
+        if (!self.recording) {
             self.batch_depth = 0;
             self.batch_changed = false;
             return;
-        };
-        const allocator = self.allocator;
-        self.transaction_snapshot = null;
-        self.deinitNodes();
-        self.copyOccupiedFrom(snapshot);
-        self.transaction_snapshot = null;
-        self.snapshot_storage = snapshot;
-        rebaseInternalSlices(snapshot, self);
-        resetEmpty(snapshot, allocator);
+        }
+        self.recording = false;
+        const undo = &self.undo;
+        const storage = undo.storage.?;
+        // Free what the batch allocated: the slices of nodes it created, and
+        // slices that replaced a recorded node's.
+        var live = self.occupied.iterator(.{});
+        while (live.next()) |index| {
+            const prior = undo.savedNode(index);
+            if (prior == null and undo.occupied.isSet(index)) continue;
+            inline for (owned_slices) |field| {
+                const slice = @field(self.nodes[index], field);
+                if (slice.len > 0 and (prior == null or @field(prior.?, field).ptr != slice.ptr)) self.allocator.free(slice);
+            }
+        }
+        for (storage.entries[0..undo.entry_count]) |*entry| self.nodes[entry.index] = entry.node;
+        var canvases = undo.saved_canvases.iterator(.{});
+        while (canvases.next()) |slot| copyCanvas(&self.canvases[slot], &storage.canvases[slot]);
+        self.root = undo.root;
+        self.generation = undo.generation;
+        self.canvas_generation = undo.canvas_generation;
+        self.next_node_lifetime = undo.next_node_lifetime;
+        self.batch_changed = undo.batch_changed;
+        self.occupied = undo.occupied;
+        self.canvas_occupied = undo.canvas_occupied;
+        self.batch_depth = 0;
+    }
+
+    /// End the batch's recording, keeping what it did: a slice a recorded
+    /// node held before the batch and no longer holds is freed now.
+    fn keepBatch(self: *Tree) void {
+        if (!self.recording) return;
+        self.recording = false;
+        const undo = &self.undo;
+        for (undo.storage.?.entries[0..undo.entry_count]) |*entry| {
+            const current: ?*const Node = if (self.occupied.isSet(entry.index)) &self.nodes[entry.index] else null;
+            inline for (owned_slices) |field| {
+                const prior = @field(entry.node, field);
+                if (prior.len > 0 and (current == null or @field(current.?, field).ptr != prior.ptr)) self.allocator.free(prior);
+            }
+        }
+    }
+
+    /// Record node `index` as it was before the open batch first changes it.
+    /// Nodes the batch itself created need no record: the occupancy restore
+    /// drops them.
+    fn remember(self: *Tree, index: usize) void {
+        const undo = &self.undo;
+        if (undo.saved.isSet(index) or !undo.occupied.isSet(index)) return;
+        undo.saved.set(index);
+        undo.storage.?.entries[undo.entry_count] = .{ .index = @intCast(index), .node = self.nodes[index] };
+        undo.entry_count += 1;
+    }
+
+    fn rememberCanvas(self: *Tree, slot: usize) void {
+        const undo = &self.undo;
+        if (undo.saved_canvases.isSet(slot) or !undo.canvas_occupied.isSet(slot)) return;
+        undo.saved_canvases.set(slot);
+        copyCanvas(&undo.storage.?.canvases[slot], &self.canvases[slot]);
+    }
+
+    /// Free a slice a node lets go of, unless the open batch's record of the
+    /// node still holds it: the batch's end decides that one.
+    fn releaseSlice(self: *Tree, index: usize, comptime field: []const u8, slice: []u8) void {
+        if (slice.len == 0) return;
+        if (self.recording) if (self.undo.savedNode(index)) |prior| if (@field(prior, field).ptr == slice.ptr) return;
+        self.allocator.free(slice);
     }
 
     pub fn moveFrom(self: *Tree, source: *Tree) void {
@@ -443,14 +549,14 @@ pub const Tree = struct {
     /// error tree. This path has no fallible allocation, so even an OOM or
     /// exhausted authored budget cannot expose an uninitialized GPU surface.
     pub fn showError(self: *Tree, message: []const u8) void {
-        self.recycleSnapshot();
+        self.keepBatch();
         self.deinitNodes();
         const allocator = self.allocator;
-        const snapshot_storage = self.snapshot_storage;
+        const undo_storage = self.undo.storage;
         const next_generation = self.generation +% 1;
         resetEmpty(self, allocator);
         self.generation = next_generation;
-        self.snapshot_storage = snapshot_storage;
+        self.undo.storage = undo_storage;
 
         const root_id: NodeId = 1;
         const text_id: NodeId = 2;
@@ -488,79 +594,6 @@ pub const Tree = struct {
         self.root = root_id;
     }
 
-    fn cloneInto(self: *const Tree, destination: *Tree) Error!void {
-        resetEmpty(destination, self.allocator);
-        destination.root = self.root;
-        destination.generation = self.generation;
-        destination.canvas_generation = self.canvas_generation;
-        destination.next_node_lifetime = self.next_node_lifetime;
-        destination.batch_depth = self.batch_depth;
-        destination.batch_changed = self.batch_changed;
-        errdefer destination.deinitNodes();
-        for (&self.nodes, 0..) |*node_value, index| {
-            if (!self.occupied.isSet(index)) continue;
-            destination.nodes[index] = node_value.*;
-            destination.nodes[index].source = &.{};
-            destination.nodes[index].icon_path = &.{};
-            destination.nodes[index].background_gradient = &.{};
-            destination.occupied.set(index);
-            if (node_value.source.len > 0) {
-                destination.nodes[index].source = try self.allocator.dupe(u8, node_value.source);
-            }
-            if (node_value.icon_path.len > 0) {
-                destination.nodes[index].icon_path = try self.allocator.dupe(u8, node_value.icon_path);
-            }
-            if (node_value.background_gradient.len > 0) {
-                destination.nodes[index].background_gradient = try self.allocator.dupe(u8, node_value.background_gradient);
-            }
-        }
-        for (&self.canvases, 0..) |*canvas, index| {
-            if (!self.canvas_occupied.isSet(index)) continue;
-            const copy = &destination.canvases[index];
-            resetCanvas(copy);
-            copy.owner = canvas.owner;
-            copy.layout_width = canvas.layout_width;
-            copy.layout_height = canvas.layout_height;
-            copy.command_layout_width = canvas.command_layout_width;
-            copy.command_layout_height = canvas.command_layout_height;
-            copy.command_count = canvas.command_count;
-            copy.point_count = canvas.point_count;
-            copy.fingerprint = canvas.fingerprint;
-            @memcpy(copy.commands[0..canvas.command_count], canvas.commands[0..canvas.command_count]);
-            @memcpy(copy.points[0..canvas.point_count], canvas.points[0..canvas.point_count]);
-            destination.canvas_occupied.set(index);
-        }
-        rebaseInternalSlices(self, destination);
-    }
-
-    fn recycleSnapshot(self: *Tree) void {
-        const snapshot = self.transaction_snapshot orelse return;
-        self.transaction_snapshot = null;
-        snapshot.transaction_snapshot = null;
-        snapshot.snapshot_storage = null;
-        snapshot.deinitNodes();
-        resetEmpty(snapshot, self.allocator);
-        std.debug.assert(self.snapshot_storage == null);
-        self.snapshot_storage = snapshot;
-    }
-
-    fn destroySnapshots(self: *Tree) void {
-        if (self.transaction_snapshot) |snapshot| {
-            self.transaction_snapshot = null;
-            snapshot.transaction_snapshot = null;
-            snapshot.snapshot_storage = null;
-            snapshot.deinitNodes();
-            self.allocator.destroy(snapshot);
-        }
-        if (self.snapshot_storage) |snapshot| {
-            self.snapshot_storage = null;
-            snapshot.transaction_snapshot = null;
-            snapshot.snapshot_storage = null;
-            snapshot.deinitNodes();
-            self.allocator.destroy(snapshot);
-        }
-    }
-
     pub fn createNode(self: *Tree, kind: Kind) Error!NodeId {
         for (&self.nodes, 0..) |*slot, index| {
             if (self.occupied.isSet(index)) continue;
@@ -570,6 +603,10 @@ pub const Tree = struct {
                     _ = canvas;
                     if (!self.canvas_occupied.isSet(candidate)) break candidate;
                 } else return error.CanvasLimit;
+            }
+            if (self.recording) {
+                self.remember(index);
+                if (canvas_index) |canvas_slot| self.rememberCanvas(canvas_slot);
             }
             slot.* = .{ .lifetime = self.next_node_lifetime, .kind = kind };
             self.occupied.set(index);
@@ -588,11 +625,15 @@ pub const Tree = struct {
         return error.NodeLimit;
     }
 
+    /// A node to change: an open batch records it first, so the pointer is
+    /// for changes within the batch it was taken in (one taken earlier and
+    /// written during a batch would escape the record). Reads use
+    /// `nodeConst`.
     pub fn node(self: *Tree, id: NodeId) Error!*Node {
         if (id == 0 or id > max_nodes) return error.InvalidNode;
         if (!self.occupied.isSet(id - 1)) return error.InvalidNode;
-        const result = &self.nodes[id - 1];
-        return result;
+        if (self.recording) self.remember(id - 1);
+        return &self.nodes[id - 1];
     }
 
     pub fn nodeConst(self: *const Tree, id: NodeId) Error!*const Node {
@@ -753,7 +794,7 @@ pub const Tree = struct {
         const target = try self.node(id);
         if (std.mem.eql(u8, target.backgroundGradientSlice(), value)) return;
         const replacement = try self.allocator.dupe(u8, value);
-        if (target.background_gradient.len > 0) self.allocator.free(target.background_gradient);
+        self.releaseSlice(id - 1, "background_gradient", target.background_gradient);
         target.background_gradient = replacement;
         self.changed();
     }
@@ -924,7 +965,7 @@ pub const Tree = struct {
         const target = try self.node(id);
         if (std.mem.eql(u8, target.sourceSlice(), value)) return;
         const replacement = try self.allocator.dupe(u8, value);
-        if (target.source.len > 0) self.allocator.free(target.source);
+        self.releaseSlice(id - 1, "source", target.source);
         target.source = replacement;
         self.changed();
     }
@@ -934,7 +975,7 @@ pub const Tree = struct {
         const target = try self.node(id);
         if (std.mem.eql(u8, target.iconPathSlice(), value)) return;
         const replacement = try self.allocator.dupe(u8, value);
-        if (target.icon_path.len > 0) self.allocator.free(target.icon_path);
+        self.releaseSlice(id - 1, "icon_path", target.icon_path);
         target.icon_path = replacement;
         self.changed();
     }
@@ -970,9 +1011,12 @@ pub const Tree = struct {
         self.changed();
     }
 
+    /// A canvas to change; like `node`, recorded when taken, so the pointer is
+    /// for changes within the batch it was taken in.
     pub fn canvasState(self: *Tree, id: NodeId) Error!*CanvasState {
-        const target = try self.node(id);
+        const target = try self.nodeConst(id);
         if (target.kind != .canvas or target.canvas_slot == 0) return error.InvalidNode;
+        if (self.recording) self.rememberCanvas(target.canvas_slot - 1);
         return &self.canvases[target.canvas_slot - 1];
     }
 
@@ -1080,8 +1124,8 @@ pub const Tree = struct {
 
     pub fn appendChild(self: *Tree, parent_id: NodeId, child_id: NodeId) Error!void {
         if (parent_id == child_id or try self.isAncestor(child_id, parent_id)) return error.Cycle;
-        const parent = try self.node(parent_id);
-        _ = try self.node(child_id);
+        const parent = try self.nodeConst(parent_id);
+        _ = try self.nodeConst(child_id);
         for (parent.children[0..parent.child_count]) |existing| {
             if (existing == child_id) return;
         }
@@ -1098,14 +1142,14 @@ pub const Tree = struct {
     /// `before_id` means append, matching the reconciler's end sentinel.
     pub fn insertBefore(self: *Tree, parent_id: NodeId, child_id: NodeId, before_id: NodeId) Error!void {
         if (parent_id == child_id or try self.isAncestor(child_id, parent_id)) return error.Cycle;
-        _ = try self.node(parent_id);
-        _ = try self.node(child_id);
+        _ = try self.nodeConst(parent_id);
+        _ = try self.nodeConst(child_id);
         if (before_id != 0) {
-            const before = try self.node(before_id);
+            const before = try self.nodeConst(before_id);
             if (before.parent != parent_id or before_id == child_id) return error.InvalidNode;
         }
-        const original_parent = (try self.node(child_id)).parent;
-        const parent = try self.node(parent_id);
+        const original_parent = (try self.nodeConst(child_id)).parent;
+        const parent = try self.nodeConst(parent_id);
         var original_index: ?usize = null;
         if (original_parent == parent_id) {
             for (parent.children[0..parent.child_count], 0..) |candidate, index| {
@@ -1146,7 +1190,7 @@ pub const Tree = struct {
     }
 
     pub fn setRoot(self: *Tree, id: NodeId) Error!void {
-        _ = try self.node(id);
+        _ = try self.nodeConst(id);
         if (self.root == id) return;
         self.root = id;
         self.changed();
@@ -1171,10 +1215,13 @@ pub const Tree = struct {
         var children: [max_children]NodeId = undefined;
         @memcpy(children[0..count], target.children[0..count]);
         for (children[0..count]) |child_id| self.removeSubtree(child_id);
-        if (target.canvas_slot > 0) self.canvas_occupied.unset(target.canvas_slot - 1);
-        if (target.source.len > 0) self.allocator.free(target.source);
-        if (target.icon_path.len > 0) self.allocator.free(target.icon_path);
-        if (target.background_gradient.len > 0) self.allocator.free(target.background_gradient);
+        if (target.canvas_slot > 0) {
+            // Recorded before its slot is let go: an abort, even after the
+            // tree moved (which copies only occupied slots), restores it.
+            if (self.recording) self.rememberCanvas(target.canvas_slot - 1);
+            self.canvas_occupied.unset(target.canvas_slot - 1);
+        }
+        inline for (owned_slices) |field| self.releaseSlice(id - 1, field, @field(target, field));
         self.occupied.unset(id - 1);
     }
 
@@ -1182,7 +1229,7 @@ pub const Tree = struct {
         var cursor: ?NodeId = descendant;
         while (cursor) |id| {
             if (id == ancestor) return true;
-            cursor = (try self.node(id)).parent;
+            cursor = (try self.nodeConst(id)).parent;
         }
         return false;
     }
@@ -1221,25 +1268,46 @@ pub fn resetEmpty(tree: *Tree, allocator: std.mem.Allocator) void {
     tree.next_node_lifetime = 1;
     tree.batch_depth = 0;
     tree.batch_changed = false;
-    tree.transaction_snapshot = null;
-    tree.snapshot_storage = null;
+    tree.undo = .{};
+    tree.recording = false;
 }
 
 fn rebaseInternalSlices(source: *const Tree, destination: *Tree) void {
     for (&destination.canvases, 0..) |*canvas, canvas_index| {
         if (!destination.canvas_occupied.isSet(canvas_index)) continue;
-        const source_canvas = &source.canvases[canvas_index];
-        for (canvas.commands[0..canvas.command_count]) |*command| {
-            switch (command.*) {
-                .polyline => |polyline| {
-                    const byte_offset = @intFromPtr(polyline.points.ptr) - @intFromPtr(&source_canvas.points);
-                    const point_offset = byte_offset / @sizeOf(native_sdk.geometry.PointF);
-                    command.polyline.points = canvas.points[point_offset .. point_offset + polyline.points.len];
-                },
-                else => {},
-            }
+        rebaseCanvas(canvas, &source.canvases[canvas_index]);
+    }
+}
+
+/// Point `canvas`'s polylines at its own points instead of `source`'s,
+/// after its commands were copied from there.
+fn rebaseCanvas(canvas: *CanvasState, source: *const CanvasState) void {
+    for (canvas.commands[0..canvas.command_count]) |*command| {
+        switch (command.*) {
+            .polyline => |polyline| {
+                const byte_offset = @intFromPtr(polyline.points.ptr) - @intFromPtr(&source.points);
+                const point_offset = byte_offset / @sizeOf(native_sdk.geometry.PointF);
+                command.polyline.points = canvas.points[point_offset .. point_offset + polyline.points.len];
+            },
+            else => {},
         }
     }
+}
+
+/// Copy a canvas's live commands and points, without the unused capacity.
+fn copyCanvas(destination: *CanvasState, source: *const CanvasState) void {
+    resetCanvas(destination);
+    destination.owner = source.owner;
+    destination.layout_width = source.layout_width;
+    destination.layout_height = source.layout_height;
+    destination.command_layout_width = source.command_layout_width;
+    destination.command_layout_height = source.command_layout_height;
+    destination.command_count = source.command_count;
+    destination.point_count = source.point_count;
+    destination.fingerprint = source.fingerprint;
+    @memcpy(destination.commands[0..source.command_count], source.commands[0..source.command_count]);
+    @memcpy(destination.points[0..source.point_count], source.points[0..source.point_count]);
+    rebaseCanvas(destination, source);
 }
 
 fn validUtf8Prefix(value: []const u8, maximum: usize) usize {
@@ -1497,7 +1565,7 @@ test "a committed render batch advances one generation" {
     try std.testing.expectEqualStrings("committed", (try tree.nodeConst(label)).textSlice());
 }
 
-test "render transactions reuse snapshot storage and validate only the outer close" {
+test "render transactions reuse undo storage and validate only the outer close" {
     var tree: Tree = .{ .allocator = std.testing.allocator };
     defer tree.deinit();
     const root = try tree.createNode(.column);
@@ -1514,11 +1582,111 @@ test "render transactions reuse snapshot storage and validate only the outer clo
     try std.testing.expect(tree.canvasOpacityAncestorViolation() == null);
     tree.commitBatch();
 
-    const storage = tree.snapshot_storage.?;
+    const storage = tree.undo.storage.?;
     try tree.beginBatch();
-    try std.testing.expect(tree.transaction_snapshot.? == storage);
+    try std.testing.expect(tree.undo.storage.? == storage);
     tree.abortBatch();
-    try std.testing.expect(tree.snapshot_storage.? == storage);
+    try std.testing.expect(tree.undo.storage.? == storage);
+}
+
+test "a batch records only the nodes it changes" {
+    var tree: Tree = .{ .allocator = std.testing.allocator };
+    defer tree.deinit();
+    const root = try tree.createNode(.column);
+    try tree.setRoot(root);
+    var labels: [40]NodeId = undefined;
+    for (&labels) |*label| {
+        label.* = try tree.createNode(.text);
+        try tree.appendChild(root, label.*);
+    }
+    try tree.beginBatch();
+    try tree.setText(labels[7], "12:01");
+    try tree.appendChild(root, labels[3]);
+    try std.testing.expectEqual(@as(usize, 1), tree.undo.entry_count);
+    tree.endBatch();
+    try std.testing.expectEqualStrings("12:01", (try tree.nodeConst(labels[7])).textSlice());
+}
+
+test "a batch frees what it replaced on commit and what it allocated on abort" {
+    for ([_]bool{ true, false }) |commit| {
+        var tree: Tree = .{ .allocator = std.testing.allocator };
+        defer tree.deinit();
+        const root = try tree.createNode(.column);
+        const kept = try tree.createNode(.image);
+        const removed = try tree.createNode(.image);
+        try tree.setSource(kept, "kept-before.png");
+        try tree.setSource(removed, "removed-before.png");
+        try tree.appendChild(root, kept);
+        try tree.appendChild(root, removed);
+        try tree.setRoot(root);
+
+        try tree.beginBatch();
+        try tree.setSource(kept, "kept-middle.png");
+        try tree.setSource(kept, "kept-after.png");
+        try tree.removeNode(removed);
+        // The removed node's slot is reused by a node the batch creates.
+        const created = try tree.createNode(.image);
+        try std.testing.expectEqual(removed, created);
+        try tree.setSource(created, "created.png");
+        try tree.appendChild(root, created);
+        if (commit) tree.endBatch() else tree.abortBatch();
+
+        if (commit) {
+            try std.testing.expectEqualStrings("kept-after.png", (try tree.nodeConst(kept)).sourceSlice());
+            try std.testing.expectEqualStrings("created.png", (try tree.nodeConst(created)).sourceSlice());
+        } else {
+            try std.testing.expectEqualStrings("kept-before.png", (try tree.nodeConst(kept)).sourceSlice());
+            try std.testing.expectEqualStrings("removed-before.png", (try tree.nodeConst(removed)).sourceSlice());
+            try std.testing.expectEqual(@as(usize, 2), (try tree.nodeConst(root)).child_count);
+        }
+        // std.testing.allocator fails the test on a leak or a double free.
+    }
+}
+
+test "aborting restores a canvas whose slot the batch reused" {
+    var tree: Tree = .{ .allocator = std.testing.allocator };
+    defer tree.deinit();
+    const root = try tree.createNode(.column);
+    const canvas = try tree.createNode(.canvas);
+    try tree.appendChild(root, canvas);
+    try tree.setRoot(root);
+    try tree.setCanvasCommands(canvas, &.{ 5, 1, 0xffffffff, 2, 1, 2, 3, 4 });
+
+    try tree.beginBatch();
+    try tree.removeNode(canvas);
+    const replacement = try tree.createNode(.canvas);
+    try tree.setCanvasCommands(replacement, &.{ 1, 7, 8, 9, 10, 0xff0000ff });
+    tree.abortBatch();
+
+    const restored = try tree.canvasStateConst(canvas);
+    try std.testing.expectEqual(@as(usize, 1), restored.command_count);
+    try std.testing.expectEqual(@as(f32, 1), restored.commands[0].polyline.points[0].x);
+    try std.testing.expectEqual(@as(f32, 4), restored.commands[0].polyline.points[1].y);
+    try std.testing.expect(@intFromPtr(restored.commands[0].polyline.points.ptr) == @intFromPtr(&restored.points));
+}
+
+test "aborting after the tree moved restores a canvas the batch removed" {
+    var tree: Tree = .{ .allocator = std.testing.allocator };
+    defer tree.deinit();
+    const root = try tree.createNode(.column);
+    const canvas = try tree.createNode(.canvas);
+    try tree.appendChild(root, canvas);
+    try tree.setRoot(root);
+    try tree.setCanvasCommands(canvas, &.{ 5, 1, 0xffffffff, 2, 1, 2, 3, 4 });
+
+    try tree.beginBatch();
+    try tree.removeNode(canvas);
+    const moved = try std.testing.allocator.create(Tree);
+    defer std.testing.allocator.destroy(moved);
+    resetEmpty(moved, std.testing.allocator);
+    moved.moveFrom(&tree);
+    defer moved.deinit();
+    moved.abortBatch();
+
+    const restored = try moved.canvasStateConst(canvas);
+    try std.testing.expectEqual(@as(usize, 2), restored.point_count);
+    try std.testing.expectEqual(@as(f32, 4), restored.commands[0].polyline.points[1].y);
+    try std.testing.expect(@intFromPtr(restored.commands[0].polyline.points.ptr) == @intFromPtr(&restored.points));
 }
 
 test "error surface is deterministic and replaces authored content" {

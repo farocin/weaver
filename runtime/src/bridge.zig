@@ -297,7 +297,7 @@ fn setRoot(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSVal
 fn beginBatch(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, _: [*c]c.JSValueConst) callconv(.c) c.JSValue {
     const js = ctx orelse return qjs.exceptionValue();
     if (argc != 0) return fail(js, "beginBatch expects no arguments");
-    state(js).tree.beginBatch() catch return fail(js, "render transaction could not snapshot the last committed tree");
+    state(js).tree.beginBatch() catch return fail(js, "render transaction could not allocate its rollback record");
     return qjs.undefinedValue();
 }
 
