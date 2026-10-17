@@ -72,10 +72,11 @@ const Shared = struct {
 
 var shared: ?Shared = null;
 
-/// Shared realm (WEAVER_SHARED_REALM=1 in a hosted runtime): every widget
+/// Shared realm (the runtime's default; `--own-realms` turns it off): every widget
 /// runs in one realm whose built-ins are frozen, with globals of its own
 /// (`Globals`, swapped into the context for its turns) and only its own
-/// promise jobs (`jobTag`). Set before the first engine is created.
+/// promise jobs (`jobTag`). Set before the first engine is created: the
+/// runtime's `main` sets it, and tests that want it set it themselves.
 pub var shared_realm_enabled = false;
 
 /// Makes the few prototype properties programs routinely shadow by
