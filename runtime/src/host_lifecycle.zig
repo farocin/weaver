@@ -72,7 +72,10 @@ pub const Verb = enum {
 /// stops it: weaverd's grace, which a host stopping cleanly meets with room
 /// (step 4 receipt: `weaver down` took about 490 ms end to end).
 pub const down_grace_ms: u32 = 4_000;
-/// How long `--down` waits for a host it stopped to be gone.
+/// How long `--down` waits for a host it stopped to be gone. Receipt
+/// (2026-10-17, weaver-step5-scratch/gt-down*): stopping a crashed host
+/// that Windows was still reporting, the whole `weaver down` took 4.42-4.52
+/// s, 4 s of it the grace and most of the rest node starting.
 const terminate_wait_ms: u32 = 1_000;
 /// How long a client waits for the lifecycle lock. Its longest holder is
 /// another `--down` (`down_grace_ms` plus `terminate_wait_ms`, 5 s); 10 s is

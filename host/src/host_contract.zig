@@ -203,9 +203,10 @@ pub fn nameHash(name: []const u8) u64 {
 /// Host slots the record names: the runtime's `max_host_widgets`, which
 /// pins it (runtime/src/main.zig).
 pub const record_slots: usize = 32;
-/// A startup error's name, as `@errorName` gives it. The longest error a
-/// daemon host's startup returns today is 24 bytes (RendererStartupFailed
-/// class); 48 leaves 2x, and a longer one is cut, not lost.
+/// A startup error's name, as `@errorName` gives it. The longest error name
+/// in the runtime, Native and host sources is 40 bytes
+/// (CaptureProviderFixtureCapabilityRequired, 2026-10-17); 48 holds it, and
+/// a longer one is cut, not lost.
 pub const stop_reason_bytes: usize = 48;
 
 /// `%LOCALAPPDATA%\weaver\host.record`, which the host keeps mapped
