@@ -24,7 +24,8 @@
 //! the registry, reconciling it, and starting widgets. So it answers status
 //! even while a widget's load holds the UI thread. A job holds `state_lock`
 //! while it changes the daemon's state, and lets go of it while it waits on
-//! the UI thread or on `node`, so status can be written meanwhile. The
+//! the UI thread, on `node` or on a dev widget's connection, so status can
+//! be written meanwhile. The
 //! worker also keeps std.Io's Windows file calls, whose 256-512 KiB stack
 //! frames would stay resident on a long-lived thread, off the management
 //! thread.
@@ -320,8 +321,8 @@ pub const Daemon = struct {
     registry_failure_len: usize = 0,
     /// Held by whichever thread changes or reads the state below the
     /// paths: the management thread while it writes status or stops, and
-    /// a job while it runs, except while it waits on the UI thread or on
-    /// `node`.
+    /// a job while it runs, except while it waits on the UI thread, on
+    /// `node` or on a dev widget's connection.
     state_lock: win.SRWLOCK = std.mem.zeroes(win.SRWLOCK),
     /// The job running on the worker, if one is.
     worker: ?std.Thread = null,
@@ -957,13 +958,21 @@ pub const Daemon = struct {
         const dist = self.distPath(slot) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
         defer self.allocator.free(dist);
         var backend: [max_path_bytes]u8 = undefined;
-        const pid = self.options.devs.launch(.{
+        const request: dev_widgets.Launch = .{
             .id = self.slotIndex(slot),
             .dir = dist,
             .backend = self.backendPath(slot, &backend) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err),
             .wants = wantsOf(slot),
             .gpu = slot.wants_gpu,
-        }) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
+        };
+        // Its process may take up to dev_widgets.connect_timeout_ms to open
+        // its provider pipe: status is answered meanwhile, showing it
+        // starting. The request holds copies; DevWidgets touches only this
+        // id, and the management thread only ids already running.
+        self.unlockState();
+        const launched = self.options.devs.launch(request);
+        self.lockState();
+        const pid = launched catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
         slot.platform.dev_running = true;
         slot.platform.pid = pid;
         self.markSlotRunning(slot, now_ms);
