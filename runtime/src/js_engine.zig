@@ -7,6 +7,7 @@ const tree_mod = @import("tree.zig");
 const storage_mod = @import("storage.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const js_heap = @import("js_heap.zig");
+const crash_record = @import("crash_record.zig");
 const c = qjs.c;
 
 // QuickJS receipt (2026-07-29): a synthetic worst-good retained view with
@@ -229,6 +230,11 @@ pub const Engine = struct {
     provider: *provider_mod.Client,
     deadline_ms: u64 = 0,
     executing: bool = false,
+    /// The widget's slot in the host, for the crash record: a crash during
+    /// one of its turns names it (`crash_record`). Null outside a host.
+    crash_slot: ?u16 = null,
+    /// Wyhash of the widget's bundle, recorded with its turns.
+    crash_bundle: u64 = 0,
     capture_clock_ms: ?u64 = null,
     pending_rejections: [max_pending_rejections]PendingRejection = [_]PendingRejection{.{}} ** max_pending_rejections,
 
@@ -244,6 +250,11 @@ pub const Engine = struct {
         const self = allocator.create(Engine) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
         const state = acquireShared() catch return error.OutOfMemory;
+        // Building the realm and installing the bridge run QuickJS code
+        // outside a turn, possibly on a thread other than the last turn's
+        // (a widget the daemon adds loads on its own thread): measure the
+        // recursion guard from here, as `beginTurn` does.
+        if (executing_engine == null) c.JS_UpdateStackTop(state.runtime);
         const owner = state.heap.acquireOwner() orelse return error.OutOfMemory;
         state.gc_settle.set(owner);
         state.engines += 1;
@@ -288,8 +299,14 @@ pub const Engine = struct {
 
     pub fn destroy(self: *Engine, allocator: std.mem.Allocator) void {
         const state = &shared.?;
+        // Teardown runs widget code outside a turn, maybe on another thread
+        // than the last turn (see `create`).
+        if (executing_engine == null) c.JS_UpdateStackTop(state.runtime);
         const previous_owner = state.heap.current;
         state.heap.current = self.owner;
+        // Teardown runs its code (a storage flush can call its toJSON): a
+        // crash here is this widget's, as in a turn.
+        if (self.crash_slot) |slot| crash_record.beginTurn(slot, self.crash_bundle);
         self.flushStorage();
         // Settling the bridge's outstanding callbacks can reject promises,
         // so its teardown comes before the rejections are released.
@@ -304,6 +321,7 @@ pub const Engine = struct {
         self.drainExceptions();
         c.JS_SetContextOpaque(self.context, null);
         c.JS_FreeContext(self.context);
+        if (self.crash_slot != null) crash_record.endTurn();
         // The realm's cycles, its queued jobs among them (the context owns
         // its job queue), go now, not at some later widget's GC, so the
         // range is empty before another engine takes it.
@@ -606,12 +624,14 @@ pub const Engine = struct {
         self.executing = true;
         executing_engine = self;
         heap().current = self.owner;
+        if (self.crash_slot) |slot| crash_record.beginTurn(slot, self.crash_bundle);
     }
 
     fn endTurn(self: *Engine) void {
         // The runtime's pending-exception slot is shared by every widget:
         // nothing of this turn may be left in it for the next one.
         self.drainExceptions();
+        crash_record.endTurn();
         self.executing = false;
         executing_engine = null;
         heap().current = heap().hostOwner();
@@ -944,6 +964,48 @@ test "unhandled promise rejection is visible while a handled rejection stays hea
     defer handled.destroy(std.testing.allocator);
     try handled.evaluate("Promise.reject(new Error('expected')).catch(() => {});", "handled-promise-test.js");
     try std.testing.expect(!handled.renderFailed());
+}
+
+test "a widget unloads at once while a request of its waits on a server that never answers" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    // Accepts the connection and never answers the TLS handshake.
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const Silent = struct {
+        fn run(listener: *std.Io.net.Server, stream: *?std.Io.net.Stream, accepted: *std.atomic.Value(bool)) void {
+            stream.* = listener.accept(std.testing.io) catch null;
+            accepted.store(true, .release);
+        }
+    };
+    var held: ?std.Io.net.Stream = null;
+    var accepted = std.atomic.Value(bool).init(false);
+    const acceptor = try std.Thread.spawn(.{}, Silent.run, .{ &server, &held, &accepted });
+    defer {
+        acceptor.join();
+        // Closing the connection lets the orphaned request finish and free
+        // itself on its own thread.
+        if (held) |stream| stream.close(io);
+    }
+    const port = server.socket.address.getPort();
+    var origin_buffer: [32]u8 = undefined;
+    const origin = try std.fmt.bufPrint(&origin_buffer, "127.0.0.1:{d}", .{port});
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const origins = [_][]const u8{origin};
+    const engine = try Engine.create(std.testing.allocator, &widgets.trees[0], &widgets.store, &origins, &widgets.provider, false, false);
+    var script_buffer: [160]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buffer, "native.fetch(\"https://127.0.0.1:{d}/\", \"GET\", \"{{}}\", \"\");", .{port});
+    try engine.evaluate(script, "fetch.js");
+    const deadline = platform.monotonicMilliseconds() + 5_000;
+    while (!accepted.load(.acquire) and platform.monotonicMilliseconds() < deadline) std.Thread.yield() catch {};
+    try std.testing.expect(accepted.load(.acquire));
+    const started = platform.monotonicMilliseconds();
+    engine.destroy(std.testing.allocator);
+    // It did not wait for WinHTTP's timeout, or for the server.
+    try std.testing.expect(platform.monotonicMilliseconds() - started < 1_000);
 }
 
 test "a widget at its memory cap leaves its neighbour's realm untouched" {
