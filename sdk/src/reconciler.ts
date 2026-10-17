@@ -1258,7 +1258,7 @@ function requireProvider(name: ProviderName, hook: "useProvider" | "useProviderS
     throw new Error(`${hook}("${name}") requires subscribe: ["${name}"] in the widget config`);
   }
   if (name !== "time" && !native.hostAvailable()) {
-    throw new Error(`Provider "${name}" requires weaverd; run "weaver up"`);
+    throw new Error(`Provider "${name}" requires the Weaver host; run "weaver up"`);
   }
 }
 

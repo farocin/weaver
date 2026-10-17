@@ -52,6 +52,11 @@ pub const max_subscribers: usize = 64;
 /// How often the system sampler runs while anything subscribes: weaverd's
 /// cadence, which `percent` frames were designed around.
 const system_interval_ms: u64 = 1000;
+
+/// Set by `native.testCrash("provider")` in `-Dautomation-seam` builds
+/// (bridge.zig): the system provider's worker faults at its next sample, so
+/// a crash on a provider thread can be tested on a real host.
+pub var test_crash_requested: std.atomic.Value(bool) = .init(false);
 /// How often the audio worker polls the capture while anything subscribes:
 /// weaverd's wait while it had an audio subscriber. The provider paces its
 /// own 30 Hz frames (audio.zig advanceDeadline) on top of this.
@@ -571,6 +576,10 @@ pub fn ServiceType(comptime Sources: type) type {
                     continue;
                 }
                 next_ms = now + system_interval_ms;
+                if (@import("weaver_build_options").automation_seam and test_crash_requested.load(.acquire)) {
+                    const nowhere: *allowzero volatile u32 = @ptrFromInt(0);
+                    nowhere.* = 1;
+                }
                 self.publishSystem(self.sources.sampleSystem());
             }
         }

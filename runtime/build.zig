@@ -46,6 +46,11 @@ pub fn build(b: *std.Build) void {
     if (os_tag != .windows and os_tag != .macos and !portable_verification_host) {
         @panic("weaver-widget ships only on Windows and macOS; use -Dplatform=null for portable Linux verification");
     }
+    // The daemon host has no console window (ADR 0022 step 5): Windows
+    // restarts a crashed console program in a new, visible console. Every
+    // mode of the runtime shares this executable; a parent that wants its
+    // output (capture, the CLI's client verbs) passes it handles.
+    if (os_tag == .windows) artifacts.exe.subsystem = .Windows;
     const c_flags: []const []const u8 = switch (os_tag) {
         .windows => &.{
             "-std=c11",
@@ -105,8 +110,9 @@ pub fn build(b: *std.Build) void {
 fn addPlatformLinkage(b: *std.Build, compile: *std.Build.Step.Compile, os_tag: std.Target.Os.Tag, is_test: bool) void {
     const target = compile.root_module.resolved_target.?;
     const optimize = compile.root_module.optimize;
-    // What weaverd and the widget host agree on: the control objects' names,
-    // the host's exit codes and its record's layout.
+    // What the Windows widget host and the CLI's client verbs agree on: the
+    // control objects' names, the lifecycle lock, the host's exit codes and
+    // its record's layout.
     compile.root_module.addImport("host_contract", b.createModule(.{
         .root_source_file = b.path("../host/src/host_contract.zig"),
         .target = target,
