@@ -497,6 +497,33 @@ test "diagnostic truncation preserves UTF-8 boundaries" {
     try std.testing.expectEqualStrings(details, validUtf8Prefix(details, details.len));
 }
 
+test "replacing Error.stackTraceLimit releases the value it replaced" {
+    var tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
+    defer tree.deinit();
+    var provider: provider_mod.Client = .{};
+    try provider.init(std.testing.io, null);
+    defer provider.deinit();
+    var store: storage_mod.Store = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .directory = ".",
+        .path = "weaver-js-engine-test-storage.json",
+        .temporary_path = "weaver-js-engine-test-storage.tmp",
+    };
+    const engine = try createTestEngine(&tree, &store, &provider);
+    defer engine.destroy(std.testing.allocator);
+
+    const before = engine.memoryUsage().malloc_size;
+    // Each assignment used to keep the value it replaced alive for good.
+    try engine.evaluate(
+        \\Error.stackTraceLimit = new ArrayBuffer(4 * 1024 * 1024);
+        \\Error.stackTraceLimit = 10;
+    , "stack-trace-limit.js");
+    c.JS_RunGC(engine.runtime);
+    const after = engine.memoryUsage().malloc_size;
+    try std.testing.expect(after < before + 1024 * 1024);
+}
+
 test "capture mode bridge capability is runtime-owned" {
     var tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
     defer tree.deinit();
