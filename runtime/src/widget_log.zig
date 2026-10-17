@@ -1,4 +1,5 @@
 const std = @import("std");
+const small_fs = @import("small_fs.zig");
 const platform = @import("platform/root.zig");
 
 // Log receipt (2026-07-29): one runtime diagnostic is capped at 6,000 detail
@@ -23,8 +24,20 @@ pub const Sink = struct {
 /// (or after the last one is gone) are dropped, as before `init`.
 var current: ?*Sink = null;
 
+/// Set on a thread that runs no widget's code (the host's provider
+/// threads): `current` belongs to the UI thread, which may switch or free
+/// it at any moment, so this thread's lines are dropped instead.
+threadlocal var detached = false;
+
+/// The calling thread runs no widget's code; see `detached`.
+pub fn detachThread() void {
+    detached = true;
+}
+
 pub fn init(sink: *Sink, runtime_io: std.Io, path: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+    // Two short paths: the C heap packs them; `page_allocator` rounded each
+    // to its own 4 KiB page.
+    const allocator = std.heap.c_allocator;
     const next_path = try allocator.dupe(u8, path);
     errdefer allocator.free(next_path);
     const next_old_path = try std.fmt.allocPrint(allocator, "{s}.old", .{path});
@@ -35,16 +48,22 @@ pub fn init(sink: *Sink, runtime_io: std.Io, path: []const u8) !void {
     sink.io = runtime_io;
     sink.write_failed.store(false, .release);
     sink.fallback_reported.store(false, .release);
-    var file = std.Io.Dir.cwd().createFile(runtime_io, path, .{ .read = true, .truncate = false }) catch |err| {
-        noteFailure(sink, err);
-        return;
-    };
-    file.close(runtime_io);
+    small_fs.append(runtime_io, path, "") catch |err| noteFailure(sink, err);
 }
 
 /// Route `std.log` to `sink` until the next call.
 pub fn use(sink: *Sink) void {
     current = sink;
+}
+
+/// Release a widget's sink when it unloads; logging goes nowhere until the
+/// next `use` if it was current.
+pub fn deinit(sink: *Sink) void {
+    if (current == sink) current = null;
+    if (sink.path.len > 0) std.heap.c_allocator.free(sink.path);
+    if (sink.old_path.len > 0) std.heap.c_allocator.free(sink.old_path);
+    sink.path = &.{};
+    sink.old_path = &.{};
 }
 
 pub fn logFn(
@@ -53,9 +72,25 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Never inlined, so the 8 KiB line buffer lives only while a line is
+    // written. Inlined, it sat in the frames of every function that logs,
+    // the host's per-tick ones included (Native's frame and rebuild
+    // handlers, `view`, `update`), and the Windows stack probe touches every
+    // page of a frame on entry whether or not the log line runs. (Marking
+    // `logFn` itself `noinline` did not stop the inlining in a ReleaseFast
+    // build; this call does.)
+    @call(.never_inline, writeLogLine, .{ level, scope, format, args });
+}
+
+fn writeLogLine(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
     // reportError forwards at most 6,000 detail bytes; 8 KiB leaves >2 KiB
-    // for timestamp/level/scope and formatting. The stack cost exists only
-    // during one log call.
+    // for timestamp/level/scope and formatting.
+    if (detached) return;
     const sink = current orelse return;
     var buffer: [8192]u8 = undefined;
     const line = formatLogLine(level, scope, format, args, &buffer) catch |err| return noteFailure(sink, err);
@@ -133,21 +168,15 @@ fn writeLineFallible(sink: *Sink, line: []const u8) !void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
 
-    var cwd = std.Io.Dir.cwd();
+    // Every log line runs this on the UI thread: small_fs keeps it to small
+    // stack frames.
     const path = sink.path;
     const old_path = sink.old_path;
-    const size = if (cwd.statFile(runtime_io, path, .{})) |stat| stat.size else |_| 0;
-    if (shouldRotate(size, line.len)) {
-        cwd.deleteFile(runtime_io, old_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        try cwd.rename(path, cwd, old_path, runtime_io);
+    if (shouldRotate(small_fs.size(runtime_io, path) orelse 0, line.len)) {
+        try small_fs.delete(runtime_io, old_path);
+        try small_fs.rename(runtime_io, path, old_path);
     }
-    var file = try cwd.createFile(runtime_io, path, .{ .read = true, .truncate = false });
-    defer file.close(runtime_io);
-    const stat = try file.stat(runtime_io);
-    try file.writePositionalAll(runtime_io, line, stat.size);
+    try small_fs.append(runtime_io, path, line);
 }
 
 fn noteFailure(sink: *Sink, err: anyerror) void {

@@ -8,6 +8,7 @@ const gradient_mod = @import("gradients.zig");
 const dev_reload = @import("dev_reload.zig");
 const image_paths = @import("image_paths.zig");
 const js_engine = @import("js_engine.zig");
+const host_control = @import("host_control.zig");
 const manifest_mod = @import("manifest.zig");
 const provider_mod = @import("provider.zig");
 const platform = @import("platform/root.zig");
@@ -17,7 +18,18 @@ const tree_mod = @import("tree.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
-const crash_breadcrumb = @import("crash_breadcrumb.zig");
+const crash_record = @import("crash_record.zig");
+
+/// Small objects that live as long as a widget: its engine, the arena its
+/// manifest, paths and stores live in, and the image resolver's paths. The C
+/// heap packs them; `page_allocator` rounds each to whole 4 KiB pages.
+const small_allocator = std.heap.c_allocator;
+const small_fs = @import("small_fs.zig");
+const provider_service = if (builtin.os.tag == .windows) @import("provider_service.zig") else struct {};
+const dev_widgets_mod = if (builtin.os.tag == .windows) @import("dev_widgets.zig") else struct {};
+const daemon_mod = if (builtin.os.tag == .windows) @import("daemon.zig") else struct {};
+const host_lifecycle = if (builtin.os.tag == .windows) @import("host_lifecycle.zig") else struct {};
+const host_contract = @import("host_contract");
 
 comptime {
     if (native_sdk.platform.max_windows != max_host_widgets or
@@ -37,11 +49,41 @@ comptime {
 /// widget-windows.
 pub const max_host_widgets: usize = 32;
 
-pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
+pub const panic = std.debug.FullPanic(recordPanic);
+
+/// A panic is recorded as a crash (`crash_record`) before Native's
+/// diagnostics run, since they may fail in turn. A daemon host then fails
+/// fast, so Windows restarts it: Native's capture ends in Zig's abort, an
+/// ordinary exit Windows never restarts.
+fn recordPanic(msg: []const u8, ra: ?usize) noreturn {
+    crash_record.notePanic();
+    if (builtin.os.tag == .windows and crash_record.failsFast()) {
+        crash_record.writePanicNote(msg, ra);
+        crash_record.failFast(crash_record.panic_code);
+    }
+    native_sdk.debug.capturePanic(msg, ra);
+}
+
+/// Zig's segfault handler (on in Debug and ReleaseSafe builds) catches a
+/// fault before the crash record's unhandled-exception filter and ends in
+/// Zig's abort. In a daemon host the fault is recorded and fails fast
+/// instead, as in ReleaseFast, where Zig installs no handler.
+pub const debug = struct {
+    pub fn handleSegfault(addr: ?usize, name: []const u8, context: ?std.debug.CpuContextPtr) noreturn {
+        if (builtin.os.tag == .windows and crash_record.failsFast()) {
+            const access_violation: u32 = 0xC000_0005;
+            crash_record.noteCrash(access_violation);
+            crash_record.failFast(access_violation);
+        }
+        std.debug.defaultHandleSegfault(addr, name, context);
+    }
+};
 pub const std_options: std.Options = .{ .logFn = widget_log.logFn };
 
 pub const Model = struct {
     tree: tree_mod.Tree = .{},
+    /// Everything this widget allocates for its life, freed when it unloads.
+    arena: ?std.heap.ArenaAllocator = null,
     engine: ?*js_engine.Engine = null,
     provider: provider_mod.Client = .{},
     io: ?std.Io = null,
@@ -79,17 +121,12 @@ pub const Model = struct {
     /// `HostMsg.widget` of its messages, and the namespace of its Native
     /// timer keys, image ids, and font ids.
     slot: u16 = 0,
-    /// Position of this widget's directory on the `--host` command line:
-    /// how the daemon names it in per-widget environment variables and
-    /// the crash breadcrumb. Equal to `slot` unless a widget before it
-    /// failed to load.
-    argument: u16 = 0,
     window: WindowSpec = .{},
     /// Where `publishBackendStatus` tells the daemon this widget's renderer.
     backend_status_path: ?[]const u8 = null,
-    /// This widget's declared fonts under its slot's ids, registered with
-    /// the runtime at install.
-    font_registrations: []const HostApp.FontRegistration = &.{},
+    /// This widget's declared fonts, in `fonts` order, under the ids their
+    /// contents were registered with (`assignFontIds`).
+    font_registrations: []HostApp.FontRegistration = &.{},
     /// This widget's log; a Model that never loaded a widget (tests) logs
     /// nowhere.
     log: *widget_log.Sink = &unopened_log,
@@ -121,9 +158,14 @@ const WindowSpec = struct {
     primary_display_anchor: ?native_sdk.PrimaryDisplayAnchor = null,
 };
 
-/// Slot 0 renders in the scene's main window; the others are declared
-/// windows. Labels are fixed per slot so a slot's identity survives
-/// rebuilds and automation can address it.
+/// Slot 0 renders in the scene's main window and the others are declared
+/// windows, except in an anchored host, whose main window is a hidden one
+/// of its own and every widget is a declared window: then any widget, the
+/// first included, can come and go without the process (`anchored_host`).
+/// Labels are fixed per slot so a slot's identity survives rebuilds and
+/// automation can address it. A widget that replaces another in its slot
+/// opens under the same labels: Native recycles a closed window's record
+/// when its label opens again.
 const main_window_label = "main";
 const main_canvas_label = "widget-canvas";
 const slot_window_labels = slotLabels("widget-");
@@ -136,25 +178,58 @@ fn slotLabels(comptime prefix: []const u8) [max_host_widgets][]const u8 {
     return labels;
 }
 
+/// The daemon host on Windows (`weaver-widget --host` with no directories,
+/// ADR 0022): its main window is a hidden anchor that owns the app, and
+/// every widget is a declared window. Dev, capture and other platforms keep
+/// slot 0 in the main window. Set once, before the app starts.
+var anchored_host = false;
+
+/// The daemon's management thread (daemon.zig) and the loads and unloads
+/// it posts, waiting for the UI thread (`applyControl`).
+var daemon: if (builtin.os.tag == .windows) ?*daemon_mod.Daemon else ?*anyopaque = null;
+var control_mailbox: host_control.Mailbox = .{};
+/// What a widget the daemon adds loads with.
+var control_environment: ?HostEnvironment = null;
+/// The anchored host's own providers: every widget it runs subscribes to
+/// them in process, and its dev widgets through their pipes. Windows only.
+var host_providers: if (builtin.os.tag == .windows) ?*provider_service.Service else ?*anyopaque = null;
+
+/// The first slot that renders in a declared window.
+fn firstDeclaredSlot() u16 {
+    return if (anchored_host) 0 else 1;
+}
+
+/// The slots an anchored host can fill: Native's window budget
+/// (`platform.max_windows`, equal to `max_host_widgets`) less the anchor.
+const max_anchored_widgets: usize = max_host_widgets - 1;
+
+comptime {
+    // The daemon hands out the slots, and the record names each one.
+    if (builtin.os.tag == .windows and daemon_mod.max_hosted_widgets != max_anchored_widgets) {
+        @compileError("daemon.max_hosted_widgets must be max_anchored_widgets");
+    }
+    if (host_contract.record_slots != max_host_widgets) @compileError("host_contract.record_slots must be max_host_widgets");
+}
+
 fn windowLabel(slot: u16) []const u8 {
-    return if (slot == 0) main_window_label else slot_window_labels[slot];
+    return if (slot < firstDeclaredSlot()) main_window_label else slot_window_labels[slot];
 }
 
 fn canvasLabel(slot: u16) []const u8 {
-    return if (slot == 0) main_canvas_label else slot_canvas_labels[slot];
+    return if (slot < firstDeclaredSlot()) main_canvas_label else slot_canvas_labels[slot];
 }
 
 fn slotForWindowLabel(label: []const u8) ?u16 {
-    if (std.mem.eql(u8, label, main_window_label)) return 0;
-    for (slot_window_labels[1..], 1..) |candidate, slot| {
+    if (std.mem.eql(u8, label, main_window_label)) return if (anchored_host) null else 0;
+    for (slot_window_labels[firstDeclaredSlot()..], firstDeclaredSlot()..) |candidate, slot| {
         if (std.mem.eql(u8, candidate, label)) return @intCast(slot);
     }
     return null;
 }
 
 fn slotForCanvasLabel(label: []const u8) ?u16 {
-    if (std.mem.eql(u8, label, main_canvas_label)) return 0;
-    for (slot_canvas_labels[1..], 1..) |candidate, slot| {
+    if (std.mem.eql(u8, label, main_canvas_label)) return if (anchored_host) null else 0;
+    for (slot_canvas_labels[firstDeclaredSlot()..], firstDeclaredSlot()..) |candidate, slot| {
         if (std.mem.eql(u8, candidate, label)) return @intCast(slot);
     }
     return null;
@@ -171,6 +246,10 @@ fn bridgeTimerCapacity() usize {
 const max_images: usize = 16;
 
 comptime {
+    // A heap range per hosted widget, plus one for a dev hot swap's candidate.
+    if (js_engine.max_engines != max_host_widgets + 1) {
+        @compileError("js_engine.max_engines must be max_host_widgets + 1");
+    }
     if (native_sdk.max_registered_canvas_images < max_images * max_host_widgets) {
         @compileError("the Native image registry must hold max_images for every hosted widget");
     }
@@ -236,9 +315,10 @@ pub const HostMsg = struct {
 /// pending provider and dev-reload wakes.
 const every_widget: u16 = std.math.maxInt(u16);
 
-/// Every widget this process runs, by slot.
+/// Every widget this process runs, by slot. In an anchored host slots fill
+/// and empty as the daemon adds and removes widgets.
 pub const Host = struct {
-    widgets: []const *Model = &.{},
+    widgets: [max_host_widgets]?*Model = @splat(null),
 };
 
 const HostApp = native_sdk.UiAppWithFeatures(Host, HostMsg, .{ .runtime_markup = false });
@@ -544,12 +624,12 @@ fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
     // candidate on the heap prevents ReleaseFast from folding it into the
     // update callback's stack frame, where it would consume most of
     // QuickJS's recorded C-stack allowance.
-    const candidate_tree = try std.heap.page_allocator.create(tree_mod.Tree);
+    const candidate_tree = try native_sdk.lazy_commit.create(tree_mod.Tree);
     tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
     var candidate_tree_moved = false;
     defer {
         if (!candidate_tree_moved) candidate_tree.deinit();
-        std.heap.page_allocator.destroy(candidate_tree);
+        native_sdk.lazy_commit.destroy(candidate_tree);
     }
     var preserved = snapshot != null;
     const candidate = evaluateCandidate(model, candidate_tree, source, snapshot) catch |err| switch (err) {
@@ -569,7 +649,7 @@ fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
     candidate_tree_moved = true;
     candidate.setTree(&model.tree);
     model.engine = candidate;
-    old_engine.destroy(std.heap.page_allocator);
+    old_engine.destroy(small_allocator);
     model.dev_seen_mtime = mtime;
     syncTimers(model, effects);
     std.log.info("dev hot swap applied ({s} root hook state)", .{if (preserved) "preserved" else "fresh"});
@@ -578,7 +658,7 @@ fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
 fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, seed: ?[]const u8) !*js_engine.Engine {
     const storage = model.storage orelse return error.MissingStorage;
     const candidate = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         tree,
         storage,
         model.origins,
@@ -586,7 +666,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
         model.media_transport_enabled,
         false,
     );
-    errdefer candidate.destroy(std.heap.page_allocator);
+    errdefer candidate.destroy(small_allocator);
     if (seed) |value| try candidate.setHotSwapSeed(value);
     try candidate.evaluate(source, "bundle.js");
     if (candidate.renderFailed()) return error.CandidateFirstRenderFailed;
@@ -1097,6 +1177,35 @@ fn buildNode(ui: *WidgetUi, model: *Model, id: tree_mod.NodeId, is_root: bool) W
         noteProjectionFailure(model, "widget retained-node projection failed: node={d}, cause={s}", .{ id, @errorName(err) });
         return projectionFailurePanel(ui, is_root);
     };
+    // Leaves drop their retained children; building them anyway would only
+    // spend stack (and, deep enough, overflow it) for nodes nobody draws.
+    const child_count: usize = if (emitsChildren(retained.kind)) retained.child_count else 0;
+    const children = ui.arena.alloc(WidgetUi.Node, child_count) catch |err| {
+        noteProjectionFailure(
+            model,
+            "widget child projection capacity exhausted: node={d}, asked for {d}, cause={s}",
+            .{ id, retained.child_count, @errorName(err) },
+        );
+        return projectionFailurePanel(ui, is_root);
+    };
+    for (retained.children[0..child_count], 0..) |child_id, index| {
+        children[index] = buildNode(ui, model, child_id, false);
+    }
+    return buildElement(ui, model, id, retained, is_root, children);
+}
+
+// One node from its already-built children. noinline so the recursion in
+// buildNode stays small: each element kind's options and Node temporaries
+// (~68 KiB together) live here, in a frame that returns before the next
+// sibling recurses, instead of in every level of the tree.
+noinline fn buildElement(
+    ui: *WidgetUi,
+    model: *Model,
+    id: tree_mod.NodeId,
+    retained: *const tree_mod.Node,
+    is_root: bool,
+    children: []WidgetUi.Node,
+) WidgetUi.Node {
     var options: WidgetUi.ElementOptions = .{
         .global_key = .{ .int = id },
         // Every widget drags by its whole surface: the root is one OS
@@ -1211,20 +1320,6 @@ fn buildNode(ui: *WidgetUi, model: *Model, id: tree_mod.NodeId, is_root: bool) W
             .scale = retained.font_scale,
         }};
         return attachEffects(ui, model, retained, resolveFontId(model, retained), ui.paragraph(options, &span));
-    }
-    // Leaves drop their retained children; building them anyway would only
-    // spend stack (and, deep enough, overflow it) for nodes nobody draws.
-    const child_count: usize = if (emitsChildren(retained.kind)) retained.child_count else 0;
-    const children = ui.arena.alloc(WidgetUi.Node, child_count) catch |err| {
-        noteProjectionFailure(
-            model,
-            "widget child projection capacity exhausted: node={d}, asked for {d}, cause={s}",
-            .{ id, retained.child_count, @errorName(err) },
-        );
-        return projectionFailurePanel(ui, is_root);
-    };
-    for (retained.children[0..child_count], 0..) |child_id, index| {
-        children[index] = buildNode(ui, model, child_id, false);
     }
     const result = switch (retained.kind) {
         // SDK layout-only rows/columns/stacks do not paint their own style.
@@ -1343,7 +1438,11 @@ fn firstDescendantText(tree: *const tree_mod.Tree, id: tree_mod.NodeId) []const 
 
 fn resolveFontId(model: *const Model, node: *const tree_mod.Node) ?native_sdk.canvas.FontId {
     const id = resolveManifestFontId(node, model.fonts) orelse return null;
-    return if (id == native_sdk.canvas.default_mono_font_id) id else slotted(model.slot, id);
+    if (id == native_sdk.canvas.default_mono_font_id) return id;
+    for (model.fonts, model.font_registrations) |font, registration| {
+        if (font.id == id) return registration.id;
+    }
+    return null;
 }
 
 fn resolveManifestFontId(node: *const tree_mod.Node, fonts: []const manifest_mod.Font) ?native_sdk.canvas.FontId {
@@ -1366,9 +1465,72 @@ fn resolveManifestFontId(node: *const tree_mod.Node, fonts: []const manifest_mod
     return if (best) |font| font.id else null;
 }
 
-/// A widget's declared faces, read from its directory and registered under
-/// its slot's font ids.
-fn slottedFontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, slot: u16, fonts: []const manifest_mod.Font) ![]const HostApp.FontRegistration {
+/// Faces the runtime has, by content. Native font ids are permanent, so a
+/// face registers once: every widget that ships it, and a widget loaded
+/// again, shares its id. Widgets load one at a time (`Loader`,
+/// `WidgetLoad`), so the table needs no lock.
+const ContentFont = struct { hash: u64, len: usize, id: native_sdk.canvas.FontId, registered: bool = false };
+var content_fonts: [native_sdk.runtime.max_registered_canvas_fonts]ContentFont = undefined;
+var content_font_count: usize = 0;
+
+fn contentFontId(ttf: []const u8) !native_sdk.canvas.FontId {
+    if (knownFontId(ttf)) |id| return id;
+    const hash = std.hash.Wyhash.hash(0, ttf);
+    if (content_font_count == content_fonts.len) return error.FontRegistryFull;
+    const id: native_sdk.canvas.FontId = native_sdk.canvas.min_registered_font_id + content_font_count;
+    content_fonts[content_font_count] = .{ .hash = hash, .len = ttf.len, .id = id };
+    content_font_count += 1;
+    return id;
+}
+
+/// Give a loaded widget's faces their content ids. Only a widget that
+/// loaded takes entries in the table, and only if all its new faces fit: a
+/// widget refused for a full table must not use up ids the host can never
+/// give back.
+fn assignFontIds(model: *Model) !void {
+    var new_faces: usize = 0;
+    for (model.font_registrations, 0..) |registration, index| {
+        if (knownFontId(registration.ttf) != null) continue;
+        const repeated = for (model.font_registrations[0..index]) |earlier| {
+            if (sameFace(earlier.ttf, registration.ttf)) break true;
+        } else false;
+        if (!repeated) new_faces += 1;
+    }
+    if (content_font_count + new_faces > content_fonts.len) {
+        std.log.warn("font registry full: max_registered_canvas_fonts={d}, {d} in use, this widget asked for {d} more", .{ content_fonts.len, content_font_count, new_faces });
+        return error.FontRegistryFull;
+    }
+    for (model.font_registrations) |*registration| registration.id = contentFontId(registration.ttf) catch unreachable;
+}
+
+fn knownFontId(ttf: []const u8) ?native_sdk.canvas.FontId {
+    const hash = std.hash.Wyhash.hash(0, ttf);
+    for (content_fonts[0..content_font_count]) |font| {
+        if (font.hash == hash and font.len == ttf.len) return font.id;
+    }
+    return null;
+}
+
+fn sameFace(a: []const u8, b: []const u8) bool {
+    return a.len == b.len and std.hash.Wyhash.hash(0, a) == std.hash.Wyhash.hash(0, b);
+}
+
+/// Register a widget's faces the runtime does not have yet: an anchored
+/// host loads widgets after its app installed its fonts.
+fn registerWidgetFonts(runtime: *native_sdk.Runtime, model: *const Model) !void {
+    for (model.font_registrations) |registration| {
+        const entry = for (content_fonts[0..content_font_count]) |*font| {
+            if (font.id == registration.id) break font;
+        } else unreachable;
+        if (entry.registered) continue;
+        try runtime.registerCanvasFont(registration.id, registration.ttf);
+        entry.registered = true;
+    }
+}
+
+/// A widget's declared faces, read from its directory and checked; their
+/// ids come once it has loaded (`assignFontIds`).
+fn fontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, fonts: []const manifest_mod.Font) ![]HostApp.FontRegistration {
     const registrations = try allocator.alloc(HostApp.FontRegistration, fonts.len);
     for (fonts, 0..) |font, index| {
         for (fonts[0..index]) |earlier| {
@@ -1385,7 +1547,7 @@ fn slottedFontRegistrations(io: std.Io, allocator: std.mem.Allocator, directory:
             std.log.err("font \"{s}\" ({s}) failed to parse: {s}", .{ font.name, font.file, native_sdk.canvas.font_ttf.parseFailureReason(bytes) orelse "not a parseable TrueType face" });
             return error.FontParseFailed;
         };
-        registrations[index] = .{ .id = slotted(slot, font.id), .name = font.name, .ttf = bytes };
+        registrations[index] = .{ .id = 0, .name = font.name, .ttf = bytes };
     }
     return registrations;
 }
@@ -1426,7 +1588,7 @@ fn seedImageStates(model: *Model) !void {
 
 fn deinitImageStates(model: *Model) void {
     for (model.image_states[0..model.image_state_count]) |*state| {
-        if (state.observed) |observed| std.heap.page_allocator.free(observed);
+        if (state.observed) |observed| small_allocator.free(observed);
     }
     model.image_state_count = 0;
 }
@@ -1449,21 +1611,21 @@ fn addImageState(model: *Model, id: tree_mod.NodeId, lifetime: u64) !*ImageState
 fn removeImageState(model: *Model, effects: WidgetEffects, index: usize) void {
     const state = &model.image_states[index];
     if (state.registered) _ = effects.unregisterImage(state.id);
-    if (state.observed) |observed| std.heap.page_allocator.free(observed);
+    if (state.observed) |observed| small_allocator.free(observed);
     model.image_state_count -= 1;
     if (index != model.image_state_count) model.image_states[index] = model.image_states[model.image_state_count];
     model.image_states[model.image_state_count] = .{};
 }
 
 fn replaceObserved(state: *ImageState, observed: [:0]u8, valid: bool) void {
-    if (state.observed) |previous| std.heap.page_allocator.free(previous);
+    if (state.observed) |previous| small_allocator.free(previous);
     state.observed = observed;
     state.observed_valid = valid;
     state.load_failure_count = 0;
 }
 
 fn rememberRawSource(state: *ImageState, source: []const u8) !void {
-    replaceObserved(state, try std.heap.page_allocator.dupeZ(u8, source), false);
+    replaceObserved(state, try small_allocator.dupeZ(u8, source), false);
 }
 
 fn observedEquals(state: *const ImageState, source: []const u8, valid: bool) bool {
@@ -1512,7 +1674,7 @@ fn synchronizeImageNode(model: *Model, effects: WidgetEffects, id: tree_mod.Node
         return;
     };
     if (observedImageLoadSettled(state, resolved.path)) {
-        std.heap.page_allocator.free(resolved.path);
+        small_allocator.free(resolved.path);
         return;
     }
     const bytes = std.Io.Dir.cwd().readFileAlloc(
@@ -1538,27 +1700,44 @@ fn synchronizeImageNode(model: *Model, effects: WidgetEffects, id: tree_mod.Node
     clearImageFailure(state);
 }
 
+test "a widget's image paths are freed by the allocator that made them" {
+    const root = ".zig-cache/weaver-image-state-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const image = root ++ "/cover.img";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = image, .data = "image" });
+    var resolver = try image_paths.Resolver.init(std.testing.io, small_allocator, root, null);
+    defer resolver.deinit();
+    var state: ImageState = .{};
+    // A resolved path, a raw source and a failure each replace the last.
+    replaceObserved(&state, (try resolver.resolve("cover.img")).path, true);
+    try rememberRawSource(&state, "missing.img");
+    recordImageLoadFailure(&state, (try resolver.resolve("cover.img")).path);
+    if (state.observed) |observed| small_allocator.free(observed);
+}
+
 test "image reload failures retry twice then settle until the source changes" {
     var state: ImageState = .{};
-    defer if (state.observed) |observed| std.heap.page_allocator.free(observed);
+    defer if (state.observed) |observed| small_allocator.free(observed);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "first.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "first.img"));
     try std.testing.expect(!observedImageLoadSettled(&state, "first.img"));
     try std.testing.expectEqual(@as(u8, 1), state.load_failure_count);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "first.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "first.img"));
     try std.testing.expect(!observedImageLoadSettled(&state, "first.img"));
     try std.testing.expectEqual(@as(u8, 2), state.load_failure_count);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "first.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "first.img"));
     try std.testing.expect(observedImageLoadSettled(&state, "first.img"));
     try std.testing.expectEqual(max_image_load_attempts, state.load_failure_count);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "second.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "second.img"));
     try std.testing.expect(!observedImageLoadSettled(&state, "second.img"));
     try std.testing.expectEqual(@as(u8, 1), state.load_failure_count);
 
-    replaceObserved(&state, try std.heap.page_allocator.dupeZ(u8, "second.img"), true);
+    replaceObserved(&state, try small_allocator.dupeZ(u8, "second.img"), true);
     try std.testing.expect(observedImageLoadSettled(&state, "second.img"));
     try std.testing.expectEqual(@as(u8, 0), state.load_failure_count);
 }
@@ -1605,9 +1784,11 @@ fn nativeWindowLayers(manifest_layer: []const u8) NativeWindowLayers {
 /// A widget's Model, allocated and set one field at a time: `.{}` would copy
 /// the whole default image (4.3 MB, almost all of it the retained tree's
 /// node and canvas arenas) and make it resident before the tree uses a slot.
-/// The tree starts through `resetEmpty`, which leaves the arenas untouched.
+/// The tree starts through `resetEmpty`, which leaves the arenas untouched,
+/// and the Model is committed as it is touched (native_sdk.lazy_commit), so
+/// those arenas cost nothing until the tree uses them.
 fn createModel() !*Model {
-    const model = try std.heap.page_allocator.create(Model);
+    const model = try native_sdk.lazy_commit.create(Model);
     inline for (std.meta.fields(Model)) |field| {
         if (comptime std.mem.eql(u8, field.name, "tree")) {
             tree_mod.resetEmpty(&model.tree, std.heap.page_allocator);
@@ -1620,7 +1801,29 @@ fn createModel() !*Model {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(allocator);
+    const all_args = try init.minimal.args.toSlice(allocator);
+    // Every widget runs in the shared, frozen realm (js_engine.zig), in the
+    // host, under `weaver dev` and in capture alike, so a widget behaves
+    // the same everywhere. A leading `--own-realms` gives each widget a
+    // realm of its own instead.
+    const own_realms = all_args.len >= 2 and std.mem.eql(u8, all_args[1], "--own-realms");
+    js_engine.shared_realm_enabled = !own_realms;
+    const args = if (own_realms) rest: {
+        const rest = try allocator.alloc([:0]const u8, all_args.len - 1);
+        rest[0] = all_args[0];
+        @memcpy(rest[1..], all_args[2..]);
+        break :rest rest;
+    } else all_args;
+    // The CLI's client verbs (host_lifecycle.zig): a short-lived process
+    // that only touches the host's named objects and files.
+    if (builtin.os.tag == .windows and args.len == 2) if (host_lifecycle.Verb.parse(args[1])) |verb| {
+        const data_root = platform.dataRoot(allocator, init.environ_map.get("LOCALAPPDATA"), null) catch {
+            std.debug.print("weaver-widget {s}: LOCALAPPDATA is not set; the widget host keeps its files under %LOCALAPPDATA%\\weaver\n", .{args[1]});
+            std.process.exit(@intFromEnum(host_lifecycle.Exit.failed));
+        };
+        const paths = try host_lifecycle.Paths.of(allocator, data_root);
+        std.process.exit(@intFromEnum(host_lifecycle.run(verb, init.io, allocator, paths)));
+    };
     // Shared render host mode: this process becomes the one Metal-owning
     // renderer every macOS widget talks to (weaverd spawns and supervises
     // it; docs/macos-memory-handoff.md carries the receipts). It never
@@ -1636,21 +1839,50 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const capture_state_root = init.environ_map.get("WEAVER_CAPTURE_STATE_ROOT");
-    if (capture_state_root == null and args.len >= 3 and std.mem.eql(u8, args[1], "--host")) {
-        return runHost(init, args[2..], false, true);
+    if (capture_state_root == null and args.len >= 2 and std.mem.eql(u8, args[1], "--host")) {
+        if (builtin.os.tag == .windows and args.len >= 3 and std.mem.eql(u8, args[2], host_contract.restart_of_flag)) {
+            return runHost(init, &.{}, false, true, try restartedLaunch(init, args));
+        }
+        return runHost(init, args[2..], false, true, null);
     }
     const dev = capture_state_root == null and args.len == 3 and std.mem.eql(u8, args[1], "--dev");
     if ((!dev and args.len != 2) or (dev and args.len != 3)) {
         // The render-host form is parsed only on macOS; advertise it only
         // where it is accepted.
         std.debug.print(if (weaver_build_options.render_host_enabled)
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
+            "usage: weaver-widget [--own-realms] [--dev] <widget-directory> | weaver-widget [--own-realms] --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
         else
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>...\n", .{});
+            "usage: weaver-widget [--own-realms] [--dev] <widget-directory> | weaver-widget [--own-realms] --host <widget-directory>...\n", .{});
         return error.InvalidArguments;
     }
     const directory_arg: usize = if (dev) 2 else 1;
-    return runHost(init, args[directory_arg .. directory_arg + 1], dev, false);
+    return runHost(init, args[directory_arg .. directory_arg + 1], dev, false, null);
+}
+
+/// `--host --restart-of <generation> --localappdata <path>`: Windows
+/// restarted a crashed daemon host (host_contract.restart_of_flag). Windows
+/// gives a restarted process the user's default environment, so the
+/// profile the crashed host ran against comes from the command line, and
+/// replaces LOCALAPPDATA before anything reads it. Returns the crashed
+/// host's generation.
+fn restartedLaunch(init: std.process.Init, args: []const []const u8) !u64 {
+    const usage = "weaver-widget --host " ++ host_contract.restart_of_flag ++ " <generation> " ++ host_contract.local_app_data_flag ++ " <path>: the command line Windows restarts a crashed widget host with";
+    if (args.len != 6 or !std.mem.eql(u8, args[4], host_contract.local_app_data_flag) or args[5].len == 0) {
+        std.debug.print("usage: {s}\n", .{usage});
+        return error.InvalidArguments;
+    }
+    const generation = std.fmt.parseInt(u64, args[3], 10) catch {
+        std.debug.print("usage: {s}; '{s}' is not a generation\n", .{ usage, args[3] });
+        return error.InvalidArguments;
+    };
+    try init.environ_map.put("LOCALAPPDATA", args[5]);
+    // Children (the renderer, dev widgets, the bundler) read the process's.
+    var wide: [1024:0]u16 = undefined;
+    const length = try std.unicode.utf8ToUtf16Le(&wide, args[5]);
+    if (length >= wide.len) return error.NameTooLong;
+    wide[length] = 0;
+    if (SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA"), &wide) == 0) return error.SetEnvironmentFailed;
+    return generation;
 }
 
 /// Process-wide inputs every widget load shares.
@@ -1659,6 +1891,10 @@ const HostEnvironment = struct {
     data_root: []const u8,
     log_directory: []const u8,
     capture_state_root: ?[]const u8,
+    /// Where media artwork lives (WEAVER_ART_CACHE): the daemon host's own
+    /// under its data root, a dev widget's from its environment, none in
+    /// capture.
+    art_cache_root: ?[]const u8,
     force_software: bool,
     dev: bool,
     /// Launched as `--host`: per-widget settings arrive as
@@ -1673,13 +1909,56 @@ const HostEnvironment = struct {
         const key = std.fmt.bufPrint(&buffer, name ++ "_{d}", .{argument}) catch unreachable;
         return self.init.environ_map.get(key);
     }
+
+    /// The channels of the widget at `--host` position `argument`.
+    fn channels(self: HostEnvironment, argument: u16) WidgetChannels {
+        return .{
+            .backend_file = self.widgetSetting("WEAVER_BACKEND_FILE", argument),
+            .host_pipe = self.widgetSetting("WEAVER_HOST_PIPE", argument),
+            .host_endpoint = self.widgetSetting("WEAVER_HOST_ENDPOINT", argument),
+        };
+    }
 };
+
+/// Where a widget and the daemon talk: named by environment variables for
+/// a widget on the command line, by its `add` command for one the daemon
+/// adds to an anchored host.
+const WidgetChannels = struct {
+    /// Where the widget reports its renderer, or why it did not load.
+    backend_file: ?[]const u8 = null,
+    host_pipe: ?[]const u8 = null,
+    host_endpoint: ?[]const u8 = null,
+};
+
+/// Stack for a thread that loads widgets: the UI thread's reservation
+/// (runtime/build.zig), because bundles evaluate on it under the same
+/// QuickJS recursion guard.
+const loader_stack_bytes: usize = 16 * 1024 * 1024;
 
 /// Run every widget in `directories` in this one process: one Native app,
 /// one window per widget. Slot 0 is the scene's main window. A single
 /// directory is the ordinary one-widget runtime.
-fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool) !void {
+///
+/// A `--host` with no directories (Windows) is the daemon instead
+/// (daemon.zig): it starts with no widget, reads the registry itself, and
+/// adds and removes widgets while the others keep running. `restart_of` is
+/// the crashed host's generation when Windows restarted it.
+fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool, restart_of: ?u64) !void {
+    return hostMain(init, directories, dev, hosted, restart_of) catch |err| {
+        // The record says why this host stopped (a daemon host's; others
+        // keep none).
+        crash_record.markStoppedWith(@errorName(err));
+        return err;
+    };
+}
+
+fn hostMain(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool, restart_of: ?u64) !void {
     const allocator = init.arena.allocator();
+    anchored_host = hosted and builtin.os.tag == .windows and directories.len == 0;
+    if (!anchored_host and directories.len == 0) {
+        std.debug.print("weaver-widget --host: no widget directories; with none, --host is the daemon host, which runs only on Windows\n", .{});
+        return error.InvalidArguments;
+    }
     if (directories.len > max_host_widgets) {
         std.debug.print("weaver-widget --host: {d} widget directories; the limit is max_host_widgets={d}, asked for {d}\n", .{ directories.len, max_host_widgets, directories.len });
         return error.TooManyWidgets;
@@ -1692,27 +1971,30 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     }
     const capture_state_root = init.environ_map.get("WEAVER_CAPTURE_STATE_ROOT");
     backend_status_io = init.io;
-    if (hosted) {
-        if (init.environ_map.get("WEAVER_CRASH_BREADCRUMB")) |name| crash_breadcrumb.open(name);
-    }
     const local_app_data = init.environ_map.get("LOCALAPPDATA");
     const home = init.environ_map.get("HOME");
+    const data_root = if (capture_state_root) |root| root else try platform.dataRoot(allocator, local_app_data, home);
     // Capture receives its own empty state root from the CLI. Keeping the
     // branch here, beside the ordinary bootstrap, makes it impossible for a
     // headless run to inherit live storage, geometry, or per-widget logs.
     const environment: HostEnvironment = .{
         .init = init,
-        .data_root = if (capture_state_root) |root| root else try platform.dataRoot(allocator, local_app_data, home),
+        .data_root = data_root,
         .log_directory = if (capture_state_root) |root|
             try std.fs.path.join(allocator, &.{ root, "logs" })
         else
             try platform.logsRoot(allocator, local_app_data, home),
         .capture_state_root = capture_state_root,
+        .art_cache_root = if (capture_state_root != null)
+            null
+        else if (anchored_host)
+            try std.fs.path.join(allocator, &.{ data_root, "artcache" })
+        else
+            init.environ_map.get("WEAVER_ART_CACHE"),
         .force_software = if (init.environ_map.get("WEAVER_FORCE_SOFTWARE")) |value| std.mem.eql(u8, value, "1") else false,
         .dev = dev,
         .hosted = hosted,
     };
-    try std.Io.Dir.cwd().createDirPath(init.io, environment.log_directory);
     // That capture log is deleted with the state root, so widget diagnostics
     // also go to a file the CLI copies into the capture receipt.
     if (capture_state_root) |root| {
@@ -1720,36 +2002,43 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
 
-    var widgets: std.ArrayList(*Model) = .empty;
-    for (directories, 0..) |directory, argument| {
-        const slot: u16 = @intCast(widgets.items.len);
-        const model = loadWidget(environment, directory, slot, @intCast(argument)) catch |err| {
-            // One widget's broken install must not keep the others off the
-            // desktop; a lone widget fails the process as it always has.
-            if (directories.len == 1) return err;
-            std.debug.print("weaver-widget --host: skipping {s}: {s}\n", .{ directory, @errorName(err) });
-            reportLoadFailure(environment, @intCast(argument), err);
-            continue;
-        };
-        try widgets.append(allocator, model);
-    }
-    if (widgets.items.len == 0) return error.NoWidgetLoaded;
+    // A startup error returned from here is a clean stop, not a crash: its
+    // record says `stopped` with the error, and Windows does not restart it
+    // (ADR 0022).
+    defer crash_record.markStopped();
+    if (builtin.os.tag == .windows and anchored_host) try startDaemon(init, environment, restart_of);
+
+    var loader: Loader = .{ .environment = environment, .directories = directories };
+    const widgets = try loader.run();
+    if (widgets.items.len == 0 and !anchored_host) return error.NoWidgetLoaded;
     defer for (widgets.items) |model| unloadWidget(model);
 
-    // Every widget's faces register with the one runtime, each under its
-    // own slot's ids (`resolveFontId`).
+    // Every widget's faces register with the one runtime, once per face
+    // (`contentFontId`).
     var fonts: std.ArrayList(HostApp.FontRegistration) = .empty;
-    for (widgets.items) |model| try fonts.appendSlice(allocator, model.font_registrations);
+    for (widgets.items) |model| {
+        for (model.font_registrations) |registration| {
+            const known = for (fonts.items) |font| {
+                if (font.id == registration.id) break true;
+            } else false;
+            if (!known) try fonts.append(allocator, registration);
+        }
+    }
 
-    const first = widgets.items[0];
-    widget_log.use(first.log);
+    // The anchor only owns the app; it is never shown and never drawn.
+    const anchor_window: WindowSpec = .{
+        .name = "Weaver",
+        .click_through = true,
+    };
+    const primary = if (anchored_host) anchor_window else widgets.items[0].window;
+    if (!anchored_host) widget_log.use(widgets.items[0].log);
     const shell_views = [_]native_sdk.ShellView{.{
         .label = main_canvas_label,
         .kind = .gpu_surface,
         .fill = true,
         .role = "Weaver widget canvas",
-        .accessibility_label = first.window.name,
-        .gpu_backend = first.window.backend,
+        .accessibility_label = primary.name,
+        .gpu_backend = primary.backend,
         .gpu_pixel_format = .bgra8_unorm,
         .gpu_present_mode = .timer,
         .gpu_alpha_mode = .premultiplied,
@@ -1758,25 +2047,26 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     }};
     const shell_windows = [_]native_sdk.ShellWindow{.{
         .label = main_window_label,
-        .title = first.window.name,
-        .width = first.window.frame.width,
-        .height = first.window.frame.height,
-        .x = first.window.frame.x,
-        .y = first.window.frame.y,
+        .title = primary.name,
+        .width = primary.frame.width,
+        .height = primary.frame.height,
+        .x = primary.frame.x,
+        .y = primary.frame.y,
         .resizable = false,
         .restore_state = false,
         .titlebar = .chromeless,
         .transparent = true,
-        .layer = first.window.layer.shell,
-        .click_through = first.window.click_through,
+        .layer = primary.layer.shell,
+        .click_through = primary.click_through,
         .no_activate = true,
         .views = &shell_views,
     }};
     var tokens = native_sdk.canvas.DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark });
     tokens.colors.background = native_sdk.canvas.Color.rgba8(0, 0, 0, 0);
-    const app_state = try std.heap.page_allocator.create(HostApp);
+    // Committed as it is touched: most of its frame scratch never is.
+    const app_state = try native_sdk.lazy_commit.create(HostApp);
     HostApp.initInPlace(app_state, std.heap.page_allocator, .{
-        .name = first.window.name,
+        .name = primary.name,
         .scene = .{ .windows = &shell_windows },
         .canvas_label = main_canvas_label,
         .tokens = tokens,
@@ -1797,12 +2087,16 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         .on_window_frame = hostOnWindowFrame,
     });
     defer app_state.destroy();
-    app_state.model = .{ .widgets = widgets.items };
+    app_state.model = .{};
+    for (widgets.items) |model| app_state.model.widgets[model.slot] = model;
 
     // `--dev` is a one-widget mode: its listener hot-swaps slot 0.
-    const dev_signal_path = try std.fs.path.join(allocator, &.{ directories[0], dev_reload.signal_file_name });
     var dev_reload_server: dev_reload.Server = .{};
-    if (dev) try dev_reload_server.start(init.io, dev_signal_path, wakeFns(&dev_reload_pending)[0]);
+    if (dev) try dev_reload_server.start(
+        init.io,
+        try std.fs.path.join(allocator, &.{ directories[0], dev_reload.signal_file_name }),
+        wakeFns(&dev_reload_pending)[0],
+    );
     defer if (dev) {
         dev_reload_server.deinit();
         dev_reload_pending[0].store(false, .release);
@@ -1818,23 +2112,27 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         app.capture_pending_fn = capturePendingWork;
         app.capture_validate_fn = validateCapture;
     }
+    // Its own frame, below every live one: inlined, its marker would sit
+    // inside this function's frame, above some of its live variables.
+    if (builtin.os.tag == .windows and anchored_host) @call(.never_inline, discardDeadStack, .{});
     runner.runWithOptions(app, .{
         .app_name = "weaver-widget",
-        .window_title = first.window.name,
+        .window_title = primary.name,
         .bundle_id = "com.weaver.widget",
-        .default_frame = first.window.frame,
+        .default_frame = primary.frame,
         // A dragged origin places the window explicitly (macOS reads the
         // frame only when restore is set, then clamps it in AppKit); the
         // manifest anchor stays the placement until that first drag.
-        .restore_state = first.window.dragged,
+        .restore_state = primary.dragged,
         // Weaver owns placement persistence (debounced, per-widget,
         // atomic). The substrate's bundle-id-keyed store would make
         // every widget process rewrite one shared windows.zon on each
         // move tick.
         .persist_window_state = false,
-        .primary_display_anchor = if (builtin.os.tag == .macos and !first.window.dragged) first.window.primary_display_anchor else null,
-        .startup_window_layer = first.window.layer.startup,
-        .startup_click_through = first.window.click_through,
+        .primary_display_anchor = if (builtin.os.tag == .macos and !primary.dragged) primary.primary_display_anchor else null,
+        .startup_window_layer = primary.layer.startup,
+        .startup_click_through = primary.click_through,
+        .startup_window_show = if (anchored_host) .hidden else null,
         .js_window_api = false,
     }, init) catch |err| {
         std.log.err("widget runtime stopped after platform callback failure: {s}", .{@errorName(err)});
@@ -1842,29 +2140,253 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     };
 }
 
+/// Everything the daemon host needs before any widget loads (ADR 0022):
+/// the lifecycle checks, control, its crash record and its request for a
+/// restart, the renderer pipe its widgets connect to, the providers (their
+/// workers start with their first subscriber), a job only it holds for its
+/// dev widgets and renderer, and the management thread's state. The
+/// management thread itself starts with the runtime
+/// (`startRendererDiagnostics`).
+fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of: ?u64) !void {
+    const allocator = std.heap.page_allocator;
+    // Windows restarts only a crash its error reporting handles, and a
+    // parent can turn that off for its children (rm-bench/restart-spike: a
+    // host started from Git Bash inherits SEM_NOGPFAULTERRORBOX and was
+    // never restarted).
+    _ = SetErrorMode(0);
+    // No console: notes go to <logs>\host.log.
+    std.Io.Dir.cwd().createDirPath(init.io, environment.log_directory) catch {};
+    host_lifecycle.logToFile(environment.log_directory);
+    host_lifecycle.logStart(restart_of);
+    const paths = try host_lifecycle.Paths.of(allocator, environment.data_root);
+    // Windows can restart this host before the crashed one has exited, and
+    // that one owns the singleton until it has: wait for it, outside the
+    // lifecycle lock so `weaver down` meanwhile is not held.
+    if (restart_of != null) if (crash_record.read(paths.record)) |crashed| {
+        const began = GetTickCount64();
+        const gone = host_lifecycle.waitForExit(crashed, host_contract.predecessor_wait_ms);
+        std.debug.print("weaver-widget --host: the crashed host (pid {d}) {s} after {d} ms\n", .{ crashed.pid, if (gone) "had exited" else "had not exited (predecessor_wait_ms); starting anyway", GetTickCount64() - began });
+    };
+    // Starting is ordered with `weaver up` and `weaver down` by the
+    // lifecycle lock (host_lifecycle.zig), held until control is published.
+    const lock = host_lifecycle.Lock.acquire(host_contract.host_lock_wait_ms) catch {
+        std.debug.print("weaver-widget --host: another 'weaver up' or 'weaver down' held the lifecycle lock for host_lock_wait_ms={d}; this host exits\n", .{host_contract.host_lock_wait_ms});
+        daemon_mod.exitProcess(host_contract.exit_lifecycle_busy);
+    };
+    defer lock.release();
+    // `weaver down` ran since this start was decided: a pending restart,
+    // or a `weaver up` that lost the race, ends here.
+    if (host_lifecycle.stopMarked(paths)) {
+        std.debug.print("weaver-widget --host: 'weaver down' left the stop marker at {s}; this host exits\n", .{paths.marker});
+        lock.release();
+        daemon_mod.exitProcess(host_contract.exit_stopped);
+    }
+    // Windows restarted this host for a crash; a host `weaver up` started
+    // since then consumed that crash's record, and runs or ran after it.
+    if (restart_of) |crashed| {
+        const current = crash_record.read(paths.record);
+        if (current == null) if (crash_record.openFailure(paths.record)) |err| {
+            std.debug.print("weaver-widget --host: restarted for generation {d}, but could not read the record at {s} (Win32 error {d}); without it this host cannot quarantine the widget the crash blames, so it exits. Close whatever holds the file open, then run 'weaver up'\n", .{ crashed, paths.record, err });
+            lock.release();
+            daemon_mod.exitProcess(host_contract.exit_record_unavailable);
+        };
+        if (current == null or current.?.generation != crashed) {
+            std.debug.print("weaver-widget --host: restarted for generation {d}, but the record now holds {?d}: a newer host started since; this host exits\n", .{ crashed, if (current) |record| record.generation else null });
+            lock.release();
+            daemon_mod.exitProcess(host_contract.exit_superseded);
+        }
+    }
+    // The singleton comes first, before any widget loads: a second host
+    // leaves at once.
+    const singleton = daemon_mod.Objects.claim() catch |err| switch (err) {
+        error.AlreadyRunning => {
+            std.debug.print("weaver-widget --host: another widget host is already running for this user; this one exits\n", .{});
+            lock.release();
+            daemon_mod.exitProcess(host_contract.exit_already_running);
+        },
+        else => return err,
+    };
+    std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
+    // From here on, a crash is recorded. Opening the record consumes the
+    // previous host's: this start takes the next generation.
+    const previous = openRecord(paths.record) catch {
+        // The singleton goes before the lock: a `weaver up` waiting on the
+        // lock then finds no host, not one on its way out.
+        daemon_mod.Objects.release(singleton);
+        lock.release();
+        daemon_mod.exitProcess(host_contract.exit_record_unavailable);
+    };
+    // This host runs: control comes up, still before any widget loads.
+    const objects = try daemon_mod.Objects.publish(singleton);
+    var now: u64 = 0;
+    GetSystemTimeAsFileTime(&now);
+    const plan = host_contract.RestartPlan.of(previous, restart_of != null, now);
+    const registration: host_lifecycle.Registration = if (crash_record.generation()) |generation|
+        host_lifecycle.registerRestart(plan, generation, init.environ_map.get("LOCALAPPDATA").?)
+    else
+        .{ .request = .none };
+    crash_record.noteRestart(plan, registration.request, registration.hresult, registration.line_len);
+    // Crashes fail fast from here on, so Windows restarts this host.
+    var log_buffers: native_sdk.debug.LogPathBuffers = .{};
+    const native_logs = try native_sdk.debug.resolveLogPaths(&log_buffers, "com.weaver.widget", native_sdk.debug.envFromMap(init.environ_map), init.environ_map.get("NATIVE_SDK_LOG_DIR"));
+    std.Io.Dir.cwd().createDirPath(init.io, native_logs.log_dir) catch {};
+    crash_record.routeCrashesToWindows(native_logs.panic_file);
+    const renderer_pipe_name = try std.fmt.allocPrint(allocator, "\\\\.\\pipe\\weaver-renderer-{d}", .{platform.currentProcessId()});
+    try daemon_mod.exportRendererPipe(renderer_pipe_name);
+    // Widgets resolve media artwork under the art cache (image_paths), so
+    // it must exist before any loads; the media worker owns what is in it.
+    const art_cache_root = environment.art_cache_root.?;
+    std.Io.Dir.cwd().createDirPath(init.io, art_cache_root) catch |err| {
+        std.debug.print("weaver-widget --host: the art cache {s} could not be created: {s}; media artwork is unavailable\n", .{ art_cache_root, @errorName(err) });
+    };
+    const service = try allocator.create(provider_service.Service);
+    service.* = .init(.{ .io = init.io, .art_cache_root = art_cache_root });
+    host_providers = service;
+    const devs = try allocator.create(dev_widgets_mod.DevWidgets);
+    devs.* = try .init(service, init.environ_map, .{ .renderer_pipe = renderer_pipe_name, .art_cache = art_cache_root });
+    control_environment = environment;
+    daemon = try daemon_mod.Daemon.create(.{
+        .io = init.io,
+        .environment = init.environ_map,
+        .data_directory = environment.data_root,
+        .renderer_pipe_name = renderer_pipe_name,
+        .force_software = environment.force_software,
+        .service = service,
+        .devs = devs,
+        .post = postControl,
+        .previous = previous,
+        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration),
+    }, objects);
+}
+
+/// Open the host's record (crash_record.open), retrying while it is in use
+/// for up to `record_open_wait_ms`: it stays in use for a moment after a
+/// crashed host has exited. A host that still cannot open it must not run:
+/// it could not quarantine the widget the last crash blames, and would run
+/// it again. `weaver up` and `weaver status` name the file and the error
+/// (host_lifecycle.zig `recordUnavailable`, `describeDown`).
+fn openRecord(path: []const u8) !?host_contract.Record {
+    const began = GetTickCount64();
+    var attempts: u32 = 0;
+    while (true) {
+        attempts += 1;
+        const previous = crash_record.open(path) catch |err| {
+            const waited = GetTickCount64() - began;
+            if (err == error.RecordInUse and waited < host_contract.record_open_wait_ms) {
+                Sleep(50);
+                continue;
+            }
+            std.debug.print("weaver-widget --host: could not open the record at {s}: {s} (Win32 error {d}, {d} attempts over {d} ms); without it this host cannot quarantine the widget the last crash blames, so it exits. Close whatever holds the file open, then run 'weaver up'\n", .{ path, @errorName(err), crash_record.open_error, attempts, waited });
+            return err;
+        };
+        if (attempts > 1) std.debug.print("weaver-widget --host: the record opened after {d} attempts over {d} ms\n", .{ attempts, GetTickCount64() - began });
+        return previous;
+    }
+}
+
+/// Give back the main thread's stack pages below the caller's frame before
+/// the host settles into its event loop. Startup runs std.Io's Windows path
+/// helpers on this thread: directory creation and path conversion have
+/// 262 KiB and 197 KiB frames (dirCreateDirWindows, wToPrefixedFileW), and
+/// every page they touched stayed resident for the host's life (deep dive,
+/// 2026-10-17: 524 KiB of main-thread stack, 256 KiB of it in use once the
+/// widgets tick). Below the caller those pages are dead; discarded, Windows
+/// drops them, and a later call that reaches as deep gets fresh pages.
+/// Must not be inlined (see its call).
+fn discardDeadStack() void {
+    const page = std.heap.page_size_min;
+    const tib = &std.os.windows.teb().NtTib;
+    const low = @intFromPtr(tib.StackLimit);
+    var here: u8 = 0;
+    // Slack under this frame for DiscardVirtualMemory's own stack: 4,296
+    // bytes plus saved registers on KernelBase 10.0.26100 (review of #117);
+    // eight pages leave room for other Windows builds.
+    const high = std.mem.alignBackward(usize, @intFromPtr(&here), page) -| 8 * page;
+    if (high <= low) return;
+    _ = DiscardVirtualMemory(@ptrFromInt(low), high - low);
+}
+
+extern "kernel32" fn DiscardVirtualMemory(address: *anyopaque, size: usize) callconv(.winapi) u32;
+extern "kernel32" fn SetErrorMode(mode: u32) callconv(.winapi) u32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) c_int;
+extern "kernel32" fn GetSystemTimeAsFileTime(time: *u64) callconv(.winapi) void;
+
+/// Hand the daemon's load or unload to the UI thread (`applyControl`).
+fn postControl(pending: *host_control.Pending) void {
+    control_mailbox.post(pending);
+    requestExternalWake("control");
+}
+
+/// Loads every widget on a short-lived thread. Loading reads manifests,
+/// bundles, fonts, images and stores through std.Io, whose Windows file
+/// calls take 256-512 KiB stack frames; a thread's stack is released when it
+/// exits, where the UI thread's high-water mark would stay resident for the
+/// host's whole life.
+const Loader = struct {
+    environment: HostEnvironment,
+    directories: []const []const u8,
+    widgets: std.ArrayList(*Model) = .empty,
+    failure: ?anyerror = null,
+
+    fn run(self: *Loader) !std.ArrayList(*Model) {
+        const thread = try std.Thread.spawn(.{ .stack_size = loader_stack_bytes }, load, .{self});
+        thread.join();
+        if (self.failure) |err| return err;
+        return self.widgets;
+    }
+
+    fn load(self: *Loader) void {
+        const allocator = self.environment.init.arena.allocator();
+        std.Io.Dir.cwd().createDirPath(self.environment.init.io, self.environment.log_directory) catch |err| {
+            self.failure = err;
+            return;
+        };
+        for (self.directories, 0..) |directory, argument| {
+            const slot: u16 = @intCast(self.widgets.items.len);
+            const model = loadWidget(self.environment, directory, slot, self.environment.channels(@intCast(argument))) catch |err| {
+                // One widget's broken install must not keep the others off
+                // the desktop; a lone widget fails the process as it always
+                // has.
+                if (self.directories.len == 1) {
+                    self.failure = err;
+                    return;
+                }
+                std.debug.print("weaver-widget --host: skipping {s}: {s}\n", .{ directory, @errorName(err) });
+                reportLoadFailure(self.environment.init.io, self.environment.channels(@intCast(argument)).backend_file, err);
+                continue;
+            };
+            self.widgets.append(allocator, model) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    }
+};
+
 /// Load one widget into `slot`: its manifest, log, storage, placement,
-/// provider channel, and engine, then evaluate its bundle. Everything it
-/// allocates lives as long as the process.
-fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, argument: u16) !*Model {
+/// provider channel, and engine, then evaluate its bundle. What it
+/// allocates lives in the widget's arena (`freeModel`).
+fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, channels: WidgetChannels) !*Model {
     const init = environment.init;
-    const allocator = init.arena.allocator();
     const capture_state_root = environment.capture_state_root;
+    const model = try createModel();
+    model.arena = .init(small_allocator);
+    const allocator = (&model.arena.?).allocator();
+    // A failed load must stop the provider reader and free the engine
+    // before the Model goes: the host keeps running the other widgets.
+    errdefer {
+        unloadWidget(model);
+        freeModel(model);
+    }
     const loaded = try manifest_mod.load(init.io, allocator, std.heap.page_allocator, directory);
     // The engine compiles the source; keeping it would hold every widget's
     // bundle text resident for the life of the host (a dev hot swap reads
     // the file again).
     defer std.heap.page_allocator.free(loaded.bundle);
-    const model = try createModel();
-    // A failed load must stop the provider reader and free the engine
-    // before the Model goes: the host keeps running the other widgets.
-    errdefer {
-        unloadWidget(model);
-        std.heap.page_allocator.destroy(model);
-    }
     model.slot = slot;
-    model.argument = argument;
-    crash_breadcrumb.mark(argument);
-    model.backend_status_path = environment.widgetSetting("WEAVER_BACKEND_FILE", argument);
+    model.backend_status_path = if (channels.backend_file) |path| try allocator.dupe(u8, path) else null;
     const log_name = try safeLogName(allocator, loaded.manifest.name);
     model.log = try allocator.create(widget_log.Sink);
     model.log.* = .{};
@@ -1923,14 +2445,14 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     const image_resolver = try allocator.create(image_paths.Resolver);
     image_resolver.* = try image_paths.Resolver.init(
         init.io,
-        std.heap.page_allocator,
+        small_allocator,
         directory,
-        if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
+        environment.art_cache_root,
     );
     model.image_resolver = image_resolver;
     // Fonts load with the widget, so a missing face is this widget's
     // load failure, not the host's.
-    model.font_registrations = try slottedFontRegistrations(init.io, allocator, directory, slot, loaded.manifest.fonts);
+    model.font_registrations = try fontRegistrations(init.io, allocator, directory, loaded.manifest.fonts);
 
     model.geometry = geometry_store;
     model.fonts = loaded.manifest.fonts;
@@ -1939,12 +2461,17 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         const capture_command_fixture = try allocator.create(provider_mod.CaptureCommandFixture);
         capture_command_fixture.* = .{ .commands = fixture.commands };
         model.provider.initCaptureFixture(init.io, capture_command_fixture);
+    } else if (builtin.os.tag == .windows and host_providers != null and capture_state_root == null) {
+        // In the anchored host: the host's own providers, in process.
+        const wants = provider_service.Wants.fromManifest(loaded.manifest.subscribe, loaded.manifest.capabilities);
+        if (wants.any()) {
+            try model.provider.initLocal(init.io, host_providers.?, wants, slot);
+        } else {
+            try model.provider.init(init.io, null);
+        }
     } else {
         try model.provider.init(init.io, if (capture_state_root == null)
-            platform.providerEndpoint(
-                environment.widgetSetting("WEAVER_HOST_PIPE", argument),
-                environment.widgetSetting("WEAVER_HOST_ENDPOINT", argument),
-            )
+            platform.providerEndpoint(channels.host_pipe, channels.host_endpoint)
         else
             null);
     }
@@ -1961,7 +2488,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         if (std.mem.eql(u8, capability, "media-transport")) break true;
     } else false;
     const engine = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         &model.tree,
         storage,
         loaded.manifest.origins,
@@ -1975,6 +2502,9 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
             try engine.setCaptureClock(epoch_ms);
         }
     }
+    // Its turns mark the crash record with its slot and bundle.
+    engine.crash_slot = slot;
+    engine.crash_bundle = std.hash.Wyhash.hash(0, loaded.bundle);
     model.engine = engine;
     model.io = init.io;
     model.storage = storage;
@@ -1997,7 +2527,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         if (value.len != 0 and !std.mem.eql(u8, value, "0")) {
             const usage = engine.memoryUsage();
             std.log.info(
-                "widget memory receipt model_bytes={d} host_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
+                "widget memory receipt model_bytes={d} host_app_bytes={d} tree_bytes={d} node_bytes={d} canvas_state_bytes={d} engine_bytes={d} quickjs_widget_heap_bytes={d} quickjs_widget_heap_grown_bytes={d} quickjs_runtime_malloc_bytes={d} quickjs_memory_used_bytes={d} quickjs_atoms_bytes={d} quickjs_strings_bytes={d} quickjs_objects_bytes={d} quickjs_properties_bytes={d} quickjs_shapes_bytes={d} quickjs_functions_bytes={d} quickjs_function_code_bytes={d}",
                 .{
                     @sizeOf(Model),
                     @sizeOf(HostApp),
@@ -2005,6 +2535,8 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
                     @sizeOf(tree_mod.Node),
                     @sizeOf(tree_mod.CanvasState),
                     @sizeOf(js_engine.Engine),
+                    engine.heapBytes(),
+                    engine.heapGrownBytes(),
                     usage.malloc_size,
                     usage.memory_used_size,
                     usage.atom_size,
@@ -2023,6 +2555,9 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         model.tree.showError("WidgetDidNotRenderRoot\nThe bundle completed without rendering a widget root.");
     }
     if (model.provider.fatalChannelFailure()) return error.FatalProviderChannelFailure;
+    // Its bundle ran: now it may take font ids (`assignFontIds`). A widget
+    // whose faces do not fit fails here, like any other load failure.
+    try assignFontIds(model);
     if (loadLocalImages(init.io, allocator, directory, model)) |_| {
         seedImageStates(model) catch |err| {
             std.log.err("initial widget image state failed: {s}", .{@errorName(err)});
@@ -2043,29 +2578,121 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
 
 /// The daemon reads `failed:<error>` from the widget's backend status file
 /// as "this widget did not load"; a running widget writes its renderer there.
-fn reportLoadFailure(environment: HostEnvironment, argument: u16, err: anyerror) void {
-    const path = environment.widgetSetting("WEAVER_BACKEND_FILE", argument) orelse return;
+fn reportLoadFailure(io: std.Io, backend_file: ?[]const u8, err: anyerror) void {
+    const path = backend_file orelse return;
     var buffer: [96]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, "failed:{s}", .{@errorName(err)}) catch "failed:";
-    std.Io.Dir.cwd().writeFile(environment.init.io, .{ .sub_path = path, .data = text }) catch {};
+    small_fs.write(io, path, text) catch {};
 }
 
 fn unloadWidget(model: *Model) void {
     widget_log.use(model.log);
-    if (model.engine) |engine| engine.destroy(std.heap.page_allocator);
+    if (model.engine) |engine| engine.destroy(small_allocator);
     model.engine = null;
     model.provider.deinit();
     deinitImageStates(model);
     model.tree.deinit();
     if (model.image_resolver) |resolver| @constCast(resolver).deinit();
     model.image_resolver = null;
+    widget_log.deinit(model.log);
+}
+
+/// Free an unloaded widget's Model and everything its load allocated.
+fn freeModel(model: *Model) void {
+    if (model.arena) |*arena| arena.deinit();
+    native_sdk.lazy_commit.destroy(model);
+}
+
+/// Carry out the daemon's waiting command, if there is one. Runs on the
+/// UI thread, between widget turns.
+fn applyControl(host: *Host, effects: *Effects) void {
+    const pending = control_mailbox.take() orelse return;
+    defer pending.done.set(control_environment.?.init.io);
+    const outcome = switch (pending.command) {
+        .add => |add| addWidget(host, effects, add),
+        .remove => |remove| removeWidget(host, effects, remove.id),
+    };
+    if (outcome) |_| {} else |err| pending.failure = err;
+}
+
+fn addWidget(host: *Host, effects: *Effects, add: host_control.Add) anyerror!void {
+    if (add.id >= max_anchored_widgets) {
+        std.log.err("control add refused: max_anchored_widgets={d}, asked for slot {d}", .{ max_anchored_widgets, add.id });
+        return error.SlotOutOfRange;
+    }
+    if (host.widgets[add.id] != null) return error.SlotTaken;
+    const started_ms = platform.monotonicMilliseconds();
+    var load: WidgetLoad = .{
+        .directory = add.dir,
+        .slot = add.id,
+        .channels = .{ .backend_file = add.backend },
+    };
+    const model = try load.run();
+    errdefer {
+        unloadWidget(model);
+        freeModel(model);
+    }
+    try registerWidgetFonts(diagnostic_runtime.?, model);
+    host.widgets[add.id] = model;
+    initEffects(enter(model), .{ .fx = effects, .slot = add.id });
+    std.log.info("widget added to the running host slot={d} load_ms={d}", .{ add.id, platform.monotonicMilliseconds() - started_ms });
+}
+
+/// Loads a widget the daemon adds on a short-lived thread, as `Loader`
+/// does and for the same reason. The UI thread waits for it, so the
+/// bundle evaluates while no other widget's code runs.
+const WidgetLoad = struct {
+    directory: []const u8,
+    slot: u16,
+    channels: WidgetChannels,
+    model: ?*Model = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *WidgetLoad) !*Model {
+        const thread = try std.Thread.spawn(.{ .stack_size = loader_stack_bytes }, load, .{self});
+        thread.join();
+        if (self.failure) |err| return err;
+        return self.model.?;
+    }
+
+    fn load(self: *WidgetLoad) void {
+        self.model = loadWidget(control_environment.?, self.directory, self.slot, self.channels) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+};
+
+fn removeWidget(host: *Host, effects: *Effects, slot: u16) anyerror!void {
+    if (slot >= max_host_widgets) return error.SlotOutOfRange;
+    const model = host.widgets[slot] orelse return error.NoWidgetInSlot;
+    retireWidget(enter(model), .{ .fx = effects, .slot = slot });
+    host.widgets[slot] = null;
+    unloadWidget(model);
+    freeModel(model);
+    // Its provider reader has stopped; a wake it raised is stale.
+    provider_wake_pending[slot].store(false, .release);
+    dev_reload_pending[slot].store(false, .release);
+}
+
+/// Hand back what a widget holds in the shared Native runtime before it
+/// unloads: its unsaved dragged position, its timers, its images.
+fn retireWidget(model: *Model, effects: WidgetEffects) void {
+    persistGeometry(model);
+    for (model.armed_timers) |armed| {
+        if (armed.id != 0) effects.cancelTimer(armed.id);
+    }
+    for ([_]u64{ fetch_poll_key, provider_poll_key, media_deadline_key, geometry_save_key }) |key| effects.cancelTimer(key);
+    for (model.images[0..model.image_count]) |image| _ = effects.unregisterImage(image.id);
+    for (model.image_states[0..model.image_state_count]) |state| {
+        if (state.registered) _ = effects.unregisterImage(state.id);
+    }
 }
 
 /// Route this process's logging to `model` and return it: every host hook
 /// enters the widget it is about to run.
 fn enter(model: *Model) *Model {
     widget_log.use(model.log);
-    crash_breadcrumb.mark(model.argument);
     return model;
 }
 
@@ -2084,7 +2711,10 @@ fn widgetForWindow(host: *const Host, window_label: []const u8) ?*Model {
 }
 
 fn hostInitEffects(host: *Host, effects: *Effects) void {
-    for (host.widgets) |model| initEffects(enter(model), .{ .fx = effects, .slot = model.slot });
+    for (host.widgets) |slot_model| {
+        const model = slot_model orelse continue;
+        initEffects(enter(model), .{ .fx = effects, .slot = model.slot });
+    }
 }
 
 fn hostUpdate(host: *Host, message: HostMsg, effects: *Effects) void {
@@ -2094,8 +2724,10 @@ fn hostUpdate(host: *Host, message: HostMsg, effects: *Effects) void {
         // this turns that frame boundary into the ordinary update/rebuild
         // path for each widget with a wake. Static widgets therefore
         // hot-swap without borrowing a GPU completion from animation,
-        // input, or resize.
-        for (host.widgets) |model| {
+        // input, or resize. The daemon's control commands ride it too.
+        applyControl(host, effects);
+        for (host.widgets) |slot_model| {
+            const model = slot_model orelse continue;
             const provider = provider_wake_pending[model.slot].swap(false, .acq_rel);
             const dev = dev_reload_pending[model.slot].swap(false, .acq_rel);
             if (!provider and !dev) continue;
@@ -2108,6 +2740,7 @@ fn hostUpdate(host: *Host, message: HostMsg, effects: *Effects) void {
 }
 
 fn hostView(ui: *WidgetUi, host: *const Host) WidgetUi.Node {
+    if (anchored_host) return ui.panel(.{}, .{});
     return view(ui, widgetFor(host, 0).?);
 }
 
@@ -2117,6 +2750,7 @@ fn hostWindowView(ui: *WidgetUi, host: *const Host, window_label: []const u8) Wi
 }
 
 fn hostViewRevision(host: *const Host) u64 {
+    if (anchored_host) return 0;
     return viewRevision(widgetAt(host, 0).?);
 }
 
@@ -2140,6 +2774,7 @@ fn hostProjectUpdate(
 }
 
 fn hostSync(host: *Host, layout: native_sdk.canvas.WidgetLayoutTree) void {
+    if (anchored_host) return;
     syncNativeState(widgetFor(host, 0).?, layout);
 }
 
@@ -2148,6 +2783,7 @@ fn hostWindowSync(host: *Host, window_label: []const u8, layout: native_sdk.canv
 }
 
 fn hostOnFrame(host: *const Host, frame: native_sdk.platform.GpuFrame) ?HostMsg {
+    if (anchored_host) return null;
     const msg = onFrame(widgetFor(host, 0).?, frame) orelse return null;
     return .{ .widget = 0, .msg = msg };
 }
@@ -2159,10 +2795,11 @@ fn hostWindowOnFrame(host: *const Host, window_label: []const u8, frame: native_
 }
 
 fn hostOnFrameRequested(host: *const Host) ?HostMsg {
-    for (host.widgets) |model| {
-        if (provider_wake_pending[model.slot].load(.acquire) or dev_reload_pending[model.slot].load(.acquire)) {
-            return .{ .widget = every_widget, .msg = .{ .external_wake = .{ .provider = false, .dev_reload = false } } };
-        }
+    const wake: HostMsg = .{ .widget = every_widget, .msg = .{ .external_wake = .{ .provider = false, .dev_reload = false } } };
+    if (control_mailbox.waiting()) return wake;
+    for (host.widgets) |slot_model| {
+        const model = slot_model orelse continue;
+        if (provider_wake_pending[model.slot].load(.acquire) or dev_reload_pending[model.slot].load(.acquire)) return wake;
     }
     return null;
 }
@@ -2181,11 +2818,12 @@ fn hostOnWindowFrame(event: native_sdk.runtime.WindowFrameEvent) ?HostMsg {
     return null;
 }
 
-/// Slots 1 and up open as declared windows: placed, layered and rendered
-/// exactly like slot 0's startup window.
+/// Every slot past the main window's opens as a declared window: placed,
+/// layered and rendered exactly like a startup window.
 fn hostWindows(host: *const Host, scratch: *HostApp.WindowsScratch) []const HostApp.WindowDescriptor {
     var count: usize = 0;
-    for (host.widgets[1..]) |model| {
+    for (host.widgets[firstDeclaredSlot()..]) |slot_model| {
+        const model = slot_model orelse continue;
         scratch.windows[count] = .{
             .label = windowLabel(model.slot),
             .canvas_label = canvasLabel(model.slot),
@@ -2224,7 +2862,7 @@ fn wakeFns(comptime pending: *[max_host_widgets]std.atomic.Value(bool)) [max_hos
 
 fn captureWidget(context: *anyopaque) *Model {
     const app_state: *HostApp = @ptrCast(@alignCast(context));
-    return enter(app_state.model.widgets[0]);
+    return enter(app_state.model.widgets[0].?);
 }
 
 fn advanceCaptureClock(context: *anyopaque, milliseconds: u64) !void {
@@ -2505,9 +3143,27 @@ fn draggedOriginVisible(saved: geometry_mod.Saved, size: [2]f32) bool {
 fn publishBackendStatus(model: *const Model, backend: native_sdk.platform.GpuSurfaceBackend) void {
     const io = backend_status_io orelse return;
     const path = model.backend_status_path orelse return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = backendStatusLabel(backend) }) catch |err| {
+    small_fs.write(io, path, backendStatusLabel(backend)) catch |err| {
         std.log.warn("widget could not publish renderer status: {s}", .{@errorName(err)});
     };
+    // The Windows daemon host writes status.json only when something
+    // changes or someone asks (daemon.zig): this is a change it cannot see,
+    // whether the widget runs in the host or is a dev widget of its own.
+    if (builtin.os.tag == .windows) requestHostStatus();
+}
+
+/// Ask the daemon host to rewrite status.json (host_contract
+/// status_request_event). Nothing to ask when no host runs.
+fn requestHostStatus() void {
+    const Kernel = struct {
+        extern "kernel32" fn OpenEventW(access: u32, inherit: std.os.windows.BOOL, name: [*:0]const u16) callconv(.winapi) ?std.os.windows.HANDLE;
+        extern "kernel32" fn SetEvent(event: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn CloseHandle(handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+    };
+    const event_modify_state: u32 = 0x0002;
+    const event = Kernel.OpenEventW(event_modify_state, .FALSE, host_contract.status_request_event) orelse return;
+    _ = Kernel.SetEvent(event);
+    _ = Kernel.CloseHandle(event);
 }
 
 fn backendStatusLabel(backend: native_sdk.platform.GpuSurfaceBackend) []const u8 {
@@ -2539,7 +3195,8 @@ fn startRendererDiagnostics(context: *anyopaque, runtime: *native_sdk.Runtime) !
     diagnostic_runtime = runtime;
     wake_runtime.store(@intFromPtr(runtime), .release);
     var wake_pending = false;
-    for (app_state.model.widgets) |model| {
+    for (app_state.model.widgets) |slot_model| {
+        const model = slot_model orelse continue;
         wake_pending = wake_pending or dev_reload_pending[model.slot].load(.acquire) or provider_wake_pending[model.slot].load(.acquire);
         _ = enter(model);
         if (model.window.backend != .software) {
@@ -2549,6 +3206,9 @@ fn startRendererDiagnostics(context: *anyopaque, runtime: *native_sdk.Runtime) !
         }
     }
     if (wake_pending) try runtime.options.platform.services.requestFrame();
+    // Every load and unload wakes the runtime, so the daemon's management
+    // starts only once it can be woken.
+    if (builtin.os.tag == .windows) if (daemon) |management| try management.start();
 }
 
 fn requestExternalWake(label: []const u8) void {
@@ -2583,10 +3243,21 @@ test {
     _ = @import("geometry.zig");
     _ = @import("manifest.zig");
     _ = @import("network.zig");
+    _ = @import("lazy_dll.zig");
     _ = @import("storage.zig");
     _ = @import("provider.zig");
     _ = @import("widget_diagnostic.zig");
     _ = @import("widget_log.zig");
+    _ = @import("small_fs.zig");
+    _ = @import("host_control.zig");
+    _ = @import("crash_record.zig");
+    if (builtin.os.tag == .windows) {
+        _ = provider_service;
+        _ = dev_widgets_mod;
+        _ = daemon_mod;
+        _ = host_lifecycle;
+        _ = @import("provider_windows.zig");
+    }
     const automatic_software_backend: native_sdk.app_manifest.GpuSurfaceBackend =
         if (@import("builtin").os.tag == .macos) .metal else .software;
     try std.testing.expectEqual(automatic_software_backend, declaredGpuBackend("software", false));
@@ -2728,9 +3399,9 @@ test "dev reload crosses requestFrame into the frame-requested hook exactly once
     const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{});
     defer harness.destroy(std.testing.allocator);
     const model = try createModel();
-    defer std.heap.page_allocator.destroy(model);
-    const widgets = [_]*Model{model};
-    var app_state: TestApp = .{ .host = .{ .widgets = &widgets } };
+    defer native_sdk.lazy_commit.destroy(model);
+    var app_state: TestApp = .{ .host = .{} };
+    app_state.host.widgets[0] = model;
     const app = app_state.app();
     try harness.start(app);
 
@@ -2984,6 +3655,26 @@ test "path icon projection parses normalized geometry and preserves viewBox stro
     }
 }
 
+test "a widget whose new faces do not all fit takes no font ids" {
+    const saved_count = content_font_count;
+    defer content_font_count = saved_count;
+    // One id left.
+    content_font_count = content_fonts.len - 1;
+    for (content_fonts[0..content_font_count], 0..) |*font, index| font.* = .{ .hash = index, .len = 0, .id = native_sdk.canvas.min_registered_font_id + index };
+    const model = try createModel();
+    defer native_sdk.lazy_commit.destroy(model);
+    var two = [_]HostApp.FontRegistration{ .{ .id = 0, .name = "a", .ttf = "face a" }, .{ .id = 0, .name = "b", .ttf = "face b" } };
+    model.font_registrations = &two;
+    try std.testing.expectError(error.FontRegistryFull, assignFontIds(model));
+    try std.testing.expectEqual(content_fonts.len - 1, content_font_count);
+    // The same face twice is one new face, and it fits.
+    var repeated = [_]HostApp.FontRegistration{ .{ .id = 0, .name = "a", .ttf = "face a" }, .{ .id = 0, .name = "a2", .ttf = "face a" } };
+    model.font_registrations = &repeated;
+    try assignFontIds(model);
+    try std.testing.expectEqual(content_fonts.len, content_font_count);
+    try std.testing.expectEqual(repeated[0].id, repeated[1].id);
+}
+
 test "showcase headline keeps exact registered face through bold and text shadow" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3009,6 +3700,9 @@ test "showcase headline keeps exact registered face through bold and text shadow
         .file = "assets/GeistPixel-Square.ttf",
     }};
     model.fonts = &fonts;
+    // Registered under the id of its contents, not its manifest id.
+    var registrations = [_]HostApp.FontRegistration{.{ .id = 70, .name = "GeistPixel-Square.ttf", .ttf = "" }};
+    model.font_registrations = &registrations;
 
     var ui = WidgetUi.init(arena_state.allocator());
     const built = try ui.finalize(buildNodeForTest(&ui, &model, text_node, true));
@@ -3025,7 +3719,7 @@ test "showcase headline keeps exact registered face through bold and text shadow
         else => return error.TestExpectedEqual,
     }
     switch (built.root.immediate_commands[2]) {
-        .text_font => |font_id| try std.testing.expectEqual(@as(native_sdk.canvas.FontId, 65), font_id),
+        .text_font => |font_id| try std.testing.expectEqual(@as(native_sdk.canvas.FontId, 70), font_id),
         else => return error.TestExpectedEqual,
     }
 }
@@ -3222,4 +3916,40 @@ test "retained image projects fit tiling and class corner radii" {
     try std.testing.expect(projected.widget.image_tile);
     try std.testing.expectEqual(@as(?f32, 12), projected.widget.style.radius);
     try std.testing.expectEqual(@as(?f32, 3), projected.widget.cornerRadii().top_right);
+}
+
+test "a widget's Model is committed as it is touched" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const before = testPrivateBytes();
+    const model = try createModel();
+    defer native_sdk.lazy_commit.destroy(model);
+    // 4.3 MB of node and canvas capacity; a fresh Model touches its fields only.
+    try std.testing.expect(@sizeOf(Model) > 4 * 1024 * 1024);
+    try std.testing.expect(testPrivateBytes() -| before < 1024 * 1024);
+}
+
+/// This process's commit charge (private bytes): what a test pins a
+/// structure's commit against.
+fn testPrivateBytes() usize {
+    const Counters = extern struct {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    };
+    const api = struct {
+        extern "kernel32" fn K32GetProcessMemoryInfo(process: std.os.windows.HANDLE, counters: *Counters, size: u32) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
+    };
+    var counters = std.mem.zeroes(Counters);
+    counters.cb = @sizeOf(Counters);
+    _ = api.K32GetProcessMemoryInfo(api.GetCurrentProcess(), &counters, counters.cb);
+    return counters.private_usage;
 }
