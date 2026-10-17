@@ -1015,6 +1015,9 @@ pub fn drainFetches(ctx: *c.JSContext, bridge_state: *State) void {
             const call_result = c.JS_Call(ctx, slot.resolve, qjs.undefinedValue(), 1, &arguments);
             c.JS_FreeValue(ctx, call_result);
             c.JS_FreeValue(ctx, response);
+        } else if (work.result.failure == .unavailable) {
+            var buffer: [640]u8 = undefined;
+            rejectPromise(ctx, slot.reject, std.fmt.bufPrint(&buffer, "FetchUnavailable: wfetch cannot run on this machine: {s}", .{network.unavailableReason()}) catch "FetchUnavailable: wfetch cannot run on this machine: WINHTTP.dll could not be loaded");
         } else {
             rejectPromise(ctx, slot.reject, switch (work.result.failure) {
                 .invalid_url => "HttpsRequired: wfetch accepts only https:// URLs",
@@ -1023,7 +1026,7 @@ pub fn drainFetches(ctx: *c.JSContext, bridge_state: *State) void {
                 .response_too_large => "ResponseTooLarge: wfetch response exceeds 5 MB",
                 .cancelled => "FetchCancelled: request was cancelled",
                 .request_failed => "FetchFailed: request failed",
-                .none => unreachable,
+                .none, .unavailable => unreachable,
             });
         }
         c.JS_FreeValue(ctx, slot.resolve);

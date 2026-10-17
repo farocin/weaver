@@ -132,7 +132,9 @@ fn addPlatformLinkage(b: *std.Build, compile: *std.Build.Step.Compile, os_tag: s
             }));
             // Process memory counters for the daemon's status rows.
             compile.root_module.linkSystemLibrary("psapi", .{});
-            compile.root_module.linkSystemLibrary("winhttp", .{});
+            // No winhttp: network.zig loads WINHTTP.dll on the first fetch
+            // (lazy_dll.zig), so a host whose widgets never fetch never
+            // maps it.
             // windows_monitor.cpp: virtual-screen metrics (user32) and
             // the DPI fallback (gdi32). The exe gets both transitively
             // through the Native SDK host; the test binary links the

@@ -3216,6 +3216,7 @@ test {
     _ = @import("geometry.zig");
     _ = @import("manifest.zig");
     _ = @import("network.zig");
+    _ = @import("lazy_dll.zig");
     _ = @import("storage.zig");
     _ = @import("provider.zig");
     _ = @import("widget_diagnostic.zig");
