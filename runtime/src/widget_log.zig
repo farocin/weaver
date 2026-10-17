@@ -24,8 +24,20 @@ pub const Sink = struct {
 /// (or after the last one is gone) are dropped, as before `init`.
 var current: ?*Sink = null;
 
+/// Set on a thread that runs no widget's code (the host's provider
+/// threads): `current` belongs to the UI thread, which may switch or free
+/// it at any moment, so this thread's lines are dropped instead.
+threadlocal var detached = false;
+
+/// The calling thread runs no widget's code; see `detached`.
+pub fn detachThread() void {
+    detached = true;
+}
+
 pub fn init(sink: *Sink, runtime_io: std.Io, path: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+    // Two short paths: the C heap packs them; `page_allocator` rounded each
+    // to its own 4 KiB page.
+    const allocator = std.heap.c_allocator;
     const next_path = try allocator.dupe(u8, path);
     errdefer allocator.free(next_path);
     const next_old_path = try std.fmt.allocPrint(allocator, "{s}.old", .{path});
@@ -44,15 +56,41 @@ pub fn use(sink: *Sink) void {
     current = sink;
 }
 
+/// Release a widget's sink when it unloads; logging goes nowhere until the
+/// next `use` if it was current.
+pub fn deinit(sink: *Sink) void {
+    if (current == sink) current = null;
+    if (sink.path.len > 0) std.heap.c_allocator.free(sink.path);
+    if (sink.old_path.len > 0) std.heap.c_allocator.free(sink.old_path);
+    sink.path = &.{};
+    sink.old_path = &.{};
+}
+
 pub fn logFn(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Never inlined, so the 8 KiB line buffer lives only while a line is
+    // written. Inlined, it sat in the frames of every function that logs,
+    // the host's per-tick ones included (Native's frame and rebuild
+    // handlers, `view`, `update`), and the Windows stack probe touches every
+    // page of a frame on entry whether or not the log line runs. (Marking
+    // `logFn` itself `noinline` did not stop the inlining in a ReleaseFast
+    // build; this call does.)
+    @call(.never_inline, writeLogLine, .{ level, scope, format, args });
+}
+
+fn writeLogLine(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
     // reportError forwards at most 6,000 detail bytes; 8 KiB leaves >2 KiB
-    // for timestamp/level/scope and formatting. The stack cost exists only
-    // during one log call.
+    // for timestamp/level/scope and formatting.
+    if (detached) return;
     const sink = current orelse return;
     var buffer: [8192]u8 = undefined;
     const line = formatLogLine(level, scope, format, args, &buffer) catch |err| return noteFailure(sink, err);
