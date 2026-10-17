@@ -112,6 +112,7 @@ pub const Client = struct {
         if (self.stream) |stream| _ = c.shutdown(stream.socket.handle, c.SHUT_RDWR);
         if (self.thread) |thread| thread.join();
         self.thread = null;
+        self.queues.deinit();
         if (self.stream) |stream| stream.close(self.io);
         self.stream = null;
         self.capture_fixture = null;
