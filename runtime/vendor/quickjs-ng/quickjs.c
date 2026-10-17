@@ -2174,14 +2174,15 @@ static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
     assert(!rt->in_free);
 
     /* Weaver: a collection in one context can queue another context's
-       job; the embedder charges the entry to the job's context, or to the
-       program its tag names, and says so by returning non-NULL. When that context is full the job is
+       job; the embedder charges the entry to the job's context, or, for a
+       job queued under an explicit tag (a FinalizationRegistry cleanup), to
+       the program that tag names, and says so by returning non-NULL. When that context is full the job is
        dropped without throwing: the running context's pending exception
        is not this job's to replace. */
     if (!tagged)
         tag = rt->job_tag ? rt->job_tag(ctx) : 0;
     {
-        void *restore = rt->charge_job ? rt->charge_job(ctx, tag, NULL) : NULL;
+        void *restore = rt->charge_job ? rt->charge_job(ctx, tagged ? tag : 0, NULL) : NULL;
         e = js_malloc_rt(rt, sizeof(*e) + argc * sizeof(JSValue));
         if (restore)
             rt->charge_job(NULL, 0, restore);

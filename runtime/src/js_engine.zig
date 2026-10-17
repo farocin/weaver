@@ -263,8 +263,9 @@ fn chargeJob(context: ?*c.JSContext, tag: usize, restore: ?*anyopaque) callconv(
         heap().current = @intCast(@intFromPtr(restore) - 1);
         return null;
     };
-    // A tagged job is its tag's widget's (`jobTagOf`): in a shared realm a
-    // registry's cleanup is its creator's, whoever's turn collected.
+    // A job queued under an explicit tag is its tag's widget's
+    // (`jobTagOf`): a registry's cleanup is its creator's, whoever's turn
+    // collected. Any other job is its context's widget's.
     const owner: js_heap.Owner = if (tag != 0) @intCast(tag - 1) else (engineOf(js) orelse return null).owner;
     const previous = heap().current;
     if (owner == previous) return null;
@@ -1725,6 +1726,25 @@ test "in the shared realm each widget has its own performance time origin" {
     try std.testing.expect(second_origin >= first_origin + 20);
     // performance.now() counts from the widget's own origin.
     try std.testing.expect(try readNumberGlobal(second, "now") < 20);
+}
+
+fn noopJob(_: ?*c.JSContext, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+    return qjs.undefinedValue();
+}
+
+test "in a realm of its own a job queued outside a turn is its widget's memory" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const widget = try widgets.engine(0);
+    defer widget.destroy(std.testing.allocator);
+    try std.testing.expectEqual(heap().hostOwner(), heap().current);
+    const before = widget.heapBytes();
+    const host_before = heap().usedBytes(heap().hostOwner());
+    try std.testing.expectEqual(@as(c_int, 0), c.JS_EnqueueJob(widget.context, noopJob, 0, null));
+    try std.testing.expect(widget.heapBytes() > before);
+    try std.testing.expectEqual(host_before, heap().usedBytes(heap().hostOwner()));
+    try widget.evaluate("globalThis.tick = 1;", "tick.js");
 }
 
 test "a widget in the shared realm costs far less than a realm of its own" {

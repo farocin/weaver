@@ -47,9 +47,10 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   tag of the program that made it, and its cleanup jobs are queued under
   that tag, not the tag of whichever program's turn ran the collection.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
-  around allocating a job, with the job's tag, so a garbage collection in
-  one widget's turn charges another widget's queued cleanup job to that
-  widget's heap (the one its tag names).
+  around allocating a job, so a garbage collection in one widget's turn
+  charges another widget's queued cleanup job to that widget's heap: a job
+  queued under an explicit tag (a FinalizationRegistry cleanup) is charged
+  to the program that tag names, any other to its context's program.
 - `JS_SetChargeSharedFunc(rt, func)` (`quickjs.h`): QuickJS calls `func`
   around growing a runtime-wide table (atom hash and array, shape hash), so
   the table is charged to the host's heap, not to the widget whose turn grew
