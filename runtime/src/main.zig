@@ -1415,14 +1415,9 @@ var content_fonts: [native_sdk.runtime.max_registered_canvas_fonts]ContentFont =
 var content_font_count: usize = 0;
 
 fn contentFontId(ttf: []const u8) !native_sdk.canvas.FontId {
+    if (knownFontId(ttf)) |id| return id;
     const hash = std.hash.Wyhash.hash(0, ttf);
-    for (content_fonts[0..content_font_count]) |font| {
-        if (font.hash == hash and font.len == ttf.len) return font.id;
-    }
-    if (content_font_count == content_fonts.len) {
-        std.log.err("font registry full: max_registered_canvas_fonts={d}, asked for {d}", .{ content_fonts.len, content_fonts.len + 1 });
-        return error.FontRegistryFull;
-    }
+    if (content_font_count == content_fonts.len) return error.FontRegistryFull;
     const id: native_sdk.canvas.FontId = native_sdk.canvas.min_registered_font_id + content_font_count;
     content_fonts[content_font_count] = .{ .hash = hash, .len = ttf.len, .id = id };
     content_font_count += 1;
@@ -1430,10 +1425,35 @@ fn contentFontId(ttf: []const u8) !native_sdk.canvas.FontId {
 }
 
 /// Give a loaded widget's faces their content ids. Only a widget that
-/// loaded takes entries in the table: one that fails never registers its
-/// faces, and must not use up ids the host can never give back.
+/// loaded takes entries in the table, and only if all its new faces fit: a
+/// widget refused for a full table must not use up ids the host can never
+/// give back.
 fn assignFontIds(model: *Model) !void {
-    for (model.font_registrations) |*registration| registration.id = try contentFontId(registration.ttf);
+    var new_faces: usize = 0;
+    for (model.font_registrations, 0..) |registration, index| {
+        if (knownFontId(registration.ttf) != null) continue;
+        const repeated = for (model.font_registrations[0..index]) |earlier| {
+            if (sameFace(earlier.ttf, registration.ttf)) break true;
+        } else false;
+        if (!repeated) new_faces += 1;
+    }
+    if (content_font_count + new_faces > content_fonts.len) {
+        std.log.warn("font registry full: max_registered_canvas_fonts={d}, {d} in use, this widget asked for {d} more", .{ content_fonts.len, content_font_count, new_faces });
+        return error.FontRegistryFull;
+    }
+    for (model.font_registrations) |*registration| registration.id = contentFontId(registration.ttf) catch unreachable;
+}
+
+fn knownFontId(ttf: []const u8) ?native_sdk.canvas.FontId {
+    const hash = std.hash.Wyhash.hash(0, ttf);
+    for (content_fonts[0..content_font_count]) |font| {
+        if (font.hash == hash and font.len == ttf.len) return font.id;
+    }
+    return null;
+}
+
+fn sameFace(a: []const u8, b: []const u8) bool {
+    return a.len == b.len and std.hash.Wyhash.hash(0, a) == std.hash.Wyhash.hash(0, b);
 }
 
 /// Register a widget's faces the runtime does not have yet: an anchored
@@ -1860,7 +1880,6 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     // (`contentFontId`).
     var fonts: std.ArrayList(HostApp.FontRegistration) = .empty;
     for (widgets.items) |model| {
-        try assignFontIds(model);
         for (model.font_registrations) |registration| {
             const known = for (fonts.items) |font| {
                 if (font.id == registration.id) break true;
@@ -2207,6 +2226,9 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         model.tree.showError("WidgetDidNotRenderRoot\nThe bundle completed without rendering a widget root.");
     }
     if (model.provider.fatalChannelFailure()) return error.FatalProviderChannelFailure;
+    // Its bundle ran: now it may take font ids (`assignFontIds`). A widget
+    // whose faces do not fit fails here, like any other load failure.
+    try assignFontIds(model);
     if (loadLocalImages(init.io, allocator, directory, model)) |_| {
         seedImageStates(model) catch |err| {
             std.log.err("initial widget image state failed: {s}", .{@errorName(err)});
@@ -2281,7 +2303,6 @@ fn addWidget(host: *Host, effects: *Effects, add: host_control.Add) anyerror!voi
         unloadWidget(model);
         freeModel(model);
     }
-    try assignFontIds(model);
     try registerWidgetFonts(diagnostic_runtime.?, model);
     host.widgets[add.id] = model;
     initEffects(enter(model), .{ .fx = effects, .slot = add.id });
@@ -3324,6 +3345,26 @@ test "path icon projection parses normalized geometry and preserves viewBox stro
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+test "a widget whose new faces do not all fit takes no font ids" {
+    const saved_count = content_font_count;
+    defer content_font_count = saved_count;
+    // One id left.
+    content_font_count = content_fonts.len - 1;
+    for (content_fonts[0..content_font_count], 0..) |*font, index| font.* = .{ .hash = index, .len = 0, .id = native_sdk.canvas.min_registered_font_id + index };
+    const model = try createModel();
+    defer std.heap.page_allocator.destroy(model);
+    var two = [_]HostApp.FontRegistration{ .{ .id = 0, .name = "a", .ttf = "face a" }, .{ .id = 0, .name = "b", .ttf = "face b" } };
+    model.font_registrations = &two;
+    try std.testing.expectError(error.FontRegistryFull, assignFontIds(model));
+    try std.testing.expectEqual(content_fonts.len - 1, content_font_count);
+    // The same face twice is one new face, and it fits.
+    var repeated = [_]HostApp.FontRegistration{ .{ .id = 0, .name = "a", .ttf = "face a" }, .{ .id = 0, .name = "a2", .ttf = "face a" } };
+    model.font_registrations = &repeated;
+    try assignFontIds(model);
+    try std.testing.expectEqual(content_fonts.len, content_font_count);
+    try std.testing.expectEqual(repeated[0].id, repeated[1].id);
 }
 
 test "showcase headline keeps exact registered face through bold and text shadow" {
