@@ -33,6 +33,9 @@ pub const panic_code = contract.panic_code;
 
 var record: ?*volatile Record = null;
 var ui_thread: u32 = 0;
+/// When the running turn began (GetTickCount64), for `noteWedged`. Kept
+/// out of the record: no reader after a crash needs it.
+var turn_started_ms: std.atomic.Value(u64) = .init(0);
 
 extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?windows.HANDLE) callconv(.winapi) windows.HANDLE;
 extern "kernel32" fn CreateFileMappingW(file: windows.HANDLE, security: ?*anyopaque, protect: u32, size_high: u32, size_low: u32, name: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
@@ -44,6 +47,7 @@ extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
 extern "kernel32" fn GetProcessTimes(process: windows.HANDLE, creation: *u64, exit: *u64, kernel: *u64, user: *u64) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn GetSystemTimeAsFileTime(time: *u64) callconv(.winapi) void;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn SetUnhandledExceptionFilter(filter: ?*const fn (*windows.EXCEPTION_POINTERS) callconv(.winapi) c_long) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn RaiseFailFastException(record: ?*windows.EXCEPTION_RECORD, context: ?*windows.CONTEXT, flags: u32) callconv(.winapi) noreturn;
 
@@ -124,6 +128,7 @@ pub fn noteSlot(slot: u16, name_hash: u64, artifact: i64) void {
 /// A widget's turn starts on this thread: `slot` is its slot in the host.
 pub fn beginTurn(slot: u16, bundle: u64) void {
     const mapped = record orelse return;
+    turn_started_ms.store(GetTickCount64(), .release);
     mapped.turn.thread = GetCurrentThreadId();
     mapped.turn.bundle = bundle;
     mapped.turn.slot = @as(u32, slot) + 1;
@@ -154,13 +159,14 @@ pub fn noteCrash(code: u32) void {
 
 /// The management thread found the UI thread still busy past its deadline
 /// (daemon.zig `apply`), and the host is about to stop itself with `code`.
-/// The widget whose turn is running, on whichever thread, held it up: that
-/// is the evidence, as for a crash in its turn. Outside any turn, the crash
-/// names no one.
-pub fn noteWedged(code: u32) void {
+/// The widget whose turn is running, on whichever thread, held it up if
+/// that turn has run at least `min_turn_ms`: that is the evidence, as for a
+/// crash in its turn. Otherwise the crash names no one.
+pub fn noteWedged(code: u32, min_turn_ms: u64) void {
     const mapped = record orelse return;
     if (mapped.crash.kind != .none) return;
-    const turn_slot = mapped.turn.slot;
+    const open_slot = mapped.turn.slot;
+    const turn_slot = if (open_slot != 0 and GetTickCount64() -| turn_started_ms.load(.acquire) >= min_turn_ms) open_slot else 0;
     var now: u64 = 0;
     GetSystemTimeAsFileTime(&now);
     mapped.crash.code = code;
@@ -218,22 +224,27 @@ test "a crash in a widget's turn names it; one outside a turn names no one" {
     try std.testing.expectEqual(CrashKind.other, storage.crash.kind);
 
     // A stuck UI thread names the widget whose turn holds it, from the
-    // management thread; with no turn running it names no one.
+    // management thread, once that turn has lasted long enough; a turn that
+    // just began, or none, names no one.
     storage.crash = .{};
     beginTurn(6, 9);
     const Management = struct {
-        fn wedge() void {
-            noteWedged(contract.exit_wedged);
+        fn wedge(min_turn_ms: u64) void {
+            noteWedged(contract.exit_wedged, min_turn_ms);
         }
     };
-    const management = try std.Thread.spawn(.{}, Management.wedge, .{});
+    var management = try std.Thread.spawn(.{}, Management.wedge, .{@as(u64, 60_000)});
+    management.join();
+    try std.testing.expectEqual(CrashKind.other, storage.crash.kind);
+    storage.crash = .{};
+    management = try std.Thread.spawn(.{}, Management.wedge, .{@as(u64, 0)});
     management.join();
     try std.testing.expectEqual(CrashKind.widget_turn, storage.crash.kind);
     try std.testing.expectEqual(@as(u32, 7), storage.crash.slot);
     try std.testing.expectEqual(contract.exit_wedged, storage.crash.code);
     storage.crash = .{};
     endTurn();
-    noteWedged(contract.exit_wedged);
+    noteWedged(contract.exit_wedged, 0);
     try std.testing.expectEqual(CrashKind.other, storage.crash.kind);
 }
 

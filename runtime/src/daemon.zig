@@ -64,6 +64,12 @@ const apply_timeout_ms: u64 = 5_000;
 /// How often that wait looks for `weaver down`: weaverd's supervision tick,
 /// which is how soon weaverd noticed it.
 const apply_poll_ms: u64 = 250;
+/// A stuck UI thread is blamed on the widget whose turn holds it only if
+/// that one turn has run this long: QuickJS interrupts a turn after
+/// js_engine.turn_budget_ms (100 ms), so a turn still running after 2.5 s,
+/// 25 times that and half the apply budget, is stuck in native code, not a
+/// short turn that happened to be open when the deadline passed.
+const wedged_turn_ms: u64 = apply_timeout_ms / 2;
 /// Handles the management thread waits on: its four events, the renderer,
 /// and a dev widget per registry slot. WaitForMultipleObjects takes at most
 /// 64 (MAXIMUM_WAIT_OBJECTS).
@@ -350,13 +356,14 @@ pub const Daemon = struct {
     fn run(self: *Daemon) void {
         // It runs no widget's code.
         widget_log.detachThread();
-        onWorker(begin, .{self}) catch |err| self.noteRegistryFailure(err);
+        const began = onWorker(begin, .{self});
+        if (began) |_| {} else |err| self.noteRegistryFailure(err);
         // The host before this one died: a reload it took and never
         // acknowledged (it may have died removing a widget) is answered
-        // here, once this start has read the registry as it now stands.
-        // The CLI that sent it still waits on the acknowledgement events,
-        // which weaverd kept alive across the restart.
-        if (self.predecessorCrashed()) _ = win.SetEvent(self.objects.reload);
+        // here, now that this start has read the registry as it stands and
+        // before any widget starts, so the CLI that sent it, which still
+        // waits on the events weaverd kept alive, hears in time.
+        if (self.predecessorCrashed()) _ = win.SetEvent(if (began) |_| self.objects.reload_success else |_| self.objects.reload_failure);
         var status_requested = true;
         while (true) {
             const now = win.GetTickCount64();
@@ -374,6 +381,11 @@ pub const Daemon = struct {
             const count = self.waitHandles(&handles);
             const wait = win.WaitForMultipleObjects(@intCast(count), &handles, 0, self.nextDeadlineMs(win.GetTickCount64()));
             if (wait == win.WAIT_OBJECT_0) break;
+            if (wait == win.WAIT_FAILED) {
+                // Never expected; a wait that keeps failing must not spin.
+                note("the management wait failed: Win32 error {d}; retrying in {d} ms", .{ win.GetLastError(), apply_poll_ms });
+                win.Sleep(@intCast(apply_poll_ms));
+            }
             if (wait == win.WAIT_OBJECT_0 + 1) {
                 // Any widget this reload removed is out of the host when
                 // the worker returns: the CLI may delete its directory.
@@ -591,7 +603,15 @@ pub const Daemon = struct {
                 .launch => launch_due = true,
             }
         }
-        if (launch_due) onWorker(launchDue, .{ self, now_ms }) catch |err| note("could not start a widget: {s}", .{@errorName(err)});
+        if (launch_due) onWorker(launchDue, .{ self, now_ms }) catch |err| {
+            // No worker to start them on: each due widget backs off with the
+            // cause, rather than staying due and spinning the wait.
+            for (&self.slots, 0..) |*slot, index| {
+                if (!slot.used or !slot.enabled or self.running(index)) continue;
+                const due = slot.state == .starting or (slot.state == .backoff and now_ms >= slot.next_restart_ms);
+                if (due) supervisor.recordLaunchFailure(slot, now_ms, err);
+            }
+        };
         self.superviseRenderer(now_ms);
     }
 
@@ -769,13 +789,16 @@ pub const Daemon = struct {
         const deadline = win.GetTickCount64() + apply_timeout_ms;
         while (!pending.done.isSet()) {
             if (win.WaitForSingleObject(self.objects.shutdown, 0) == win.WAIT_OBJECT_0) {
+                // The UI thread never runs this command now; the rest of
+                // `weaver down` needs nothing from it.
+                self.stopAll();
                 crash_record.markStopped();
                 exitProcess(0);
             }
             const now = win.GetTickCount64();
             if (now >= deadline) {
                 note("the UI thread did not apply a widget {s} within apply_timeout_ms={d}; the host is stuck and exits for weaverd to restart it", .{ @tagName(command), apply_timeout_ms });
-                crash_record.noteWedged(contract.exit_wedged);
+                crash_record.noteWedged(contract.exit_wedged, wedged_turn_ms);
                 _ = win.TerminateProcess(win.GetCurrentProcess(), contract.exit_wedged);
             }
             pending.done.waitTimeout(self.options.io, .{ .duration = .{

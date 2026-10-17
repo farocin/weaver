@@ -150,6 +150,29 @@ const Held = struct {
         if (self.count == 0) return false;
         return c.WaitForSingleObject(self.handles[1], 0) == c.WAIT_OBJECT_0;
     }
+
+    /// How long a host has to stop by itself once `weaver down` is
+    /// signalled before weaverd stops it: under the CLI's 5 s wait for the
+    /// host to go (cli/src/index.ts downHost), so a host whose management
+    /// is stuck still goes down.
+    const down_grace_ms: u32 = 4_000;
+
+    /// Wait for the host to exit. If `weaver down` is signalled and it
+    /// does not exit within `down_grace_ms`, stop it; returns whether down
+    /// was signalled.
+    fn waitForHost(self: *const Held, host: c.HANDLE) bool {
+        if (self.count == 0) {
+            _ = c.WaitForSingleObject(host, c.INFINITE);
+            return false;
+        }
+        const handles = [_]c.HANDLE{ host, self.handles[1] };
+        if (c.WaitForMultipleObjects(handles.len, &handles, 0, c.INFINITE) == c.WAIT_OBJECT_0) return false;
+        if (c.WaitForSingleObject(host, down_grace_ms) != c.WAIT_OBJECT_0) {
+            _ = c.TerminateProcess(host, contract.exit_wedged);
+            _ = c.WaitForSingleObject(host, c.INFINITE);
+        }
+        return true;
+    }
 };
 
 fn supervise(init: std.process.Init) !void {
@@ -169,7 +192,10 @@ fn supervise(init: std.process.Init) !void {
         const host = try startHost(allocator, runtime_exe, &supervision);
         supervision.started();
         if (held.count == 0) held.take(host.process);
-        _ = c.WaitForSingleObject(host.process, c.INFINITE);
+        if (held.waitForHost(host.process)) {
+            _ = c.CloseHandle(host.process);
+            return;
+        }
         var exit_code: c.DWORD = 1;
         _ = c.GetExitCodeProcess(host.process, &exit_code);
         const record = readHostRecord(record_path_w, host.process, host.pid);

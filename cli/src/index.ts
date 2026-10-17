@@ -1880,7 +1880,9 @@ function assertHostReloadReady(): void {
 // that cannot answer leaves the last status, which the freshness warning in
 // statusDivergenceWarnings reports. macOS weaverd writes status on a timer.
 function requestStatus(): void {
-  if (process.platform !== "win32") return;
+  // An older weaverd starts supervising on an argument it does not know, so
+  // only a running host is asked.
+  if (process.platform !== "win32" || !hostRunning()) return;
   spawnSync(hostExecutable, ["--request-status"], { stdio: "ignore", windowsHide: true, env: hostEnvironment() });
 }
 

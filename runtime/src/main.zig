@@ -2898,6 +2898,24 @@ fn publishBackendStatus(model: *const Model, backend: native_sdk.platform.GpuSur
     small_fs.write(io, path, backendStatusLabel(backend)) catch |err| {
         std.log.warn("widget could not publish renderer status: {s}", .{@errorName(err)});
     };
+    // The Windows daemon host writes status.json only when something
+    // changes or someone asks (daemon.zig): this is a change it cannot see,
+    // whether the widget runs in the host or is a dev widget of its own.
+    if (builtin.os.tag == .windows) requestHostStatus();
+}
+
+/// Ask the daemon host to rewrite status.json (host_contract
+/// status_request_event). Nothing to ask when no host runs.
+fn requestHostStatus() void {
+    const Kernel = struct {
+        extern "kernel32" fn OpenEventW(access: u32, inherit: std.os.windows.BOOL, name: [*:0]const u16) callconv(.winapi) ?std.os.windows.HANDLE;
+        extern "kernel32" fn SetEvent(event: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn CloseHandle(handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+    };
+    const event_modify_state: u32 = 0x0002;
+    const event = Kernel.OpenEventW(event_modify_state, .FALSE, host_contract.status_request_event) orelse return;
+    _ = Kernel.SetEvent(event);
+    _ = Kernel.CloseHandle(event);
 }
 
 fn backendStatusLabel(backend: native_sdk.platform.GpuSurfaceBackend) []const u8 {
