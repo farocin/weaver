@@ -84,10 +84,14 @@ const client_lock_wait_ms: u32 = 10_000;
 /// How long `--up` waits for the host it started to publish control: what
 /// the CLI waited for weaverd to bring the host up (5 s).
 const up_wait_ms: u64 = 5_000;
-/// How long a client waits, once the singleton exists, for the rest of the
-/// control objects: the host creates them together (daemon.zig
-/// `Objects.claim`), so only a host that predates them takes this long.
-const control_wait_ms: u64 = 1_000;
+/// How long a client waits, once the singleton exists, for the control
+/// events. A starting host holds the singleton without them while it
+/// retries its record (main.zig `openRecord`, up to `record_open_wait_ms`;
+/// 203-250 ms after a crash), then creates them together (daemon.zig
+/// `Objects.publish`): a second past the longest retry. Only a host that
+/// predates them, or one that exits for want of its record, takes this
+/// long.
+const control_wait_ms: u64 = contract.record_open_wait_ms + 1_000;
 /// `--reload`'s waits: weaverd's limits, which reloads have always met.
 const reload_signal_wait_ms: u32 = 10_000;
 const reload_answer_wait_ms: u32 = 10_000;
@@ -307,7 +311,8 @@ fn fail(comptime format: []const u8, args: anytype) Exit {
 
 fn probe() !Exit {
     if (!hostRunning()) return .not_running;
-    return if (controlReady()) .ok else .legacy;
+    if (controlReady()) return .ok;
+    return if (hostRunning()) .legacy else .not_running;
 }
 
 /// The host it starts inherits this process's environment, so `paths` are
@@ -464,6 +469,8 @@ fn reload(paths: Paths) !Exit {
     defer _ = win.ReleaseMutex(signal_mutex);
 
     if (!hostRunning()) return .not_running;
+    // A host still starting (retrying its record) has no events yet.
+    if (!controlReady()) return if (hostRunning()) .legacy else .not_running;
     const access = win.SYNCHRONIZE | win.EVENT_MODIFY_STATE;
     const success = win.OpenEventW(access, 0, contract.reload_success_event) orelse return .legacy;
     defer _ = win.CloseHandle(success);
