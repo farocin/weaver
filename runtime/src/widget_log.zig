@@ -35,7 +35,9 @@ pub fn detachThread() void {
 }
 
 pub fn init(sink: *Sink, runtime_io: std.Io, path: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+    // Two short paths: the C heap packs them; `page_allocator` rounded each
+    // to its own 4 KiB page.
+    const allocator = std.heap.c_allocator;
     const next_path = try allocator.dupe(u8, path);
     errdefer allocator.free(next_path);
     const next_old_path = try std.fmt.allocPrint(allocator, "{s}.old", .{path});
@@ -58,8 +60,8 @@ pub fn use(sink: *Sink) void {
 /// next `use` if it was current.
 pub fn deinit(sink: *Sink) void {
     if (current == sink) current = null;
-    if (sink.path.len > 0) std.heap.page_allocator.free(sink.path);
-    if (sink.old_path.len > 0) std.heap.page_allocator.free(sink.old_path);
+    if (sink.path.len > 0) std.heap.c_allocator.free(sink.path);
+    if (sink.old_path.len > 0) std.heap.c_allocator.free(sink.old_path);
     sink.path = &.{};
     sink.old_path = &.{};
 }
