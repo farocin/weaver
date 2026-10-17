@@ -36,6 +36,8 @@ pub const Record = contract.Record;
 /// The exception code recorded for a Zig panic (`notePanic`).
 pub const panic_code = contract.panic_code;
 
+/// Mapped only on Windows: the functions that reach kernel32 return first
+/// elsewhere, so other platforms neither compile nor link those calls.
 var record: ?*volatile Record = null;
 var ui_thread: u32 = 0;
 /// When the running turn began (GetTickCount64), for `noteWedged`. Kept
@@ -260,6 +262,7 @@ pub fn noteSlot(slot: u16, name_hash: u64, artifact: i64) void {
 
 /// A widget's turn starts on this thread: `slot` is its slot in the host.
 pub fn beginTurn(slot: u16, bundle: u64) void {
+    if (builtin.os.tag != .windows) return;
     const mapped = record orelse return;
     turn_started_ms.store(GetTickCount64(), .release);
     mapped.turn.thread = GetCurrentThreadId();
@@ -275,6 +278,7 @@ pub fn endTurn() void {
 /// Fill the crash slot for a crash on the calling thread: plain stores, no
 /// allocation, no locks. The first crash wins.
 pub fn noteCrash(code: u32) void {
+    if (builtin.os.tag != .windows) return;
     const mapped = record orelse return;
     if (mapped.crash.kind != .none) return;
     const thread = GetCurrentThreadId();
@@ -296,6 +300,7 @@ pub fn noteCrash(code: u32) void {
 /// that turn has run at least `min_turn_ms`: that is the evidence, as for a
 /// crash in its turn. Otherwise the crash names no one.
 pub fn noteWedged(code: u32, min_turn_ms: u64) void {
+    if (builtin.os.tag != .windows) return;
     const mapped = record orelse return;
     if (mapped.crash.kind != .none) return;
     const open_slot = mapped.turn.slot;

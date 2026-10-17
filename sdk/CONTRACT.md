@@ -460,9 +460,10 @@ weaverd supervises widget processes (crash → restart with backoff, 3 strikes
 → stopped + noted in status), fans out providers over local IPC, and samples
 per-widget cost. Registrations persist across host restarts.
 
-Windows amendment (ADR 0022): there is no weaverd. One widget host process
-runs every widget and is the daemon. After a crash, Windows restarts it
-(seconds to tens of seconds later), at most three times in ten minutes; a
+Amendment (ADR 0022), where the operating system restarts the host: there
+is no weaverd. One widget host process runs every widget and is the daemon.
+After a crash, the operating system restarts it (seconds to tens of seconds
+later), at most three times in ten minutes; a
 widget whose own turn crashed the host is quarantined until it is reinstalled
 or updated. A host that crashes within a minute of starting, or past the cap,
 stays down until `weaver up`. While no host runs, `weaver status` says why
