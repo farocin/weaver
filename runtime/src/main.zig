@@ -23,6 +23,7 @@ const small_fs = @import("small_fs.zig");
 const provider_service = if (builtin.os.tag == .windows) @import("provider_service.zig") else struct {};
 const dev_widgets_mod = if (builtin.os.tag == .windows) @import("dev_widgets.zig") else struct {};
 const daemon_mod = if (builtin.os.tag == .windows) @import("daemon.zig") else struct {};
+const host_lifecycle = if (builtin.os.tag == .windows) @import("host_lifecycle.zig") else struct {};
 const host_contract = @import("host_contract");
 
 comptime {
@@ -46,11 +47,32 @@ pub const max_host_widgets: usize = 32;
 pub const panic = std.debug.FullPanic(recordPanic);
 
 /// A panic is recorded as a crash (`crash_record`) before Native's
-/// diagnostics run, since they may fail in turn.
+/// diagnostics run, since they may fail in turn. A daemon host then fails
+/// fast, so Windows restarts it: Native's capture ends in Zig's abort, an
+/// ordinary exit Windows never restarts.
 fn recordPanic(msg: []const u8, ra: ?usize) noreturn {
     crash_record.notePanic();
+    if (builtin.os.tag == .windows and crash_record.failsFast()) {
+        crash_record.writePanicNote(msg, ra);
+        crash_record.failFast(crash_record.panic_code);
+    }
     native_sdk.debug.capturePanic(msg, ra);
 }
+
+/// Zig's segfault handler (on in Debug and ReleaseSafe builds) catches a
+/// fault before the crash record's unhandled-exception filter and ends in
+/// Zig's abort. In a daemon host the fault is recorded and fails fast
+/// instead, as in ReleaseFast, where Zig installs no handler.
+pub const debug = struct {
+    pub fn handleSegfault(addr: ?usize, name: []const u8, context: ?std.debug.CpuContextPtr) noreturn {
+        if (builtin.os.tag == .windows and crash_record.failsFast()) {
+            const access_violation: u32 = 0xC000_0005;
+            crash_record.noteCrash(access_violation);
+            crash_record.failFast(access_violation);
+        }
+        std.debug.defaultHandleSegfault(addr, name, context);
+    }
+};
 pub const std_options: std.Options = .{ .logFn = widget_log.logFn };
 
 pub const Model = struct {
@@ -1741,6 +1763,16 @@ fn createModel() !*Model {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    // The CLI's client verbs (host_lifecycle.zig): a short-lived process
+    // that only touches the host's named objects and files.
+    if (builtin.os.tag == .windows and args.len == 2) if (host_lifecycle.Verb.parse(args[1])) |verb| {
+        const data_root = platform.dataRoot(allocator, init.environ_map.get("LOCALAPPDATA"), null) catch {
+            std.debug.print("weaver-widget {s}: LOCALAPPDATA is not set; the widget host keeps its files under %LOCALAPPDATA%\\weaver\n", .{args[1]});
+            std.process.exit(@intFromEnum(host_lifecycle.Exit.failed));
+        };
+        const paths = try host_lifecycle.Paths.of(allocator, data_root);
+        std.process.exit(@intFromEnum(host_lifecycle.run(verb, init.io, allocator, paths)));
+    };
     // Shared render host mode: this process becomes the one Metal-owning
     // renderer every macOS widget talks to (weaverd spawns and supervises
     // it; docs/macos-memory-handoff.md carries the receipts). It never
@@ -1757,7 +1789,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const capture_state_root = init.environ_map.get("WEAVER_CAPTURE_STATE_ROOT");
     if (capture_state_root == null and args.len >= 2 and std.mem.eql(u8, args[1], "--host")) {
-        return runHost(init, args[2..], false, true);
+        if (builtin.os.tag == .windows and args.len >= 3 and std.mem.eql(u8, args[2], host_contract.restart_of_flag)) {
+            return runHost(init, &.{}, false, true, try restartedLaunch(init, args));
+        }
+        return runHost(init, args[2..], false, true, null);
     }
     const dev = capture_state_root == null and args.len == 3 and std.mem.eql(u8, args[1], "--dev");
     if ((!dev and args.len != 2) or (dev and args.len != 3)) {
@@ -1770,7 +1805,33 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     const directory_arg: usize = if (dev) 2 else 1;
-    return runHost(init, args[directory_arg .. directory_arg + 1], dev, false);
+    return runHost(init, args[directory_arg .. directory_arg + 1], dev, false, null);
+}
+
+/// `--host --restart-of <generation> --localappdata <path>`: Windows
+/// restarted a crashed daemon host (host_contract.restart_of_flag). Windows
+/// gives a restarted process the user's default environment, so the
+/// profile the crashed host ran against comes from the command line, and
+/// replaces LOCALAPPDATA before anything reads it. Returns the crashed
+/// host's generation.
+fn restartedLaunch(init: std.process.Init, args: []const []const u8) !u64 {
+    const usage = "weaver-widget --host " ++ host_contract.restart_of_flag ++ " <generation> " ++ host_contract.local_app_data_flag ++ " <path>: the command line Windows restarts a crashed widget host with";
+    if (args.len != 6 or !std.mem.eql(u8, args[4], host_contract.local_app_data_flag) or args[5].len == 0) {
+        std.debug.print("usage: {s}\n", .{usage});
+        return error.InvalidArguments;
+    }
+    const generation = std.fmt.parseInt(u64, args[3], 10) catch {
+        std.debug.print("usage: {s}; '{s}' is not a generation\n", .{ usage, args[3] });
+        return error.InvalidArguments;
+    };
+    try init.environ_map.put("LOCALAPPDATA", args[5]);
+    // Children (the renderer, dev widgets, the bundler) read the process's.
+    var wide: [1024:0]u16 = undefined;
+    const length = try std.unicode.utf8ToUtf16Le(&wide, args[5]);
+    if (length >= wide.len) return error.NameTooLong;
+    wide[length] = 0;
+    if (SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA"), &wide) == 0) return error.SetEnvironmentFailed;
+    return generation;
 }
 
 /// Process-wide inputs every widget load shares.
@@ -1829,8 +1890,18 @@ const loader_stack_bytes: usize = 16 * 1024 * 1024;
 ///
 /// A `--host` with no directories (Windows) is the daemon instead
 /// (daemon.zig): it starts with no widget, reads the registry itself, and
-/// adds and removes widgets while the others keep running.
-fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool) !void {
+/// adds and removes widgets while the others keep running. `restart_of` is
+/// the crashed host's generation when Windows restarted it.
+fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool, restart_of: ?u64) !void {
+    return hostMain(init, directories, dev, hosted, restart_of) catch |err| {
+        // The record says why this host stopped (a daemon host's; others
+        // keep none).
+        crash_record.markStoppedWith(@errorName(err));
+        return err;
+    };
+}
+
+fn hostMain(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool, restart_of: ?u64) !void {
     const allocator = init.arena.allocator();
     anchored_host = hosted and builtin.os.tag == .windows and directories.len == 0;
     if (!anchored_host and directories.len == 0) {
@@ -1881,9 +1952,10 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     }
 
     // A startup error returned from here is a clean stop, not a crash: its
-    // record says `stopped`, and weaverd does not restart it (ADR 0022).
+    // record says `stopped` with the error, and Windows does not restart it
+    // (ADR 0022).
     defer crash_record.markStopped();
-    if (builtin.os.tag == .windows and anchored_host) try startDaemon(init, environment);
+    if (builtin.os.tag == .windows and anchored_host) try startDaemon(init, environment, restart_of);
 
     var loader: Loader = .{ .environment = environment, .directories = directories };
     const widgets = try loader.run();
@@ -1988,6 +2060,9 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         app.capture_pending_fn = capturePendingWork;
         app.capture_validate_fn = validateCapture;
     }
+    // Its own frame, below every live one: inlined, its marker would sit
+    // inside this function's frame, above some of its live variables.
+    if (builtin.os.tag == .windows and anchored_host) @call(.never_inline, discardDeadStack, .{});
     runner.runWithOptions(app, .{
         .app_name = "weaver-widget",
         .window_title = primary.name,
@@ -2014,29 +2089,96 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
 }
 
 /// Everything the daemon host needs before any widget loads (ADR 0022):
-/// its crash record, the renderer pipe its widgets connect to, the
-/// providers (their workers start with their first subscriber), a job only
-/// it holds for its dev widgets and renderer, and the management thread's
-/// state. The management thread itself starts with the runtime
+/// the lifecycle checks, control, its crash record and its request for a
+/// restart, the renderer pipe its widgets connect to, the providers (their
+/// workers start with their first subscriber), a job only it holds for its
+/// dev widgets and renderer, and the management thread's state. The
+/// management thread itself starts with the runtime
 /// (`startRendererDiagnostics`).
-fn startDaemon(init: std.process.Init, environment: HostEnvironment) !void {
+fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of: ?u64) !void {
     const allocator = std.heap.page_allocator;
-    // Control comes up first, before any widget loads: a second host
+    // Windows restarts only a crash its error reporting handles, and a
+    // parent can turn that off for its children (rm-bench/restart-spike: a
+    // host started from Git Bash inherits SEM_NOGPFAULTERRORBOX and was
+    // never restarted).
+    _ = SetErrorMode(0);
+    // No console: notes go to <logs>\host.log.
+    std.Io.Dir.cwd().createDirPath(init.io, environment.log_directory) catch {};
+    host_lifecycle.logToFile(environment.log_directory);
+    host_lifecycle.logStart(restart_of);
+    const paths = try host_lifecycle.Paths.of(allocator, environment.data_root);
+    // Windows can restart this host before the crashed one has exited, and
+    // that one owns the singleton until it has: wait for it, outside the
+    // lifecycle lock so `weaver down` meanwhile is not held.
+    if (restart_of != null) if (crash_record.read(paths.record)) |crashed| {
+        const began = GetTickCount64();
+        const gone = host_lifecycle.waitForExit(crashed, host_contract.predecessor_wait_ms);
+        std.debug.print("weaver-widget --host: the crashed host (pid {d}) {s} after {d} ms\n", .{ crashed.pid, if (gone) "had exited" else "had not exited (predecessor_wait_ms); starting anyway", GetTickCount64() - began });
+    };
+    // Starting is ordered with `weaver up` and `weaver down` by the
+    // lifecycle lock (host_lifecycle.zig), held until control is published.
+    const lock = host_lifecycle.Lock.acquire(host_contract.host_lock_wait_ms) catch {
+        std.debug.print("weaver-widget --host: another 'weaver up' or 'weaver down' held the lifecycle lock for host_lock_wait_ms={d}; this host exits\n", .{host_contract.host_lock_wait_ms});
+        daemon_mod.exitProcess(host_contract.exit_lifecycle_busy);
+    };
+    defer lock.release();
+    // `weaver down` ran since this start was decided: a pending restart,
+    // or a `weaver up` that lost the race, ends here.
+    if (host_lifecycle.stopMarked(paths)) {
+        std.debug.print("weaver-widget --host: 'weaver down' left the stop marker at {s}; this host exits\n", .{paths.marker});
+        lock.release();
+        daemon_mod.exitProcess(host_contract.exit_stopped);
+    }
+    // Windows restarted this host for a crash; a host `weaver up` started
+    // since then consumed that crash's record, and runs or ran after it.
+    if (restart_of) |crashed| {
+        const current = crash_record.read(paths.record);
+        if (current == null) if (crash_record.openFailure(paths.record)) |err| {
+            std.debug.print("weaver-widget --host: restarted for generation {d}, but could not read the record at {s} (Win32 error {d}); without it this host cannot quarantine the widget the crash blames, so it exits. Close whatever holds the file open, then run 'weaver up'\n", .{ crashed, paths.record, err });
+            lock.release();
+            daemon_mod.exitProcess(host_contract.exit_record_unavailable);
+        };
+        if (current == null or current.?.generation != crashed) {
+            std.debug.print("weaver-widget --host: restarted for generation {d}, but the record now holds {?d}: a newer host started since; this host exits\n", .{ crashed, if (current) |record| record.generation else null });
+            lock.release();
+            daemon_mod.exitProcess(host_contract.exit_superseded);
+        }
+    }
+    // The singleton comes first, before any widget loads: a second host
     // leaves at once.
-    const objects = daemon_mod.Objects.claim() catch |err| switch (err) {
+    const singleton = daemon_mod.Objects.claim() catch |err| switch (err) {
         error.AlreadyRunning => {
             std.debug.print("weaver-widget --host: another widget host is already running for this user; this one exits\n", .{});
+            lock.release();
             daemon_mod.exitProcess(host_contract.exit_already_running);
         },
         else => return err,
     };
     std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
-    // From here on, a crash is recorded.
-    const record_path = try std.fs.path.join(allocator, &.{ environment.data_root, "host.record" });
-    const previous = crash_record.open(record_path) catch |err| previous: {
-        std.debug.print("weaver-widget --host: no crash record at {s}: {s}; crashes go unattributed\n", .{ record_path, @errorName(err) });
-        break :previous null;
+    // From here on, a crash is recorded. Opening the record consumes the
+    // previous host's: this start takes the next generation.
+    const previous = openRecord(paths.record) catch {
+        // The singleton goes before the lock: a `weaver up` waiting on the
+        // lock then finds no host, not one on its way out.
+        daemon_mod.Objects.release(singleton);
+        lock.release();
+        daemon_mod.exitProcess(host_contract.exit_record_unavailable);
     };
+    // This host runs: control comes up, still before any widget loads.
+    const objects = try daemon_mod.Objects.publish(singleton);
+    var now: u64 = 0;
+    GetSystemTimeAsFileTime(&now);
+    const plan = host_contract.RestartPlan.of(previous, restart_of != null, now);
+    const registration: host_lifecycle.Registration = if (crash_record.generation()) |generation|
+        host_lifecycle.registerRestart(plan, generation, init.environ_map.get("LOCALAPPDATA").?)
+    else
+        .{ .request = .none };
+    crash_record.noteRestart(plan, registration.request, registration.hresult, registration.line_len);
+    // Crashes fail fast from here on, so Windows restarts this host.
+    var log_buffers: native_sdk.debug.LogPathBuffers = .{};
+    const native_logs = try native_sdk.debug.resolveLogPaths(&log_buffers, "com.weaver.widget", native_sdk.debug.envFromMap(init.environ_map), init.environ_map.get("NATIVE_SDK_LOG_DIR"));
+    std.Io.Dir.cwd().createDirPath(init.io, native_logs.log_dir) catch {};
+    crash_record.routeCrashesToWindows(native_logs.panic_file);
     const renderer_pipe_name = try std.fmt.allocPrint(allocator, "\\\\.\\pipe\\weaver-renderer-{d}", .{platform.currentProcessId()});
     try daemon_mod.exportRendererPipe(renderer_pipe_name);
     // Widgets resolve media artwork under the art cache (image_paths), so
@@ -2061,9 +2203,63 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment) !void {
         .devs = devs,
         .post = postControl,
         .previous = previous,
-        .restart = .fromEnvironment(init.environ_map),
+        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration),
     }, objects);
 }
+
+/// Open the host's record (crash_record.open), retrying while it is in use
+/// for up to `record_open_wait_ms`: it stays in use for a moment after a
+/// crashed host has exited. A host that still cannot open it must not run:
+/// it could not quarantine the widget the last crash blames, and would run
+/// it again. `weaver up` and `weaver status` name the file and the error
+/// (host_lifecycle.zig `recordUnavailable`, `describeDown`).
+fn openRecord(path: []const u8) !?host_contract.Record {
+    const began = GetTickCount64();
+    var attempts: u32 = 0;
+    while (true) {
+        attempts += 1;
+        const previous = crash_record.open(path) catch |err| {
+            const waited = GetTickCount64() - began;
+            if (err == error.RecordInUse and waited < host_contract.record_open_wait_ms) {
+                Sleep(50);
+                continue;
+            }
+            std.debug.print("weaver-widget --host: could not open the record at {s}: {s} (Win32 error {d}, {d} attempts over {d} ms); without it this host cannot quarantine the widget the last crash blames, so it exits. Close whatever holds the file open, then run 'weaver up'\n", .{ path, @errorName(err), crash_record.open_error, attempts, waited });
+            return err;
+        };
+        if (attempts > 1) std.debug.print("weaver-widget --host: the record opened after {d} attempts over {d} ms\n", .{ attempts, GetTickCount64() - began });
+        return previous;
+    }
+}
+
+/// Give back the main thread's stack pages below the caller's frame before
+/// the host settles into its event loop. Startup runs std.Io's Windows path
+/// helpers on this thread: directory creation and path conversion have
+/// 262 KiB and 197 KiB frames (dirCreateDirWindows, wToPrefixedFileW), and
+/// every page they touched stayed resident for the host's life (deep dive,
+/// 2026-10-17: 524 KiB of main-thread stack, 256 KiB of it in use once the
+/// widgets tick). Below the caller those pages are dead; discarded, Windows
+/// drops them, and a later call that reaches as deep gets fresh pages.
+/// Must not be inlined (see its call).
+fn discardDeadStack() void {
+    const page = std.heap.page_size_min;
+    const tib = &std.os.windows.teb().NtTib;
+    const low = @intFromPtr(tib.StackLimit);
+    var here: u8 = 0;
+    // Slack under this frame for DiscardVirtualMemory's own stack: 4,296
+    // bytes plus saved registers on KernelBase 10.0.26100 (review of #117);
+    // eight pages leave room for other Windows builds.
+    const high = std.mem.alignBackward(usize, @intFromPtr(&here), page) -| 8 * page;
+    if (high <= low) return;
+    _ = DiscardVirtualMemory(@ptrFromInt(low), high - low);
+}
+
+extern "kernel32" fn DiscardVirtualMemory(address: *anyopaque, size: usize) callconv(.winapi) u32;
+extern "kernel32" fn SetErrorMode(mode: u32) callconv(.winapi) u32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) c_int;
+extern "kernel32" fn GetSystemTimeAsFileTime(time: *u64) callconv(.winapi) void;
 
 /// Hand the daemon's load or unload to the UI thread (`applyControl`).
 fn postControl(pending: *host_control.Pending) void {
@@ -3006,6 +3202,7 @@ test {
         _ = provider_service;
         _ = dev_widgets_mod;
         _ = daemon_mod;
+        _ = host_lifecycle;
         _ = @import("provider_windows.zig");
     }
     const automatic_software_backend: native_sdk.app_manifest.GpuSurfaceBackend =

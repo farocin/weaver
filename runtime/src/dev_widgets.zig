@@ -399,7 +399,7 @@ fn connectPipe(pipe: win.HANDLE, process: win.HANDLE, expected_pid: u32, timeout
             return false;
         }
         if (pid == expected_pid) return true;
-        std.debug.print("weaver-widget: rejecting provider pipe client pid={d}; expected dev widget pid={d}\n", .{ pid, expected_pid });
+        @import("host_lifecycle.zig").note("weaver-widget: rejecting provider pipe client pid={d}; expected dev widget pid={d}\n", .{ pid, expected_pid });
         _ = win.DisconnectNamedPipe(pipe);
     }
 }

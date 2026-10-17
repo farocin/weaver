@@ -1,12 +1,13 @@
-//! The widget host is the daemon (ADR 0022 step 4). The registry, the
+//! The widget host is the daemon (ADR 0022). It owns the registry, the
 //! control objects the CLI uses, `status.json`, the crash ledger and the
-//! shared renderer moved here from `weaverd`, which now only starts this
-//! process and restarts it after a crash (host/src/windows_host.zig).
+//! shared renderer. No process supervises it: it asks Windows to restart it
+//! after a crash (main.zig `startDaemon`), and the CLI starts and stops it
+//! through host_lifecycle.zig.
 //!
-//! Control comes up before any widget: `Objects.claim` takes the singleton
-//! and creates the reload and shutdown events in main.zig `startDaemon`,
-//! before the host evaluates a single bundle, so `weaver down`, status and
-//! a fixed install always reach it.
+//! Control comes up before any widget: main.zig `startDaemon` takes the
+//! singleton (`Objects.claim`), opens its crash record, and creates the
+//! control events (`Objects.publish`) before the host evaluates a single
+//! bundle, so `weaver down`, status and a fixed install always reach it.
 //!
 //! Management runs off the UI thread, on a thread of its own (`run`): it
 //! reconciles the registry, decides when each widget runs, starts and
@@ -33,15 +34,14 @@
 //! A crash is recorded by crash_record.zig. The next host reads that record
 //! before it opens its own: a crash inside a widget's turn quarantines that
 //! widget's bundle in `crash-ledger.json` (`applyCulprit`); any other crash
-//! quarantines no one, and `weaverd` restarts the host with every widget
-//! backed off, or held once the crashes pass the restart budget
-//! (`applyRestart`).
+//! quarantines no one, and counts only toward the restart cap
+//! (host_contract.restart_cap).
 const std = @import("std");
 const contract = @import("host_contract");
 const supervisor = @import("host_supervisor");
-const backoff = supervisor.backoff;
 const registry = supervisor.registry;
 const crash_record = @import("crash_record.zig");
+const host_lifecycle = @import("host_lifecycle.zig");
 const dev_widgets = @import("dev_widgets.zig");
 const host_control = @import("host_control.zig");
 const provider_service = @import("provider_service.zig");
@@ -61,7 +61,7 @@ const max_widgets = supervisor.max_widgets;
 pub const max_hosted_widgets = max_widgets - 1;
 const max_path_bytes = supervisor.max_path_bytes;
 /// How long the UI thread may take to apply a load or unload before the
-/// host counts itself wedged and exits, for `weaverd` to restart it.
+/// host counts itself wedged and fails fast, for Windows to restart it.
 /// Receipt (2026-10-16, rm-bench/control-test.ps1): adding a clock answers
 /// in 6-15 ms, removing one in under 5 ms. Five seconds is what weaverd
 /// gave the host for the same answer.
@@ -113,19 +113,34 @@ pub const Objects = struct {
     status_request: win.HANDLE,
     status_written: win.HANDLE,
 
-    /// Create them all, or fail with `error.AlreadyRunning` when another
-    /// host owns the singleton. The singleton is owned, not merely
-    /// created: weaverd and CLI probes hold handles to it while no host
-    /// runs, and a crashed host's ownership is abandoned with it.
-    pub fn claim() !Objects {
+    /// Own the singleton, or fail with `error.AlreadyRunning` when another
+    /// host does. Owned, not merely created: a CLI probe may hold a handle
+    /// to it for a moment while no host runs, and a crashed host's
+    /// ownership is abandoned with it.
+    pub fn claim() !win.HANDLE {
         const mutex = win.CreateMutexW(null, 0, contract.singleton_mutex) orelse return error.CreateMutexFailed;
         switch (win.WaitForSingleObject(mutex, 0)) {
-            win.WAIT_OBJECT_0, win.WAIT_ABANDONED => {},
+            win.WAIT_OBJECT_0, win.WAIT_ABANDONED => return mutex,
             else => {
                 _ = win.CloseHandle(mutex);
                 return error.AlreadyRunning;
             },
         }
+    }
+
+    /// Let go of the singleton `claim` took, for a host that exits before
+    /// it publishes control.
+    pub fn release(mutex: win.HANDLE) void {
+        _ = win.ReleaseMutex(mutex);
+        _ = win.CloseHandle(mutex);
+    }
+
+    /// Create the control events, once this host, owning `mutex`, can run:
+    /// `weaver up` takes them as a host that has started (host_lifecycle.zig
+    /// `up`), so a host that exits for want of its record never makes them.
+    /// Until then the lifecycle lock keeps `weaver down` and `weaver up`
+    /// waiting.
+    pub fn publish(mutex: win.HANDLE) !Objects {
         return .{
             .mutex = mutex,
             .shutdown = win.CreateEventW(null, 1, 0, contract.shutdown_event) orelse return error.CreateEventFailed,
@@ -134,22 +149,6 @@ pub const Objects = struct {
             .reload_failure = win.CreateEventW(null, 1, 0, contract.reload_failure_event) orelse return error.CreateEventFailed,
             .status_request = win.CreateEventW(null, 0, 0, contract.status_request_event) orelse return error.CreateEventFailed,
             .status_written = win.CreateEventW(null, 1, 0, contract.status_written_event) orelse return error.CreateEventFailed,
-        };
-    }
-};
-
-/// How `weaverd` restarted this host, from its environment
-/// (`contract.env_host_crashes`).
-pub const Restart = struct {
-    /// Crashes no widget was blamed for, within `backoff.crash_window_ms`.
-    crashes: u32 = 0,
-    exit_code: ?u32 = null,
-
-    pub fn fromEnvironment(environment: *const std.process.Environ.Map) Restart {
-        const crashes = environment.get(contract.env_host_crashes) orelse return .{};
-        return .{
-            .crashes = std.fmt.parseInt(u32, crashes, 10) catch 0,
-            .exit_code = if (environment.get(contract.env_host_exit_code)) |code| std.fmt.parseInt(u32, code, 10) catch null else null,
         };
     }
 };
@@ -169,7 +168,10 @@ pub const Options = struct {
     post: *const fn (*host_control.Pending) void,
     /// The previous host's record, read before this one opened its own.
     previous: ?contract.Record,
-    restart: Restart,
+    /// What status's host row says about how this host runs: a restart by
+    /// Windows, a refused restart request (host_lifecycle.hostNote). Empty
+    /// when there is nothing to say.
+    host_note: []const u8,
 };
 
 /// A process's cost as status shows it, sampled when the CLI asks for
@@ -415,9 +417,9 @@ pub const Daemon = struct {
             const wait = win.WaitForMultipleObjects(@intCast(count), &handles, 0, timeout);
             if (wait == win.WAIT_OBJECT_0) {
                 // Stopped from here on, whatever the rest of `weaver down`
-                // takes (a job may hold the state a moment longer): weaverd
-                // stops a host that is slow to go, and that must read as a
-                // stop, not a crash.
+                // takes (a job may hold the state a moment longer): `weaver
+                // down` stops a host that is slow to go, and that must read
+                // as a stop, not a crash.
                 crash_record.markStopped();
                 self.lockState();
                 self.stopAll();
@@ -484,11 +486,11 @@ pub const Daemon = struct {
                 if (result) |_| {} else |err| self.noteRegistryFailure(err);
                 // The host before this one died: a reload it took and never
                 // acknowledged (it may have died removing a widget) is
-                // answered now, before any widget starts, so the CLI that
-                // sent it, which still waits on the events weaverd kept
-                // alive, hears in time. A reload signalled since `begin`
-                // read the registry may carry a change that read missed: it
-                // runs next, and its result is the answer.
+                // answered now, before any widget starts, so a CLI that sent
+                // it and still waits on the events (one that could not watch
+                // the dead host's process) hears in time. A reload signalled
+                // since `begin` read the registry may carry a change that
+                // read missed: it runs next, and its result is the answer.
                 if (self.predecessorCrashed()) {
                     if (win.WaitForSingleObject(self.objects.reload, 0) == win.WAIT_OBJECT_0) {
                         reload_due.* = true;
@@ -538,7 +540,6 @@ pub const Daemon = struct {
         self.loadLedger();
         try self.loadRegistry();
         self.applyCulprit();
-        self.applyRestart(win.GetTickCount64());
     }
 
     // ---- Registry -------------------------------------------------------
@@ -610,37 +611,6 @@ pub const Daemon = struct {
             self.writeLedger();
             note("the previous host stopped in '{s}' (code 0x{X:0>8}); it is quarantined", .{ slot.name(), record.crash.code });
             return;
-        }
-    }
-
-    /// weaverd restarted this host after crashes no widget was blamed for:
-    /// every widget pays the backoff it paid when weaverd restarted each
-    /// one, and once the crashes pass the budget they are all held stopped
-    /// until a reinstall, or `weaver down` and `up`, as they were then.
-    fn applyRestart(self: *Daemon, now_ms: u64) void {
-        const restart = self.options.restart;
-        if (restart.crashes == 0) return;
-        const held = restart.crashes > backoff.restart_limit;
-        const window_minutes = backoff.crash_window_ms / 60_000;
-        for (&self.slots) |*slot| {
-            if (!slot.used or !slot.enabled or slot.state != .starting) continue;
-            if (held) {
-                if (self.quarantined(slot)) continue;
-                // A reinstall changes the artifact; reconcile compares
-                // against this.
-                slot.artifact_mtime = self.artifactMtime(slot.source());
-                slot.state = .stopped;
-                slot.setReason("held: the widget host crashed {d} times within {d} minutes with no widget to blame (restart_limit={d}); reinstall this widget, or run 'weaver down' then 'weaver up'", .{ restart.crashes, window_minutes, backoff.restart_limit });
-            } else {
-                slot.state = .backoff;
-                slot.next_restart_ms = now_ms + backoff.delayMs(restart.crashes);
-                slot.setReason("the widget host crashed{s}{?d}; restart {d} in {d}s", .{
-                    if (restart.exit_code != null) ": exit_code=" else "",
-                    restart.exit_code,
-                    restart.crashes,
-                    backoff.delayMs(restart.crashes) / 1000,
-                });
-            }
         }
     }
 
@@ -903,8 +873,8 @@ pub const Daemon = struct {
     /// Hand `command` to the UI thread and wait until it has taken effect.
     /// A UI thread that does not get to it in `apply_timeout_ms` is stuck
     /// (in a widget's native code, or in Native itself): the record names
-    /// the widget whose turn holds it, if one does, and the host exits for
-    /// weaverd to restart it, as weaverd restarted a host that did not
+    /// the widget whose turn holds it, if one does, and the host fails fast
+    /// for Windows to restart it, as weaverd restarted a host that did not
     /// answer. It runs on the worker, without the state lock, so the
     /// management thread answers status and `weaver down` meanwhile.
     fn apply(self: *Daemon, command: host_control.Command) !void {
@@ -916,9 +886,9 @@ pub const Daemon = struct {
         while (!pending.done.isSet()) {
             const now = win.GetTickCount64();
             if (now >= deadline) {
-                note("the UI thread did not apply a widget {s} within apply_timeout_ms={d}; the host is stuck and exits for weaverd to restart it", .{ @tagName(command), apply_timeout_ms });
+                note("the UI thread did not apply a widget {s} within apply_timeout_ms={d}; the host is stuck and fails fast for Windows to restart it", .{ @tagName(command), apply_timeout_ms });
                 crash_record.noteWedged(contract.exit_wedged, wedged_turn_ms);
-                _ = win.TerminateProcess(win.GetCurrentProcess(), contract.exit_wedged);
+                crash_record.failFast(contract.exit_wedged);
             }
             pending.done.waitTimeout(self.options.io, .{ .duration = .{
                 .raw = .fromMilliseconds(@intCast(@min(deadline - now, apply_poll_ms))),
@@ -1161,6 +1131,15 @@ pub const Daemon = struct {
         var entries: [max_widgets + 2]supervisor.StatusEntry = undefined;
         var count: usize = 0;
         const host_cost = self.costs;
+        // A registry failure and the host note both matter: shown together.
+        const registry_failure = self.registry_failure[0..self.registry_failure_len];
+        const host_reason = if (registry_failure.len == 0)
+            self.options.host_note
+        else if (self.options.host_note.len == 0)
+            registry_failure
+        else
+            std.fmt.allocPrint(self.allocator, "{s}; {s}", .{ registry_failure, self.options.host_note }) catch registry_failure;
+        defer if (host_reason.ptr != registry_failure.ptr and host_reason.ptr != self.options.host_note.ptr) self.allocator.free(host_reason);
         if (!self.stopping) entries[count] = .{
             .name = "host",
             .pid = self.pid,
@@ -1170,7 +1149,7 @@ pub const Daemon = struct {
             .backend = "-",
             .uptime_seconds = (now_ms -| self.started_ms) / 1000,
             .state = .running,
-            .reason = self.registry_failure[0..self.registry_failure_len],
+            .reason = host_reason,
             .host_row = true,
         };
         count += @intFromBool(!self.stopping);
@@ -1281,16 +1260,12 @@ fn wantsOf(slot: *const Slot) provider_service.Wants {
     };
 }
 
-/// The name identity a host slot records (`contract.SlotIdentity`). Never
-/// zero, which marks an empty slot.
-fn nameHash(name: []const u8) u64 {
-    return std.hash.Wyhash.hash(0, name) | 1;
-}
+const nameHash = contract.nameHash;
 
-/// Host-level notices. The host has no console under weaverd; a developer
-/// who starts it by hand sees them.
+/// Host-level notices, in logs\host.log (host_lifecycle.note, which keeps
+/// it bounded). What the CLI needs goes to status.json.
 fn note(comptime format: []const u8, args: anytype) void {
-    std.debug.print("weaver-widget --host: " ++ format ++ "\n", args);
+    host_lifecycle.note("weaver-widget --host: " ++ format ++ "\n", args);
 }
 
 /// End this process with `code`: a u32, which std.process.exit (a u8)
@@ -1371,13 +1346,4 @@ test "the crash ledger round-trips and keeps one entry per widget" {
     try std.testing.expect(read.find("Clock \"two\"") != null);
     read.remove(read.find("Clock").?);
     try std.testing.expect(read.find("Clock") == null);
-}
-
-test "weaverd's restart environment reads back, and a fresh start has none" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try std.testing.expectEqual(Restart{}, Restart.fromEnvironment(&environment));
-    try environment.put(contract.env_host_crashes, "2");
-    try environment.put(contract.env_host_exit_code, "3221225477");
-    try std.testing.expectEqual(Restart{ .crashes = 2, .exit_code = 0xC000_0005 }, Restart.fromEnvironment(&environment));
 }

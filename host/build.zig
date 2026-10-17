@@ -116,31 +116,22 @@ pub fn build(b: *std.Build) void {
         return;
     }
     if (target.result.os.tag != .windows) @panic("weaverd supports only Windows and macOS");
-    // On Windows weaverd only starts the widget host and restarts it after a
-    // crash; the host is the daemon (runtime/src/daemon.zig) and compiles
-    // the providers (runtime/build.zig hostProvidersModule).
-    const exe = b.addExecutable(.{
-        .name = "weaverd",
+    // Windows has no weaverd (ADR 0022): the widget host is the daemon and
+    // asks Windows to restart it (runtime/src/daemon.zig), and the CLI's
+    // client verbs live in the runtime too (runtime/src/host_lifecycle.zig).
+    // What stays here on Windows is what the runtime compiles from this
+    // package: the registry slots, backoff and status format, and the host
+    // contract, tested on their own.
+    const contract_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/host_contract.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    exe.subsystem = .Windows;
-    for ([_][]const u8{ "c", "kernel32" }) |library| exe.root_module.linkSystemLibrary(library, .{});
-    b.installArtifact(exe);
-
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    for ([_][]const u8{ "c", "kernel32" }) |library| tests.root_module.linkSystemLibrary(library, .{});
-    const test_step = b.step("test", "Run weaverd unit tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run the supervisor and host contract tests the Windows runtime compiles");
+    test_step.dependOn(&b.addRunArtifact(supervisor_tests).step);
+    test_step.dependOn(&b.addRunArtifact(contract_tests).step);
 }
 
 fn hostTarget(b: *std.Build) std.Build.ResolvedTarget {

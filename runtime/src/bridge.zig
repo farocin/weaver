@@ -236,9 +236,11 @@ fn stringArg(ctx: *c.JSContext, value: c.JSValueConst) !struct { bytes: []const 
     return .{ .bytes = raw[0..len], .raw = raw };
 }
 
-/// `native.testCrash("fault" | "panic")`, in `-Dautomation-seam` builds
-/// only: crash the host from inside a widget's turn, as a bug in native
-/// code would, so crash attribution can be tested on a real process.
+/// `native.testCrash("fault" | "panic" | "provider")`, in
+/// `-Dautomation-seam` builds only: crash the host from inside a widget's
+/// turn, as a bug in native code would, or (`provider`, Windows host) on
+/// the system provider's worker at its next sample, so crash attribution
+/// and the OS restart can be tested on a real process.
 fn testCrash(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {
     const js = ctx orelse return qjs.exceptionValue();
     var kind: [8]u8 = @splat(0);
@@ -250,6 +252,10 @@ fn testCrash(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSV
         }
     }
     if (std.mem.startsWith(u8, &kind, "panic")) @panic("native.testCrash(\"panic\")");
+    if (std.mem.startsWith(u8, &kind, "provider")) {
+        if (@import("builtin").os.tag == .windows) @import("provider_service.zig").test_crash_requested.store(true, .release);
+        return qjs.undefinedValue();
+    }
     const nowhere: *allowzero volatile u32 = @ptrFromInt(0);
     nowhere.* = 1;
     return qjs.undefinedValue();

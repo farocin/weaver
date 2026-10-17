@@ -1,9 +1,10 @@
 const builtin = @import("builtin");
 const supervisor = @import("supervisor.zig");
+// weaverd runs only on macOS: on Windows the widget host is the daemon
+// (ADR 0022, runtime/src/daemon.zig), and host/build.zig builds no weaverd.
 const platform_host = switch (builtin.os.tag) {
-    .windows => @import("windows_host.zig"),
     .macos => @import("macos_host.zig"),
-    else => @compileError("weaverd supports only Windows and macOS"),
+    else => @compileError("weaverd runs only on macOS; on Windows the widget host is the daemon (runtime/src/daemon.zig)"),
 };
 
 pub fn main(init: @import("std").process.Init) void {
