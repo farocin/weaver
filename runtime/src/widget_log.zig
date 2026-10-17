@@ -14,7 +14,9 @@ var write_failed = std.atomic.Value(bool).init(false);
 var fallback_reported = std.atomic.Value(bool).init(false);
 
 pub fn init(runtime_io: std.Io, path: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+    // Two short paths: the C heap packs them; `page_allocator` rounded each
+    // to its own 4 KiB page.
+    const allocator = std.heap.c_allocator;
     const next_path = try allocator.dupe(u8, path);
     errdefer allocator.free(next_path);
     const next_old_path = try std.fmt.allocPrint(allocator, "{s}.old", .{path});
