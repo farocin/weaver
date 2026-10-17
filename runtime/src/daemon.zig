@@ -363,7 +363,14 @@ pub const Daemon = struct {
         // here, now that this start has read the registry as it stands and
         // before any widget starts, so the CLI that sent it, which still
         // waits on the events weaverd kept alive, hears in time.
-        if (self.predecessorCrashed()) _ = win.SetEvent(if (began) |_| self.objects.reload_success else |_| self.objects.reload_failure);
+        if (self.predecessorCrashed()) {
+            // A reload signalled since `begin` read the registry may carry a
+            // change that read missed: it is run, and its result is the
+            // answer.
+            const answered = if (win.WaitForSingleObject(self.objects.reload, 0) == win.WAIT_OBJECT_0) onWorker(loadRegistry, .{self}) else began;
+            if (answered) |_| {} else |err| self.noteRegistryFailure(err);
+            _ = win.SetEvent(if (answered) |_| self.objects.reload_success else |_| self.objects.reload_failure);
+        }
         var status_requested = true;
         while (true) {
             const now = win.GetTickCount64();
@@ -380,7 +387,13 @@ pub const Daemon = struct {
             var handles: [max_wait_handles]win.HANDLE = undefined;
             const count = self.waitHandles(&handles);
             const wait = win.WaitForMultipleObjects(@intCast(count), &handles, 0, self.nextDeadlineMs(win.GetTickCount64()));
-            if (wait == win.WAIT_OBJECT_0) break;
+            if (wait == win.WAIT_OBJECT_0) {
+                // Stopped from here on, whatever the rest of `weaver down`
+                // takes: weaverd stops a host that is slow to go, and that
+                // must read as a stop, not a crash.
+                crash_record.markStopped();
+                break;
+            }
             if (wait == win.WAIT_FAILED) {
                 // Never expected; a wait that keeps failing must not spin.
                 note("the management wait failed: Win32 error {d}; retrying in {d} ms", .{ win.GetLastError(), apply_poll_ms });
@@ -791,6 +804,7 @@ pub const Daemon = struct {
             if (win.WaitForSingleObject(self.objects.shutdown, 0) == win.WAIT_OBJECT_0) {
                 // The UI thread never runs this command now; the rest of
                 // `weaver down` needs nothing from it.
+                crash_record.markStopped();
                 self.stopAll();
                 crash_record.markStopped();
                 exitProcess(0);
