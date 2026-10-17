@@ -56,9 +56,9 @@ external upstream.
    have finished, and no actionable thread remains. A mergeable badge alone is
    not completion.
 
-Do not merge the pull request. If permissions, infrastructure, or an unresolved
-product decision prevents the loop from finishing, return the exact blocker and
-the evidence already collected.
+Merge it then, following the merge line in `AGENTS.md`. If permissions,
+infrastructure, or an unresolved product decision prevents the loop from
+finishing, return the exact blocker and the evidence already collected.
 
 ## Return the repair
 

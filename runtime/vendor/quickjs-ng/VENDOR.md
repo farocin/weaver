@@ -79,3 +79,11 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
 - `JS_GetDOMExceptionFields(ctx, val, &name, &message)`: reads a
   DOMException's fields without its prototype getters, so diagnostics can
   show one without running code.
+- `js_error_set_stackTraceLimit` releases the value it replaces, as
+  `js_error_set_prepareStackTrace` already does. Upstream (checked against
+  quickjs-ng master, October 2026) keeps every replaced value alive until
+  the context is freed, and the context's leak check then fails at teardown.
+- `build_backtrace` releases its reference to `Error.prepareStackTrace` when
+  the value is not a function (it is ignored then). Upstream released it only
+  when it was called, so every error built while a non-function was set kept
+  it alive.

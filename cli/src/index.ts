@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
-import { compileClass, UtilityError } from "../../sdk/src/class-compiler.js";
+import { compileClass, UtilityError, type ClassProps } from "../../sdk/src/class-compiler.js";
+import { iconClass } from "../../sdk/src/icon-class.js";
 import { signalDevReload } from "./dev-reload.js";
 import { createDevRebuildLoop } from "./dev-rebuild-loop.js";
 import { endDevRegistration } from "./dev-registration.js";
@@ -307,10 +308,14 @@ async function bundleWidget(directory: string): Promise<BundleResult> {
   const outputDirectory = join(directory, "dist");
   mkdirSync(outputDirectory, { recursive: true });
   copyWidgetAssets(directory, outputDirectory);
-  const bundle = await compileWidgetBundle(project, join(outputDirectory, "bundle.js"));
+  const { bundle, sdkFallback } = await compileWidgetBundle(project, join(outputDirectory, "bundle.js"));
   if (project.usesIcons) {
     copyFileSync(iconLicenseSource, join(outputDirectory, iconLicenseFile));
   }
+  // Written before the bundle that names it, and never deleted: a widget
+  // still running an earlier bundle (a dev hot swap the runtime rejected
+  // keeps it) loads the fallback that bundle was built with.
+  if (sdkFallback) writeAtomic(join(outputDirectory, sdkFallback.name), sdkFallback.contents);
   writeAtomic(join(outputDirectory, "bundle.js"), bundle);
   const manifest: RuntimeManifest = {
     name: project.config.name,
@@ -781,7 +786,16 @@ function nowMicroseconds(): number {
   return Number(process.hrtime.bigint() / 1000n);
 }
 
-async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<Uint8Array> {
+interface SdkFallback {
+  /** sdk-fallback-<hash>.js beside bundle.js, named by its contents. */
+  name: string;
+  contents: Uint8Array;
+}
+
+async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<{ bundle: Uint8Array; sdkFallback: SdkFallback | null }> {
+  const use = sdkUse(project);
+  const trimmed = use.classes !== null || !use.backgroundProps;
+  const sdkFallback = trimmed ? await compileSdkFallback() : null;
   const built = await build({
     entryPoints: [project.sourcePath],
     outfile,
@@ -794,13 +808,44 @@ async function compileWidgetBundle(project: SourceProject, outfile: string): Pro
     legalComments: "none",
     minify: true,
     plugins: [
+      ...(sdkFallback ? [sdkTrimPlugin(use, sdkFallback.name)] : []),
       iconLoweringPlugin(project.directory, () => { project.usesIcons = true; }),
       weaverResolutionPlugin(project.directory),
     ],
     logLevel: "silent",
     write: false,
   });
-  return built.outputFiles[0].contents;
+  return { bundle: built.outputFiles[0].contents, sdkFallback };
+}
+
+/**
+ * The SDK runtime a trimmed bundle can still reach through a class or a
+ * background the source analysis did not see: the class compiler and the
+ * gradient serializer, as one script whose value is their exports. The
+ * runtime evaluates it only when the bundle first needs it.
+ */
+async function compileSdkFallback(): Promise<SdkFallback> {
+  const built = await build({
+    stdin: {
+      contents: `export { compileClass, classUsesGradientBackground } from "./class-compiler.js";
+export { serializeBackground } from "./gradients.js";
+`,
+      resolveDir: sdkRoot,
+      loader: "ts",
+    },
+    bundle: true,
+    format: "iife",
+    globalName: "__weaverSdkFallback",
+    footer: { js: "__weaverSdkFallback;" },
+    platform: "neutral",
+    target: "es2020",
+    legalComments: "none",
+    minify: true,
+    logLevel: "silent",
+    write: false,
+  });
+  const contents = built.outputFiles[0].contents;
+  return { name: `sdk-fallback-${createHash("sha256").update(contents).digest("hex").slice(0, 16)}.js`, contents };
 }
 
 async function packWidget(directory: string): Promise<void> {
@@ -1041,6 +1086,63 @@ function jsxClassVariants(attribute: ts.JsxAttribute, context: StaticExpressionC
   if (ts.isStringLiteral(initializer)) return [initializer.text];
   if (ts.isJsxExpression(initializer) && initializer.expression) return context.stringVariants(initializer.expression);
   return null;
+}
+
+/** One spelling per class string: the class compiler reads utilities split
+ * on whitespace, so strings that differ only in spacing compile the same. */
+function normalizedClass(className: string): string {
+  return className.trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+/** What of the SDK's runtime a widget's source shows it using. */
+interface SdkUse {
+  /** Every class string the source shows the widget rendering, compiled;
+   * null when the analysis gives up and the class compiler ships. */
+  classes: Map<string, ClassProps> | null;
+  /** Whether a `background={...}` gradient appears in the source. */
+  backgroundProps: boolean;
+}
+
+/**
+ * Read from the source what of the SDK's runtime the widget uses: every
+ * class string a JSX `class` can take (`weaver check` already enumerates
+ * them), and whether a built-in element takes a `background` prop. The
+ * analysis is a guide, not a proof: a class or background it did not see
+ * makes the widget load sdk-fallback.js, so being wrong costs memory, never
+ * correctness. It gives up where it is likely to be wrong anyway: spread
+ * props on a built-in element, a direct `h` call, the JSX runtime imported
+ * by hand.
+ */
+function sdkUse(project: SourceProject): SdkUse {
+  const everything: SdkUse = { classes: null, backgroundProps: true };
+  const bindings = hFactoryBindings(project.directory, project.sourceFiles);
+  if ([...bindings.values()].some((binding) => binding.identifiers.size > 0 || binding.namespaces.size > 0)) return everything;
+  if (project.sourceFiles.some((sourceFile) => sourceFile.text.includes("@weaver/sdk/jsx-runtime") || sourceFile.text.includes("serializeBackground"))) return everything;
+  const classes = new Set<string>([""]);
+  let backgroundProps = false;
+  for (const sourceFile of project.sourceFiles) {
+    const incomplete = walkSourceWithStaticExpressions(sourceFile, (node, context) => {
+      if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && node.tagName.getText(sourceFile) === "icon" &&
+          !node.attributes.properties.some((property) => ts.isJsxAttribute(property) && property.name.getText(sourceFile) === "class")) {
+        classes.add(iconClass(undefined));
+      }
+      if (ts.isJsxSpreadAttribute(node)) return /^[a-z]/.test(node.parent.parent.tagName.getText(sourceFile));
+      if (!ts.isJsxAttribute(node)) return false;
+      const tag = node.parent.parent.tagName.getText(sourceFile);
+      const name = node.name.getText(sourceFile);
+      if (name === "background") backgroundProps = true;
+      if (name !== "class") return false;
+      const variants = jsxClassVariants(node, context);
+      if (variants === null) return true;
+      // The SDK composes an <icon>'s class at run time; compile that string.
+      for (const variant of variants) classes.add(normalizedClass(tag === "icon" ? iconClass(variant) : variant));
+      return false;
+    });
+    if (incomplete) return everything;
+  }
+  const compiled = new Map<string, ClassProps>();
+  for (const className of classes) compiled.set(className, compileClass(className));
+  return { classes: compiled, backgroundProps };
 }
 
 interface HFactoryBindings {
@@ -1361,6 +1463,56 @@ function weaverResolutionPlugin(sourceRoot: string): import("esbuild").Plugin {
         }
         return null;
       });
+    },
+  };
+}
+
+/**
+ * Leave out of the bundle the SDK runtime the source shows no use for: the
+ * class compiler, replaced by a lookup in the classes compiled here, and the
+ * gradient serializer with its color palette. Each costs every widget tens
+ * of KiB of JavaScript heap (about 60 KiB apiece for a clock, 2026-10-15).
+ * A class or background the lookup cannot serve loads sdk-fallback.js once,
+ * so a widget the analysis misread still renders, at the old memory cost.
+ */
+function sdkTrimPlugin(use: SdkUse, fallbackName: string): import("esbuild").Plugin {
+  const modules = new Map<string, string>([["fallback", `let fallback;
+export function sdkFallback() {
+  if (fallback === undefined) fallback = native.loadSdkFallback(${JSON.stringify(fallbackName)});
+  return fallback;
+}
+`]]);
+  if (use.classes) {
+    modules.set("class-compiler.js", `import { sdkFallback } from "weaver-sdk-fallback";
+const classes = new Map(${JSON.stringify([...use.classes])});
+const normalized = (className) => className.trim().split(/\\s+/).filter(Boolean).join(" ");
+const known = (className) => classes.get(className) ?? classes.get(normalized(className));
+export function compileClass(className) {
+  return known(className) ?? sdkFallback().compileClass(className);
+}
+export function classUsesGradientBackground(className) {
+  const compiled = known(className);
+  return compiled !== undefined ? compiled.backgroundGradient !== undefined : sdkFallback().classUsesGradientBackground(className);
+}
+`);
+  }
+  if (!use.backgroundProps) {
+    modules.set("gradients.js", `import { sdkFallback } from "weaver-sdk-fallback";
+export function serializeBackground(background) {
+  return sdkFallback().serializeBackground(background);
+}
+`);
+  }
+  return {
+    name: "weaver-sdk-trim",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /^weaver-sdk-fallback$/ }, () => ({ path: "fallback", namespace: "weaver-sdk-trim" }));
+      pluginBuild.onResolve({ filter: /^\.\/(class-compiler|gradients)\.js$/ }, (args) => {
+        if (!args.importer || !(pathsEqual(args.importer, sdkRoot) || pathInside(sdkRoot, args.importer))) return null;
+        const name = args.path.slice(2);
+        return modules.has(name) ? { path: name, namespace: "weaver-sdk-trim" } : null;
+      });
+      pluginBuild.onLoad({ filter: /.*/, namespace: "weaver-sdk-trim" }, (args) => ({ contents: modules.get(args.path)!, loader: "js" }));
     },
   };
 }
@@ -2174,7 +2326,12 @@ const nativeWidgetCanvasLimit = 8;
 const nativeWidgetImageLimit = 16;
 
 interface LoweredTreeMetrics {
+  /** Native nodes buildNode emits (painted layouts and <panel> are two). */
   nodes: number;
+  /** Retained-tree nodes the reconciler creates: one per host element and
+   * per text value outside <text>, including leaf descendants Native never
+   * receives. */
+  retainedNodes: number;
   roots: number;
   depth: number;
   maxChildren: number;
@@ -2346,20 +2503,62 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     if (!attribute) return [""];
     return staticClassVariants.get(attribute) ?? null;
   };
+  // A layout element lowers to a painted panel around its layout node when
+  // the runtime's hasPaintStyle (runtime/src/main.zig) holds for it, read
+  // through the bridge's unset values: empty colors and shadows are null,
+  // unset corner radii and interaction opacity are -1, and an interaction
+  // `shadow-none` is the explicit override "none".
+  const paintsOwnBox = (props: ClassProps): boolean => {
+    const color = (value: string | undefined) => value !== undefined && value !== "";
+    const count = (value: number | undefined) => value !== undefined && value >= 0;
+    return color(props.background) || color(props.backgroundGradient) || color(props.borderColor) ||
+      (props.borderWidth ?? 0) > 0 || (props.radius ?? 0) > 0 ||
+      count(props.radiusTopLeft) || count(props.radiusTopRight) || count(props.radiusBottomRight) || count(props.radiusBottomLeft) ||
+      color(props.shadow) ||
+      color(props.hoverBackground) || color(props.hoverTextColor) || count(props.hoverOpacity) || color(props.hoverBorderColor) || color(props.hoverShadow) ||
+      color(props.pressedBackground) || color(props.pressedTextColor) || count(props.pressedOpacity) || color(props.pressedBorderColor) || color(props.pressedShadow);
+  };
+  // The explicit `background` prop is a gradient (the class form compiles to
+  // backgroundGradient), so any statically present value paints.
+  const hasBackgroundProp = (node: ts.JsxElement | ts.JsxSelfClosingElement): boolean => {
+    const { attributes } = tagAndAttributes(node);
+    const sourceFile = node.getSourceFile();
+    const definitelyAbsent = (expression: ts.Expression): boolean => {
+      let current = expression;
+      while (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isNonNullExpression(current) ||
+        ts.isTypeAssertionExpression(current) || ts.isSatisfiesExpression(current)) {
+        current = current.expression;
+      }
+      // null is not absent: the reconciler serializes it and rejects it.
+      return ts.isVoidExpression(current) || (ts.isIdentifier(current) && current.text === "undefined");
+    };
+    return attributes.properties.some((attribute) => {
+      if (!ts.isJsxAttribute(attribute) || attribute.name.getText(sourceFile) !== "background") return false;
+      const initializer = attribute.initializer;
+      if (!initializer || !ts.isJsxExpression(initializer) || !initializer.expression) return true;
+      return !definitelyAbsent(initializer.expression);
+    });
+  };
+  // Mirrors buildNode: <panel> is always a painted box around a column.
   const isPaintedLayout = (node: ts.JsxElement | ts.JsxSelfClosingElement, tag: string): boolean => {
+    if (tag === "panel") return true;
     if (tag !== "row" && tag !== "column" && tag !== "stack") return false;
+    if (hasBackgroundProp(node)) return true;
     for (const classText of classVariants(node) ?? []) {
       try {
-        const compiled = compileClass(classText);
-        if (Object.keys(compiled).some((key) => key === "background" || key === "radius" || key.startsWith("radius") || key.startsWith("border") || key.toLowerCase().includes("shadow"))) return true;
+        if (paintsOwnBox(compileClass(classText))) return true;
       } catch {
         // The ordinary class validator reports the malformed utility.
       }
     }
     return false;
   };
+  // Leaves draw themselves; buildNode never emits their children, so those
+  // add no Native depth. (They still count as retained nodes below.)
+  const leafTags = new Set(["text", "slider", "icon", "image", "canvas"]);
   const maximum = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: Math.max(0, ...values.map((value) => value.nodes)),
+    retainedNodes: Math.max(0, ...values.map((value) => value.retainedNodes)),
     roots: Math.max(0, ...values.map((value) => value.roots)),
     depth: Math.max(0, ...values.map((value) => value.depth)),
     maxChildren: Math.max(0, ...values.map((value) => value.maxChildren)),
@@ -2378,11 +2577,12 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     return null;
   };
   const emptyMetrics = (): LoweredTreeMetrics => ({
-    nodes: 0, roots: 0, depth: 0, maxChildren: 0, canvases: 0, images: 0, maxTextBytes: 0,
+    nodes: 0, retainedNodes: 0, roots: 0, depth: 0, maxChildren: 0, canvases: 0, images: 0, maxTextBytes: 0,
     opacityCanvas: false,
   });
   const combineSiblings = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: values.reduce((sum, value) => sum + value.nodes, 0),
+    retainedNodes: values.reduce((sum, value) => sum + value.retainedNodes, 0),
     roots: values.reduce((sum, value) => sum + value.roots, 0),
     depth: Math.max(0, ...values.map((value) => value.depth)),
     maxChildren: Math.max(0, ...values.map((value) => value.maxChildren)),
@@ -2411,11 +2611,11 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
         if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child) || ts.isJsxFragment(child)) {
           result.push(metrics(child, visiting));
         } else if (parentTag !== "text" && ts.isJsxText(child) && child.getText().trim() !== "") {
-          result.push({ ...emptyMetrics(), nodes: 1, roots: 1, depth: 1 });
+          result.push({ ...emptyMetrics(), nodes: 1, retainedNodes: 1, roots: 1, depth: 1 });
         } else if (parentTag !== "text" && ts.isJsxExpression(child) && child.expression) {
           const roots = expressionRoots(child.expression);
           if (roots.length > 0) result.push(maximum(roots.map((root) => metrics(root, visiting))));
-          else if (staticPrimitiveText(child.expression) !== null) result.push({ ...emptyMetrics(), nodes: 1, roots: 1, depth: 1 });
+          else if (staticPrimitiveText(child.expression) !== null) result.push({ ...emptyMetrics(), nodes: 1, retainedNodes: 1, roots: 1, depth: 1 });
         }
       }
       return result;
@@ -2452,9 +2652,10 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     const directChildren = combinedChildren.roots;
     const hasOpacityLayer = canvasHasOpacityLayer(node);
     return {
-      nodes: ownDepth + combinedChildren.nodes,
+      nodes: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.nodes),
+      retainedNodes: 1 + combinedChildren.retainedNodes,
       roots: 1,
-      depth: ownDepth + combinedChildren.depth,
+      depth: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.depth),
       maxChildren: Math.max(combinedChildren.maxChildren, directChildren, ownDepth === 2 ? 1 : 0),
       canvases: combinedChildren.canvases + (tag === "canvas" ? 1 : 0),
       images: combinedChildren.images + (tag === "image" ? 1 : 0),
@@ -2636,11 +2837,14 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
   const lowered = maximum(roots.map((root) => metrics(root, new Set())));
   const evidenceNode = roots[0];
   const limitation = " The static estimate follows the exported widget through local components and one level of relative imports; runtime limits remain authoritative for dynamic collections and unresolved component output.";
+  if (lowered.retainedNodes > nativeWidgetNodeLimit) {
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `RetainedWidgetNodeLimit: this tree creates ${lowered.retainedNodes} retained nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.retainedNodes}, headroom=${nativeWidgetNodeLimit - lowered.retainedNodes}. Each host element is one retained node, as is each text value outside a <text> element (a <text> joins its own children); descendants of a <slider> or <image> stay retained even though they are never drawn.${limitation}`));
+  }
   if (lowered.nodes > nativeWidgetNodeLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Painted <row>/<column>/<stack> elements add an inner layout node.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Every <panel>, and each <row>/<column>/<stack> that paints its own box, adds an inner layout node.${limitation}`));
   }
   if (lowered.depth > nativeWidgetDepthLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); painted <row>/<column>/<stack> elements add one nesting level.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); every <panel>, and each <row>/<column>/<stack> that paints its own box (background, border, radius, shadow, or a hover:/pressed: style), adds one nesting level.${limitation}`));
   }
   if (lowered.maxChildren > nativeWidgetChildLimit) {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetChildLimit: one authored parent lowers to ${lowered.maxChildren} direct Native children; child capacity exhausted: max_children=${nativeWidgetChildLimit}, asked for ${lowered.maxChildren}, headroom=${nativeWidgetChildLimit - lowered.maxChildren}.${limitation}`));
