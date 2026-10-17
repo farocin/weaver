@@ -2155,6 +2155,9 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
     // From here on, a crash is recorded. Opening the record consumes the
     // previous host's: this start takes the next generation.
     const previous = openRecord(paths.record) catch {
+        // The singleton goes before the lock: a `weaver up` waiting on the
+        // lock then finds no host, not one on its way out.
+        daemon_mod.Objects.release(singleton);
         lock.release();
         daemon_mod.exitProcess(host_contract.exit_record_unavailable);
     };

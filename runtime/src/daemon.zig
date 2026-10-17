@@ -128,6 +128,13 @@ pub const Objects = struct {
         }
     }
 
+    /// Let go of the singleton `claim` took, for a host that exits before
+    /// it publishes control.
+    pub fn release(mutex: win.HANDLE) void {
+        _ = win.ReleaseMutex(mutex);
+        _ = win.CloseHandle(mutex);
+    }
+
     /// Create the control events, once this host, owning `mutex`, can run:
     /// `weaver up` takes them as a host that has started (host_lifecycle.zig
     /// `up`), so a host that exits for want of its record never makes them.
