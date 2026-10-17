@@ -2232,8 +2232,10 @@ fn discardDeadStack() void {
     const tib = &std.os.windows.teb().NtTib;
     const low = @intFromPtr(tib.StackLimit);
     var here: u8 = 0;
-    // Slack under this frame for the call below.
-    const high = std.mem.alignBackward(usize, @intFromPtr(&here), page) -| 2 * page;
+    // Slack under this frame for DiscardVirtualMemory's own stack: 4,296
+    // bytes plus saved registers on KernelBase 10.0.26100 (review of #117);
+    // eight pages leave room for other Windows builds.
+    const high = std.mem.alignBackward(usize, @intFromPtr(&here), page) -| 8 * page;
     if (high <= low) return;
     _ = DiscardVirtualMemory(@ptrFromInt(low), high - low);
 }
