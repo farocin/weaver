@@ -1801,7 +1801,19 @@ fn createModel() !*Model {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(allocator);
+    const all_args = try init.minimal.args.toSlice(allocator);
+    // Every widget runs in the shared, frozen realm (js_engine.zig), in the
+    // host, under `weaver dev` and in capture alike, so a widget behaves
+    // the same everywhere. A leading `--own-realms` gives each widget a
+    // realm of its own instead.
+    const own_realms = all_args.len >= 2 and std.mem.eql(u8, all_args[1], "--own-realms");
+    js_engine.shared_realm_enabled = !own_realms;
+    const args = if (own_realms) rest: {
+        const rest = try allocator.alloc([:0]const u8, all_args.len - 1);
+        rest[0] = all_args[0];
+        @memcpy(rest[1..], all_args[2..]);
+        break :rest rest;
+    } else all_args;
     // The CLI's client verbs (host_lifecycle.zig): a short-lived process
     // that only touches the host's named objects and files.
     if (builtin.os.tag == .windows and args.len == 2) if (host_lifecycle.Verb.parse(args[1])) |verb| {
@@ -1838,9 +1850,9 @@ pub fn main(init: std.process.Init) !void {
         // The render-host form is parsed only on macOS; advertise it only
         // where it is accepted.
         std.debug.print(if (weaver_build_options.render_host_enabled)
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
+            "usage: weaver-widget [--own-realms] [--dev] <widget-directory> | weaver-widget [--own-realms] --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
         else
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>...\n", .{});
+            "usage: weaver-widget [--own-realms] [--dev] <widget-directory> | weaver-widget [--own-realms] --host <widget-directory>...\n", .{});
         return error.InvalidArguments;
     }
     const directory_arg: usize = if (dev) 2 else 1;
