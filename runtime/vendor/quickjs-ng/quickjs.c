@@ -7814,6 +7814,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (!JS_IsNull(ctx->error_ctor)) {
         prepare = js_dup(ctx->error_prepare_stack);
         has_prepare = JS_IsFunction(ctx, prepare);
+        /* Weaver: only a callable formatter is used, and released below. */
+        if (!has_prepare)
+            JS_FreeValue(ctx, prepare);
     }
 
     if (has_prepare) {

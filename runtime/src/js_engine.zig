@@ -497,7 +497,7 @@ test "diagnostic truncation preserves UTF-8 boundaries" {
     try std.testing.expectEqualStrings(details, validUtf8Prefix(details, details.len));
 }
 
-test "replacing Error.stackTraceLimit releases the value it replaced" {
+test "the Error stack settings keep no value they no longer hold" {
     var tree: tree_mod.Tree = .{ .allocator = std.testing.allocator };
     defer tree.deinit();
     var provider: provider_mod.Client = .{};
@@ -518,6 +518,12 @@ test "replacing Error.stackTraceLimit releases the value it replaced" {
     try engine.evaluate(
         \\Error.stackTraceLimit = new ArrayBuffer(4 * 1024 * 1024);
         \\Error.stackTraceLimit = 10;
+        \\// A formatter that is not a function is ignored, and each error
+        \\// built while it was set used to keep a reference to it.
+        \\Error.prepareStackTrace = new ArrayBuffer(4 * 1024 * 1024);
+        \\new Error("m");
+        \\Error.captureStackTrace({});
+        \\Error.prepareStackTrace = undefined;
     , "stack-trace-limit.js");
     c.JS_RunGC(engine.runtime);
     const after = engine.memoryUsage().malloc_size;
