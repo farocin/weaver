@@ -190,6 +190,8 @@ export interface HostDown {
   restartWaitMs: number;
   /** The slowest restart measured (host_contract.os_restart_measured_max_ms). */
   restartMeasuredMs: number;
+  /** The Win32 error a starting host gets opening its record, when no live host holds it; such a host exits (host_contract.exit_record_unavailable). */
+  recordHeld: null | { error: number; sharing: boolean };
   record: null | {
     generation: number;
     pid: number;
@@ -213,6 +215,10 @@ export function describeHostDown(down: HostDown): string[] {
   const seconds = (ms: number): string => `${Math.max(0, Math.round(ms / 1000))} s`;
   const up = 'Run "weaver up" to start it.';
   if (down.stopped) return [`The widget host is not running: "weaver down" stopped it at ${clock(down.stopped.at)}.`, up];
+  if (down.recordHeld) {
+    const why = down.recordHeld.sharing ? "another program holds it open" : `Windows answers Win32 error ${down.recordHeld.error}`;
+    return [`The widget host is not running: it cannot open its record at ${down.recordPath} (${why}), and a host exits without it, because it could not quarantine the widget a crash blames.`, 'Close whatever holds that file, then run "weaver up".'];
+  }
   const record = down.record;
   if (!record) return [`The widget host is not running, and ${down.recordPath} holds no record of an earlier run.`, up];
   // A host whose record holds a crash and whose process is alive is dying:

@@ -72,26 +72,26 @@ var fail_fast_crashes = false;
 var panic_note_path: [1024:0]u16 = undefined;
 var panic_note_length: usize = 0;
 
+/// How a host opens its record. Readers (`read`) and deletion may share it;
+/// another writer may not: two hosts on one record would mix one's identity
+/// with the other's crash.
+const record_access: u32 = 0x8000_0000 | 0x4000_0000; // GENERIC_READ | GENERIC_WRITE
+const record_share: u32 = 0x1 | 0x4; // FILE_SHARE_READ | FILE_SHARE_DELETE
+
 /// Map the record at `path` (creating it), start a new generation marked
 /// running, and route unhandled exceptions through `noteCrash`. Called on
-/// the UI thread, before any widget loads. A record that can't be opened
-/// leaves attribution off; the host still runs. Returns the previous
-/// host's record, when the file held one this version wrote: the host
-/// consumes it exactly once, because this start overwrites it.
+/// the UI thread, before any widget loads. A host that can't open it does
+/// not run (main.zig `openRecord`). Returns the previous host's record,
+/// when the file held one this version wrote: the host consumes it exactly
+/// once, because this start overwrites it.
 pub fn open(path: []const u8) !?Record {
     if (builtin.os.tag != .windows) return null;
     var wide: [1024:0]u16 = undefined;
     const length = try std.unicode.utf8ToUtf16Le(&wide, path);
     if (length >= wide.len) return error.NameTooLong;
     wide[length] = 0;
-    const generic_read: u32 = 0x8000_0000;
-    const generic_write: u32 = 0x4000_0000;
-    // Readers (the daemon) and deletion may share it; another writer may
-    // not: two hosts on one record would mix one's identity with the
-    // other's crash. A second host runs without attribution instead.
-    const share_read_delete: u32 = 0x1 | 0x4;
     const open_always: u32 = 4;
-    const file = CreateFileW(&wide, generic_read | generic_write, share_read_delete, null, open_always, 0, null);
+    const file = CreateFileW(&wide, record_access, record_share, null, open_always, 0, null);
     if (file == windows.INVALID_HANDLE_VALUE) {
         open_error = GetLastError();
         // ERROR_SHARING_VIOLATION: another host has it open for writing.
@@ -203,6 +203,28 @@ pub fn noteRestart(plan: contract.RestartPlan, request: contract.RestartRequest,
     mapped.restart_error = hresult;
     mapped.restart_line_len = line_len;
     mapped.restart = request;
+}
+
+/// The Win32 error a host opening the record at `path` would get now, or
+/// null if it would open it (or create it: there is none yet). What `weaver
+/// up` and `weaver status` name when a host exited for want of its record.
+/// It opens the record as a host does and closes it at once; a host
+/// starting meanwhile retries (main.zig `openRecord`).
+pub fn openFailure(path: []const u8) ?u32 {
+    if (builtin.os.tag != .windows) return null;
+    var wide: [1024:0]u16 = undefined;
+    const length = std.unicode.utf8ToUtf16Le(&wide, path) catch return null;
+    if (length >= wide.len) return null;
+    wide[length] = 0;
+    const open_existing: u32 = 3;
+    const file = CreateFileW(&wide, record_access, record_share, null, open_existing, 0, null);
+    if (file == windows.INVALID_HANDLE_VALUE) {
+        const err = GetLastError();
+        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND: a host creates it.
+        return if (err == 2 or err == 3) null else err;
+    }
+    _ = CloseHandle(file);
+    return null;
 }
 
 /// The record at `path` as it is now, if it is one this version wrote: what
@@ -369,6 +391,30 @@ test "a crash in a widget's turn names it; one outside a turn names no one" {
     endTurn();
     noteWedged(contract.exit_wedged, 0);
     try std.testing.expectEqual(CrashKind.other, storage.crash.kind);
+}
+
+test "a record another program holds open names the error a host would get" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(directory);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ directory, "host.record" });
+    defer std.testing.allocator.free(path);
+    // None yet: a host creates it.
+    try std.testing.expectEqual(@as(?u32, null), openFailure(path));
+    _ = try open(path);
+    close();
+    try std.testing.expectEqual(@as(?u32, null), openFailure(path));
+    // Held with no sharing, as a backup or scanning tool might.
+    var wide: [1024:0]u16 = undefined;
+    const length = try std.unicode.utf8ToUtf16Le(&wide, path);
+    wide[length] = 0;
+    const file = CreateFileW(&wide, 0x8000_0000, 0, null, 3, 0, null);
+    try std.testing.expect(file != windows.INVALID_HANDLE_VALUE);
+    defer _ = CloseHandle(file);
+    try std.testing.expectEqual(@as(?u32, 32), openFailure(path));
+    try std.testing.expectError(error.RecordInUse, open(path));
 }
 
 test "a new start takes the next generation and clears the last crash" {

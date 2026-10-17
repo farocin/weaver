@@ -73,6 +73,10 @@ pub const exit_lifecycle_busy: u32 = 0xE057_0006;
 /// `weaver down` stopped a host that did not exit by itself in time
 /// (host_lifecycle.down_grace_ms).
 pub const exit_stopped_by_down: u32 = 0xE057_0007;
+/// The host could not open its record within `record_open_wait_ms`, and
+/// exited before loading any widget: without the record it could neither
+/// quarantine the widget the last crash blames nor record its own.
+pub const exit_record_unavailable: u32 = 0xE057_0008;
 
 /// How long a starting host waits for the lifecycle lock. The longest
 /// holder is `weaver down`, which waits `down_grace_ms` (4 s) for the host
@@ -89,10 +93,8 @@ pub const predecessor_wait_ms: u32 = 30_000;
 /// use. It stays in use for a moment after a crashed host has exited:
 /// 203-250 ms in seven restarts (2026-10-17, weaver-step5-scratch/gt-*).
 /// 2 s is 8x that, and well inside the 5 s `weaver up` waits for a host. A
-/// host that still cannot open it reads it instead, so it quarantines the
-/// widget it names, but runs without a record of its own: its crashes go
-/// unattributed and it does not ask Windows to restart it, and status says
-/// so (host_lifecycle.hostNote).
+/// host that still cannot open it exits (`exit_record_unavailable`), and
+/// `weaver up` and `weaver status` name the file.
 pub const record_open_wait_ms: u32 = 2_000;
 
 /// The arguments Windows restarts a crashed host with, after the

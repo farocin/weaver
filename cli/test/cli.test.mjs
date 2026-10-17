@@ -238,7 +238,7 @@ test("status shows hosted widgets' costs on the shared host row", () => {
 
 test("status says why no widget host runs, and what to run", () => {
   const now = Date.UTC(2026, 9, 17, 14, 0, 0);
-  const base = { stopped: null, now, recordPath: "C:\\lad\\weaver\\host.record", restartCap: 3, restartWindowMs: 600_000, minRunMs: 60_000, restartWaitMs: 120_000, restartMeasuredMs: 37_000 };
+  const base = { stopped: null, recordHeld: null, now, recordPath: "C:\\lad\\weaver\\host.record", restartCap: 3, restartWindowMs: 600_000, minRunMs: 60_000, restartWaitMs: 120_000, restartMeasuredMs: 37_000 };
   const record = { generation: 4, pid: 70, state: "running", process: "gone", startedAt: now - 300_000, stopReason: "", restart: "registered", restartError: 0, restartLineLength: 60, restartLineLimit: 1024, automaticRestarts: [] };
   const crash = { kind: "widget", cause: "exception", code: 0xC0000005, at: now - 10_000, widget: "Clock" };
   const text = (down) => hostTools.describeHostDown(down).join("\n");
@@ -267,6 +267,12 @@ test("status says why no widget host runs, and what to run", () => {
   const dying = text({ ...base, record: { ...record, process: "alive", crash } });
   assert.match(dying, /crashed at .* in the turn of "Clock"/);
   assert.match(dying, /pid 70\) is still exiting while Windows reports the crash/);
+  // A record another program holds open: no host can start, whatever the record says.
+  const held = text({ ...base, recordHeld: { error: 32, sharing: true }, record: { ...record, crash } });
+  assert.match(held, /cannot open its record at C:\\lad\\weaver\\host\.record \(another program holds it open\)/);
+  assert.match(held, /Close whatever holds that file, then run "weaver up"/);
+  assert.doesNotMatch(held, /crashed/);
+  assert.match(text({ ...base, recordHeld: { error: 5, sharing: false }, record: null }), /Windows answers Win32 error 5/);
   // A refused restart request names the limit, the length and the fix.
   const tooLong = text({ ...base, record: { ...record, restart: "failed", restartError: 0x80070057, restartLineLength: 1028, crash } });
   assert.match(tooLong, /1028 UTF-16 units, past RegisterApplicationRestart's limit of 1024 with its terminator\. Set LOCALAPPDATA to a path at least 5 characters shorter/);

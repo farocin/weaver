@@ -4,10 +4,10 @@
 //! after a crash (main.zig `startDaemon`), and the CLI starts and stops it
 //! through host_lifecycle.zig.
 //!
-//! Control comes up before any widget: `Objects.claim` takes the singleton
-//! and creates the reload and shutdown events in main.zig `startDaemon`,
-//! before the host evaluates a single bundle, so `weaver down`, status and
-//! a fixed install always reach it.
+//! Control comes up before any widget: main.zig `startDaemon` takes the
+//! singleton (`Objects.claim`), opens its crash record, and creates the
+//! control events (`Objects.publish`) before the host evaluates a single
+//! bundle, so `weaver down`, status and a fixed install always reach it.
 //!
 //! Management runs off the UI thread, on a thread of its own (`run`): it
 //! reconciles the registry, decides when each widget runs, starts and
@@ -113,19 +113,27 @@ pub const Objects = struct {
     status_request: win.HANDLE,
     status_written: win.HANDLE,
 
-    /// Create them all, or fail with `error.AlreadyRunning` when another
-    /// host owns the singleton. The singleton is owned, not merely
-    /// created: a CLI probe may hold a handle to it for a moment while no
-    /// host runs, and a crashed host's ownership is abandoned with it.
-    pub fn claim() !Objects {
+    /// Own the singleton, or fail with `error.AlreadyRunning` when another
+    /// host does. Owned, not merely created: a CLI probe may hold a handle
+    /// to it for a moment while no host runs, and a crashed host's
+    /// ownership is abandoned with it.
+    pub fn claim() !win.HANDLE {
         const mutex = win.CreateMutexW(null, 0, contract.singleton_mutex) orelse return error.CreateMutexFailed;
         switch (win.WaitForSingleObject(mutex, 0)) {
-            win.WAIT_OBJECT_0, win.WAIT_ABANDONED => {},
+            win.WAIT_OBJECT_0, win.WAIT_ABANDONED => return mutex,
             else => {
                 _ = win.CloseHandle(mutex);
                 return error.AlreadyRunning;
             },
         }
+    }
+
+    /// Create the control events, once this host, owning `mutex`, can run:
+    /// `weaver up` takes them as a host that has started (host_lifecycle.zig
+    /// `up`), so a host that exits for want of its record never makes them.
+    /// Until then the lifecycle lock keeps `weaver down` and `weaver up`
+    /// waiting.
+    pub fn publish(mutex: win.HANDLE) !Objects {
         return .{
             .mutex = mutex,
             .shutdown = win.CreateEventW(null, 1, 0, contract.shutdown_event) orelse return error.CreateEventFailed,
@@ -154,8 +162,8 @@ pub const Options = struct {
     /// The previous host's record, read before this one opened its own.
     previous: ?contract.Record,
     /// What status's host row says about how this host runs: a restart by
-    /// Windows, no record of its own, a refused restart request
-    /// (host_lifecycle.hostNote). Empty when there is nothing to say.
+    /// Windows, a refused restart request (host_lifecycle.hostNote). Empty
+    /// when there is nothing to say.
     host_note: []const u8,
 };
 

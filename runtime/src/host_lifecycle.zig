@@ -268,13 +268,17 @@ pub fn waitForExit(record: contract.Record, timeout_ms: u32) bool {
     };
 }
 
-/// The running host's process, if its record names it. A record that
-/// names a process that has exited is not the running host's (a host that
-/// could not open its record runs while the record still names the crashed
-/// one): an exited process can still be opened while anything holds a
-/// handle to it, and its creation time still matches.
+/// The running host's process, if its record names it.
 fn hostProcess(paths: Paths, access: win.DWORD) ?win.HANDLE {
-    const record = crash_record.read(paths.record) orelse return null;
+    return openLive(crash_record.read(paths.record) orelse return null, access);
+}
+
+/// The process `record` names, opened with `access`, if it still runs. One
+/// that has exited is not the running host, though it can still be opened
+/// while anything holds a handle to it, and its creation time still
+/// matches: the crashed host a record names in the moment after Windows
+/// restarted the next one, before that one opens the record.
+fn openLive(record: contract.Record, access: win.DWORD) ?win.HANDLE {
     return switch (openRecorded(record, access | win.SYNCHRONIZE)) {
         .open => |process| if (win.WaitForSingleObject(process, 0) == win.WAIT_OBJECT_0) gone: {
             _ = win.CloseHandle(process);
@@ -335,11 +339,24 @@ fn up(paths: Paths) !Exit {
             return switch (code) {
                 contract.exit_stopped => fail("the widget host exited as it started: 'weaver down' ran meanwhile", .{}),
                 contract.exit_already_running => .already_running,
+                contract.exit_record_unavailable => recordUnavailable(paths),
                 else => fail("the widget host exited as it started, with code 0x{X:0>8}; 'weaver status' says what its record holds", .{code}),
             };
         }
     }
     return .timed_out;
+}
+
+/// A host exited for want of its record (main.zig `openRecord`): name the
+/// file and what Windows answers for it now.
+fn recordUnavailable(paths: Paths) Exit {
+    const err = crash_record.openFailure(paths.record) orelse
+        return fail("the widget host could not open its record at {s} within record_open_wait_ms={d}, and exited; nothing holds it now, so run 'weaver up' again", .{ paths.record, contract.record_open_wait_ms });
+    return fail("the widget host could not open its record at {s} (Win32 error {d}{s}), and exited: without it, it cannot quarantine the widget a crash blames. Close whatever holds that file, then run 'weaver up'", .{ paths.record, err, sharingWords(err) });
+}
+
+fn sharingWords(win32_error: u32) []const u8 {
+    return if (win32_error == win.ERROR_SHARING_VIOLATION) ": another program holds it open" else "";
 }
 
 /// `"<this executable>" --host`, with this process's environment.
@@ -400,7 +417,9 @@ fn status(io: std.Io, allocator: std.mem.Allocator, paths: Paths) !Exit {
     // A host whose record holds a crash is dying: it keeps the singleton
     // while Windows reports the crash, seconds after its last status.
     if (!hostRunning() or hostCrashed(paths)) return printDown(io, allocator, paths);
-    if (!controlReady()) return .legacy;
+    // A host that exits before publishing control (main.zig `openRecord`)
+    // is down, not one that predates control.
+    if (!controlReady()) return if (hostRunning()) .legacy else printDown(io, allocator, paths);
     const access = win.SYNCHRONIZE | win.EVENT_MODIFY_STATE;
     const written = win.OpenEventW(access, 0, contract.status_written_event) orelse return printDown(io, allocator, paths);
     defer _ = win.CloseHandle(written);
@@ -526,19 +545,23 @@ pub fn note(comptime format: []const u8, args: anytype) void {
     std.debug.print(format, args);
 }
 
-/// host.log past the cap: copy it to host.log.old, then empty it through a
-/// second handle. The host's own handle appends, so it writes on at the new
-/// end of the file.
 fn rotateIfFull() void {
-    const file = log_file orelse return;
+    rotate(log_file orelse return, log_path[0..log_path_len], host_log_max_bytes);
+}
+
+/// The log at `path`, open as `file`, past `max_bytes`: copy it to
+/// `<path>.old`, then empty it through a second handle. `file` appends, so
+/// it writes on at the new end of the file. While the copy fails (something
+/// holds the archive open) the log is kept whole, and the next note tries
+/// again.
+fn rotate(file: win.HANDLE, path: []const u8, max_bytes: u64) void {
     var size: win.LARGE_INTEGER = std.mem.zeroes(win.LARGE_INTEGER);
-    if (win.GetFileSizeEx(file, &size) == 0 or @as(u64, @intCast(size.QuadPart)) <= host_log_max_bytes) return;
-    const path = log_path[0..log_path_len];
+    if (win.GetFileSizeEx(file, &size) == 0 or @as(u64, @intCast(size.QuadPart)) <= max_bytes) return;
     var wide: WidePath = .{};
     var old_buffer: [1024]u8 = undefined;
     const old = std.fmt.bufPrint(&old_buffer, "{s}.old", .{path}) catch return;
     var old_wide: WidePath = .{};
-    _ = win.CopyFileW(wide.of(path) catch return, old_wide.of(old) catch return, 0);
+    if (win.CopyFileW(wide.of(path) catch return, old_wide.of(old) catch return, 0) == 0) return;
     const truncate = win.CreateFileW(wide.of(path) catch return, win.GENERIC_WRITE, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
     if (truncate == win.INVALID_HANDLE_VALUE) return;
     defer _ = win.CloseHandle(truncate);
@@ -577,38 +600,39 @@ const e_invalidarg: u32 = 0x8007_0057;
 /// start's record holds; unless the cap says not to (`plan.register`).
 pub fn registerRestart(plan: contract.RestartPlan, generation: u64, local_app_data: []const u8) Registration {
     if (!plan.register) return .{ .request = .capped };
+    var line: RestartLine = undefined;
+    const length = restartLine(&line, generation, local_app_data) catch return .{ .request = .failed, .hresult = e_invalidarg };
+    if (length >= line.len) return .{ .request = .failed, .hresult = e_invalidarg, .line_len = length };
+    const result = RegisterApplicationRestart(&line, contract.restart_flags);
+    if (result == 0) return .{ .request = .registered, .line_len = length };
+    return .{ .request = .failed, .hresult = @bitCast(result), .line_len = length };
+}
+
+const RestartLine = [contract.restart_max_command_line:0]u16;
+
+/// The restart command line in `line`, and its length in UTF-16 units. A
+/// length of `line.len` or more did not fit, and left `line` unwritten.
+fn restartLine(line: *RestartLine, generation: u64, local_app_data: []const u8) !u32 {
     // A trailing backslash would escape the closing quote. The path is not
     // escaped otherwise: Windows refuses `"` in file and directory names.
     const profile = std.mem.trimEnd(u8, local_app_data, "\\");
     var head_buffer: [64]u8 = undefined;
     const head = std.fmt.bufPrint(&head_buffer, "--host {s} {d} {s} \"", .{ contract.restart_of_flag, generation, contract.local_app_data_flag }) catch unreachable;
-    const profile_len = std.unicode.calcUtf16LeLen(profile) catch return .{ .request = .failed, .hresult = e_invalidarg };
-    const length = head.len + profile_len + 1;
-    const failed: Registration = .{ .request = .failed, .hresult = e_invalidarg, .line_len = @intCast(length) };
-    var line: [contract.restart_max_command_line:0]u16 = undefined;
-    if (length >= line.len) return failed;
-    var at = std.unicode.utf8ToUtf16Le(&line, head) catch unreachable;
-    at += std.unicode.utf8ToUtf16Le(line[at..], profile) catch return failed;
+    const length: u32 = @intCast(head.len + try std.unicode.calcUtf16LeLen(profile) + 1);
+    if (length >= line.len) return length;
+    var at = std.unicode.utf8ToUtf16Le(line, head) catch unreachable;
+    at += std.unicode.utf8ToUtf16Le(line[at..], profile) catch unreachable;
     line[at] = '"';
     line[length] = 0;
-    const result = RegisterApplicationRestart(&line, contract.restart_flags);
-    if (result == 0) return .{ .request = .registered, .line_len = @intCast(length) };
-    return .{ .request = .failed, .hresult = @bitCast(result), .line_len = @intCast(length) };
+    return length;
 }
-
-/// Why a starting host has no record of its own (main.zig `openRecord`).
-pub const RecordFailure = struct {
-    path: []const u8,
-    err: anyerror,
-    win32_error: u32,
-};
 
 /// What status's host row says about how this host runs, empty when there
 /// is nothing to say: the crash Windows restarted it from and which restart
-/// that is against the cap; that it runs without its record; and that
-/// Windows was refused its restart request. The last two mean a crash would
-/// leave Weaver down, so they also print on `weaver up` (cli/src/index.ts).
-pub fn hostNote(allocator: std.mem.Allocator, previous: ?contract.Record, restarted: bool, plan: contract.RestartPlan, registration: Registration, record_failure: ?RecordFailure) ![]const u8 {
+/// that is against the cap, and that Windows refused its restart request.
+/// The last means a crash would leave Weaver down, so it also prints on
+/// `weaver up` (cli/src/index.ts).
+pub fn hostNote(allocator: std.mem.Allocator, previous: ?contract.Record, restarted: bool, plan: contract.RestartPlan, registration: Registration) ![]const u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     const writer = &output.writer;
     if (restarted) {
@@ -621,10 +645,6 @@ pub fn hostNote(allocator: std.mem.Allocator, previous: ?contract.Record, restar
         }
         try writer.print("; automatic restart {d} of restart_cap={d} within {d} minutes", .{ plan.count, contract.restart_cap, contract.restart_window_ms / 60_000 });
         if (registration.request == .capped) try writer.writeAll("; that is the cap, so if this host crashes it stays down until 'weaver up'");
-    }
-    if (record_failure) |failure| {
-        if (output.written().len > 0) try writer.writeAll("; ");
-        try writer.print("this host could not open its record at {s} ({s}, Win32 error {d}) within record_open_wait_ms={d}, so it runs without one: it read the last host's record to quarantine any widget that crashed it, but its own crashes go unattributed and Windows will not restart it. Close whatever holds that file open, then run 'weaver down' and 'weaver up'", .{ failure.path, @errorName(failure.err), failure.win32_error, contract.record_open_wait_ms });
     }
     if (registration.request == .failed) {
         if (output.written().len > 0) try writer.writeAll("; ");
@@ -667,8 +687,17 @@ pub fn describeDown(io: std.Io, allocator: std.mem.Allocator, paths: Paths, writ
     if (markerTime(paths)) |time| try writer.print("{{\"at\":{d}}}", .{unixMs(time)}) else try writer.writeAll("null");
     try writer.print(",\"now\":{d},\"recordPath\":{f}", .{ unixMs(nowFileTime()), std.json.fmt(paths.record, .{}) });
     // The numbers the CLI words the restart with, from their one definition.
-    try writer.print(",\"restartCap\":{d},\"restartWindowMs\":{d},\"minRunMs\":{d},\"restartWaitMs\":{d},\"restartMeasuredMs\":{d},\"record\":", .{ contract.restart_cap, contract.restart_window_ms, contract.os_restart_min_run_ms, contract.os_restart_wait_ms, contract.os_restart_measured_max_ms });
-    const record = crash_record.read(paths.record) orelse {
+    try writer.print(",\"restartCap\":{d},\"restartWindowMs\":{d},\"minRunMs\":{d},\"restartWaitMs\":{d},\"restartMeasuredMs\":{d}", .{ contract.restart_cap, contract.restart_window_ms, contract.os_restart_min_run_ms, contract.os_restart_wait_ms, contract.os_restart_measured_max_ms });
+    const last = crash_record.read(paths.record);
+    // A record no live host holds that a host still could not open: the
+    // next host would exit for it (main.zig `openRecord`).
+    const live = if (last) |found| liveness(found) == .alive else false;
+    try writer.writeAll(",\"recordHeld\":");
+    if (if (live) null else crash_record.openFailure(paths.record)) |err| {
+        try writer.print("{{\"error\":{d},\"sharing\":{}}}", .{ err, err == win.ERROR_SHARING_VIOLATION });
+    } else try writer.writeAll("null");
+    try writer.writeAll(",\"record\":");
+    const record = last orelse {
         try writer.writeAll("null}\n");
         return;
     };
@@ -765,19 +794,121 @@ test "FILETIMEs read as Unix milliseconds" {
     try std.testing.expectEqual(@as(i64, 1_000), unixMs(116_444_736_010_000_000));
 }
 
-test "the host note names a restart request Windows refused, and a host without its record" {
+test "the host note names a restart request Windows refused" {
     const allocator = std.testing.allocator;
     const plan: contract.RestartPlan = .{};
     // Nothing to say about a fresh host Windows accepted.
-    const quiet = try hostNote(allocator, null, false, plan, .{ .request = .registered, .line_len = 60 }, null);
+    const quiet = try hostNote(allocator, null, false, plan, .{ .request = .registered, .line_len = 60 });
     defer allocator.free(quiet);
     try std.testing.expectEqualStrings("", quiet);
-    const long = try hostNote(allocator, null, false, plan, .{ .request = .failed, .hresult = e_invalidarg, .line_len = 1028 }, null);
+    const long = try hostNote(allocator, null, false, plan, .{ .request = .failed, .hresult = e_invalidarg, .line_len = 1028 });
     defer allocator.free(long);
     try std.testing.expect(std.mem.indexOf(u8, long, "is 1028 UTF-16 units, past RegisterApplicationRestart's limit of 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, long, "at least 5 characters shorter") != null);
-    const orphan = try hostNote(allocator, null, false, plan, .{ .request = .none }, .{ .path = "C:/x/host.record", .err = error.RecordInUse, .win32_error = 32 });
-    defer allocator.free(orphan);
-    try std.testing.expect(std.mem.indexOf(u8, orphan, "could not open its record at C:/x/host.record (RecordInUse, Win32 error 32)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, orphan, "Windows will not restart it") != null);
+}
+
+test "the restart command line counts UTF-16 units, and the shortening status asks for fits" {
+    var line: RestartLine = undefined;
+    const short = try restartLine(&line, 7, "C:\\Users\\Zoë\\AppData\\Local\\");
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("--host --restart-of 7 --localappdata \"C:\\Users\\Zoë\\AppData\\Local\"");
+    try std.testing.expectEqualSlices(u16, expected, line[0..short]);
+    try std.testing.expectEqual(@as(u16, 0), line[short]);
+    // A profile path past the limit, with a character outside the BMP (two
+    // UTF-16 units, four UTF-8 bytes).
+    const allocator = std.testing.allocator;
+    const head_len = "--host --restart-of 7 --localappdata \"".len;
+    const long_profile = try allocator.alloc(u8, 1028 - head_len - 1 - 2 + 4);
+    defer allocator.free(long_profile);
+    @memset(long_profile, 'a');
+    @memcpy(long_profile[0..4], "😀");
+    const long = try restartLine(&line, 7, long_profile);
+    try std.testing.expectEqual(@as(u32, 1028), long);
+    // hostNote's advice: this many characters shorter.
+    const shorter = long - contract.restart_max_command_line + 1;
+    try std.testing.expect(try restartLine(&line, 7, long_profile[0 .. long_profile.len - shorter]) < line.len);
+    try std.testing.expect(try restartLine(&line, 7, long_profile[0 .. long_profile.len - shorter + 1]) >= line.len);
+}
+
+test "a full host.log moves to host.log.old, and stays whole while the archive cannot be written" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(directory);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ directory, "host.log" });
+    defer std.testing.allocator.free(path);
+    const old = try std.fmt.allocPrint(std.testing.allocator, "{s}.old", .{path});
+    defer std.testing.allocator.free(old);
+    var wide: WidePath = .{};
+    const file = win.CreateFileW(try wide.of(path), win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    try std.testing.expect(file != win.INVALID_HANDLE_VALUE);
+    defer _ = win.CloseHandle(file);
+    const line = "a line of the host's log, 40 bytes long\n";
+    const append = struct {
+        fn lines(handle: win.HANDLE, count: usize) !void {
+            for (0..count) |_| {
+                var written: win.DWORD = 0;
+                if (win.WriteFile(handle, line, line.len, &written, null) == 0) return error.WriteFailed;
+            }
+        }
+    }.lines;
+    const sizeOf = struct {
+        fn of(file_path: []const u8) !u64 {
+            var name: WidePath = .{};
+            var data: win.WIN32_FILE_ATTRIBUTE_DATA = undefined;
+            if (win.GetFileAttributesExW(try name.of(file_path), win.GetFileExInfoStandard, &data) == 0) return error.NoFile;
+            return (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+        }
+    }.of;
+    // Under the cap: untouched.
+    try append(file, 2);
+    rotate(file, path, 100);
+    try std.testing.expectEqual(@as(u64, 80), try sizeOf(path));
+    // Past it: archived whole, then emptied; the append handle writes on
+    // from the start.
+    try append(file, 1);
+    rotate(file, path, 100);
+    try std.testing.expectEqual(@as(u64, 120), try sizeOf(old));
+    try std.testing.expectEqual(@as(u64, 0), try sizeOf(path));
+    try append(file, 1);
+    try std.testing.expectEqual(@as(u64, 40), try sizeOf(path));
+    // The archive held open against writers: the log keeps every line.
+    var old_wide: WidePath = .{};
+    const holder = win.CreateFileW(try old_wide.of(old), win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    try std.testing.expect(holder != win.INVALID_HANDLE_VALUE);
+    try append(file, 2);
+    rotate(file, path, 100);
+    try std.testing.expectEqual(@as(u64, 120), try sizeOf(path));
+    try std.testing.expectEqual(@as(u64, 120), try sizeOf(old));
+    // Released: the next note's rotation archives it.
+    _ = win.CloseHandle(holder);
+    rotate(file, path, 100);
+    try std.testing.expectEqual(@as(u64, 120), try sizeOf(old));
+    try std.testing.expectEqual(@as(u64, 0), try sizeOf(path));
+}
+
+test "a recorded process that has exited is not the running host" {
+    // A suspended copy of this test binary: it never runs.
+    var exe: [32768:0]u16 = undefined;
+    const length = win.GetModuleFileNameW(null, &exe, exe.len);
+    try std.testing.expect(length > 0 and length < exe.len);
+    exe[length] = 0;
+    var startup = std.mem.zeroes(win.STARTUPINFOW);
+    startup.cb = @sizeOf(win.STARTUPINFOW);
+    var info = std.mem.zeroes(win.PROCESS_INFORMATION);
+    try std.testing.expect(win.CreateProcessW(&exe, null, null, null, 0, win.CREATE_SUSPENDED, null, null, &startup, &info) != 0);
+    _ = win.CloseHandle(info.hThread);
+    // This handle keeps the process openable after it exits.
+    defer _ = win.CloseHandle(info.hProcess);
+    var created: win.FILETIME = undefined;
+    var unused: win.FILETIME = undefined;
+    try std.testing.expect(win.GetProcessTimes(info.hProcess, &created, &unused, &unused, &unused) != 0);
+    var record = std.mem.zeroes(contract.Record);
+    record.pid = info.dwProcessId;
+    record.start_time = fileTime(created);
+    const alive = openLive(record, win.SYNCHRONIZE) orelse return error.NotOpened;
+    _ = win.CloseHandle(alive);
+    _ = win.TerminateProcess(info.hProcess, 1);
+    try std.testing.expect(win.WaitForSingleObject(info.hProcess, 5_000) == win.WAIT_OBJECT_0);
+    try std.testing.expect(openLive(record, win.SYNCHRONIZE) == null);
+    try std.testing.expectEqual(Liveness.gone, liveness(record));
 }

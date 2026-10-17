@@ -2130,15 +2130,20 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
     // since then consumed that crash's record, and runs or ran after it.
     if (restart_of) |crashed| {
         const current = crash_record.read(paths.record);
+        if (current == null) if (crash_record.openFailure(paths.record)) |err| {
+            std.debug.print("weaver-widget --host: restarted for generation {d}, but could not read the record at {s} (Win32 error {d}); without it this host cannot quarantine the widget the crash blames, so it exits. Close whatever holds the file open, then run 'weaver up'\n", .{ crashed, paths.record, err });
+            lock.release();
+            daemon_mod.exitProcess(host_contract.exit_record_unavailable);
+        };
         if (current == null or current.?.generation != crashed) {
             std.debug.print("weaver-widget --host: restarted for generation {d}, but the record now holds {?d}: a newer host started since; this host exits\n", .{ crashed, if (current) |record| record.generation else null });
             lock.release();
             daemon_mod.exitProcess(host_contract.exit_superseded);
         }
     }
-    // Control comes up first, before any widget loads: a second host
+    // The singleton comes first, before any widget loads: a second host
     // leaves at once.
-    const objects = daemon_mod.Objects.claim() catch |err| switch (err) {
+    const singleton = daemon_mod.Objects.claim() catch |err| switch (err) {
         error.AlreadyRunning => {
             std.debug.print("weaver-widget --host: another widget host is already running for this user; this one exits\n", .{});
             lock.release();
@@ -2149,8 +2154,12 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
     std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
     // From here on, a crash is recorded. Opening the record consumes the
     // previous host's: this start takes the next generation.
-    var record_failure: ?host_lifecycle.RecordFailure = null;
-    const previous = openRecord(paths.record, &record_failure);
+    const previous = openRecord(paths.record) catch {
+        lock.release();
+        daemon_mod.exitProcess(host_contract.exit_record_unavailable);
+    };
+    // This host runs: control comes up, still before any widget loads.
+    const objects = try daemon_mod.Objects.publish(singleton);
     var now: u64 = 0;
     GetSystemTimeAsFileTime(&now);
     const plan = host_contract.RestartPlan.of(previous, restart_of != null, now);
@@ -2188,18 +2197,17 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
         .devs = devs,
         .post = postControl,
         .previous = previous,
-        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration, record_failure),
+        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration),
     }, objects);
 }
 
 /// Open the host's record (crash_record.open), retrying while it is in use
 /// for up to `record_open_wait_ms`: it stays in use for a moment after a
-/// crashed host has exited. A host that still cannot open it reads it
-/// instead, so the previous host's record still names the widget to
-/// quarantine, and runs without a record of its own (`failure`, which
-/// status shows): a host that ran a widget its record blames would crash
-/// again on it.
-fn openRecord(path: []const u8, failure: *?host_lifecycle.RecordFailure) ?host_contract.Record {
+/// crashed host has exited. A host that still cannot open it must not run:
+/// it could not quarantine the widget the last crash blames, and would run
+/// it again. `weaver up` and `weaver status` name the file and the error
+/// (host_lifecycle.zig `recordUnavailable`, `describeDown`).
+fn openRecord(path: []const u8) !?host_contract.Record {
     const began = GetTickCount64();
     var attempts: u32 = 0;
     while (true) {
@@ -2210,10 +2218,8 @@ fn openRecord(path: []const u8, failure: *?host_lifecycle.RecordFailure) ?host_c
                 Sleep(50);
                 continue;
             }
-            failure.* = .{ .path = path, .err = err, .win32_error = crash_record.open_error };
-            const read = crash_record.read(path);
-            std.debug.print("weaver-widget --host: could not open the record at {s}: {s} (Win32 error {d}, {d} attempts over {d} ms); {s}; this host's crashes go unattributed and Windows is not asked to restart it\n", .{ path, @errorName(err), crash_record.open_error, attempts, waited, if (read != null) "read it to quarantine the widget it names" else "could not read it either" });
-            return read;
+            std.debug.print("weaver-widget --host: could not open the record at {s}: {s} (Win32 error {d}, {d} attempts over {d} ms); without it this host cannot quarantine the widget the last crash blames, so it exits. Close whatever holds the file open, then run 'weaver up'\n", .{ path, @errorName(err), crash_record.open_error, attempts, waited });
+            return err;
         };
         if (attempts > 1) std.debug.print("weaver-widget --host: the record opened after {d} attempts over {d} ms\n", .{ attempts, GetTickCount64() - began });
         return previous;

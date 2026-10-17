@@ -1891,8 +1891,8 @@ function showStatus(json: boolean): void {
 
 /**
  * After `weaver up` starts a host: anything its status row says about how it
- * runs (no record of its own, Windows refusing its restart request, an
- * unreadable registry) means a crash would leave Weaver down. Say so now.
+ * runs (Windows refusing its restart request, an unreadable registry) means
+ * a crash would leave Weaver down. Say so now.
  */
 function warnHostNote(): void {
   if (hostClient("--status").status !== HostClientExit.ok) return;
