@@ -20,6 +20,19 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   `JS_ExecutePendingJob` scan contexts in creation order. A context marks
   its queued jobs for the collector and frees them with itself, so a
   dropped context's jobs never outlive it.
+- `JS_SwapGlobals(ctx, &global, &lexical)` (`quickjs.h`): exchanges the
+  context's global object and global lexical scope (top-level `let`,
+  `const`, `class`) with the caller's pair. QuickJS reads both from the
+  context each time a global name is looked up, declared or assigned, so a
+  program whose pair is in the context sees its own globals, and the shared
+  realm's built-ins through its global object's prototype. Used by
+  Weaver's shared realm: each widget's turn swaps its pair in.
+- `JS_SetJobTagFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` tags each job
+  with `func(ctx)`. `JS_ExecuteTaggedJob(ctx, tag)`,
+  `JS_IsTaggedJobPending(ctx, tag)` and `JS_FreeTaggedJobs(ctx, tag)` run,
+  check and drop only one tag's jobs, so widgets sharing one context (the
+  shared realm) each run, and are charged for, only the jobs they queued,
+  and a widget's queued jobs go with it.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
   around allocating a job, so a garbage collection in one widget's turn
   charges another widget's queued cleanup job to that widget's heap.

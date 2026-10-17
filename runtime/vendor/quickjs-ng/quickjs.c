@@ -287,6 +287,8 @@ struct JSRuntime {
     struct list_head context_list; /* list of JSContext.link */
     /* Weaver: charges a job's allocation to its context (JS_SetChargeJobFunc). */
     JSChargeJobFunc *charge_job;
+    /* Weaver: tags each job with who queued it (JS_SetJobTagFunc). */
+    JSJobTagFunc *job_tag;
     /* Weaver: charges runtime-wide tables to no context (JS_SetChargeSharedFunc). */
     JSChargeSharedFunc *charge_shared;
     /* Weaver: a per-context collection trigger (JS_SetGCTriggerFunc). */
@@ -1000,6 +1002,8 @@ struct JSModuleDef {
 typedef struct JSJobEntry {
     struct list_head link;
     JSContext *ctx;
+    /* Weaver: who queued it (JS_SetJobTagFunc); 0 without a tag function. */
+    uintptr_t tag;
     JSJobFunc *job_func;
     int argc;
     JSValue argv[];
@@ -2171,6 +2175,7 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
         }
     }
     e->ctx = ctx;
+    e->tag = rt->job_tag ? rt->job_tag(ctx) : 0;
     e->job_func = job_func;
     e->argc = argc;
     for(i = 0; i < argc; i++) {
@@ -2184,6 +2189,32 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func)
 {
     rt->charge_job = func;
+}
+
+/* Weaver: exchange the context's global object and global lexical scope
+   with '*global' and '*lexical'; each reference moves to the other side.
+   Several programs can then share one realm's built-ins, each running
+   with globals of its own while its pair is in the context. The last
+   error's backtrace is the outgoing program's: it goes, so it is neither
+   kept in that program's memory nor seen by the next. */
+void JS_SwapGlobals(JSContext *ctx, JSValue *global, JSValue *lexical)
+{
+    JSValue held;
+
+    JS_FreeValue(ctx, ctx->error_back_trace);
+    ctx->error_back_trace = JS_UNDEFINED;
+
+    held = ctx->global_obj;
+    ctx->global_obj = *global;
+    *global = held;
+    held = ctx->global_var_obj;
+    ctx->global_var_obj = *lexical;
+    *lexical = held;
+}
+
+void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func)
+{
+    rt->job_tag = func;
 }
 
 void JS_SetChargeSharedFunc(JSRuntime *rt, JSChargeSharedFunc *func)
@@ -2266,6 +2297,65 @@ int JS_ExecuteContextJob(JSContext *ctx)
     JS_FreeValue(ctx, res);
     js_free(ctx, e);
     return ret;
+}
+
+/* Weaver: the first pending job of 'ctx' tagged 'tag', or NULL. */
+static JSJobEntry *js_first_tagged_job(JSContext *ctx, uintptr_t tag)
+{
+    struct list_head *el;
+
+    list_for_each(el, &ctx->job_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        if (e->tag == tag)
+            return e;
+    }
+    return NULL;
+}
+
+bool JS_IsTaggedJobPending(JSContext *ctx, uintptr_t tag)
+{
+    return js_first_tagged_job(ctx, tag) != NULL;
+}
+
+/* Weaver: run the first pending job of 'ctx' tagged 'tag', leaving every
+   other tag's jobs queued: several programs sharing one context each run
+   only their own. Return < 0 if exception, 0 if none is pending, 1 if a
+   job was executed successfully. */
+int JS_ExecuteTaggedJob(JSContext *ctx, uintptr_t tag)
+{
+    JSJobEntry *e;
+    JSValue res;
+    int i, ret;
+
+    e = js_first_tagged_job(ctx, tag);
+    if (!e)
+        return 0;
+    list_del(&e->link);
+    res = e->job_func(e->ctx, e->argc, vc(e->argv));
+    for(i = 0; i < e->argc; i++)
+        JS_FreeValue(ctx, e->argv[i]);
+    if (JS_IsException(res))
+        ret = -1;
+    else
+        ret = 1;
+    JS_FreeValue(ctx, res);
+    js_free(ctx, e);
+    return ret;
+}
+
+/* Weaver: free the pending jobs of 'ctx' tagged 'tag' without running them.
+   Freeing their arguments can queue more with the same tag; those go too. */
+void JS_FreeTaggedJobs(JSContext *ctx, uintptr_t tag)
+{
+    JSJobEntry *e;
+    int i;
+
+    while ((e = js_first_tagged_job(ctx, tag)) != NULL) {
+        list_del(&e->link);
+        for(i = 0; i < e->argc; i++)
+            JS_FreeValue(ctx, e->argv[i]);
+        js_free(ctx, e);
+    }
 }
 
 /* return < 0 if exception, 0 if no job pending, 1 if a job was

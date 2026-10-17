@@ -1205,6 +1205,14 @@ JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 /* Weaver additions: each context queues its own jobs; see VENDOR.md. */
 JS_EXTERN bool JS_IsContextJobPending(JSContext *ctx);
 JS_EXTERN int JS_ExecuteContextJob(JSContext *ctx);
+/* Weaver: per-program globals in one shared realm (see VENDOR.md). */
+JS_EXTERN void JS_SwapGlobals(JSContext *ctx, JSValue *global, JSValue *lexical);
+/* Weaver: jobs tagged by who queued them (see VENDOR.md). */
+typedef uintptr_t JSJobTagFunc(JSContext *ctx);
+JS_EXTERN void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func);
+JS_EXTERN bool JS_IsTaggedJobPending(JSContext *ctx, uintptr_t tag);
+JS_EXTERN int JS_ExecuteTaggedJob(JSContext *ctx, uintptr_t tag);
+JS_EXTERN void JS_FreeTaggedJobs(JSContext *ctx, uintptr_t tag);
 /* Called with a job's context before QuickJS allocates the job. An
    embedder that charges memory per context and had to switch to the job's
    context returns non-NULL; QuickJS then calls it again with NULL and that

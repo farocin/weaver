@@ -26,15 +26,7 @@ pub const State = struct {
     fetches: [max_fetches]FetchSlot = [_]FetchSlot{.{}} ** max_fetches,
     render_failed: bool = false,
     emit_error_logs: bool = true,
-    /// Shared realm: the widget's own global scope, an object whose
-    /// prototype is the shared, frozen global. Null in a realm of its own.
-    scope: ?c.JSValue = null,
 };
-
-/// Shared realm: every widget shares one context, so a bridge call cannot
-/// find its widget through the context; it belongs to the widget whose turn
-/// is running.
-pub var current: ?*State = null;
 
 // Timer receipt (2026-07-29): executing every shipped widget measured one
 // simultaneously active interval. Sixteen leaves 16x headroom for clocks,
@@ -93,10 +85,8 @@ pub const FetchSlot = struct {
 /// Install the complete M0 capability surface. QuickJS's libc helpers are not
 /// linked, so this explicit object is also the widget sandbox boundary.
 pub fn install(ctx: *c.JSContext, bridge_state: *State) !void {
-    const global = if (bridge_state.scope) |scope| c.JS_DupValue(ctx, scope) else global: {
-        c.JS_SetContextOpaque(ctx, bridge_state);
-        break :global c.JS_GetGlobalObject(ctx);
-    };
+    c.JS_SetContextOpaque(ctx, bridge_state);
+    const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
     const native = c.JS_NewObject(ctx);
     if (c.JS_IsException(native)) return error.QuickJs;
@@ -184,20 +174,7 @@ fn setImmutableBoolean(ctx: *c.JSContext, object: c.JSValue, name: [*:0]const u8
 }
 
 fn state(ctx: *c.JSContext) *State {
-    if (current) |bridge_state| return bridge_state;
     return @ptrCast(@alignCast(c.JS_GetContextOpaque(ctx).?));
-}
-
-/// Shared realm: call a widget's scope wrapper (`Engine.evaluate` compiles
-/// its bundle as `(function (globalThis, native, console) { ... })`) with
-/// the widget's own bindings.
-pub fn callInScope(ctx: *c.JSContext, scope: c.JSValue, function: c.JSValue) c.JSValue {
-    const native = c.JS_GetPropertyStr(ctx, scope, "native");
-    defer c.JS_FreeValue(ctx, native);
-    const console = c.JS_GetPropertyStr(ctx, scope, "console");
-    defer c.JS_FreeValue(ctx, console);
-    var arguments = [_]c.JSValue{ scope, native, console };
-    return c.JS_Call(ctx, function, scope, arguments.len, &arguments);
 }
 
 fn fail(ctx: *c.JSContext, message: [*:0]const u8) c.JSValue {
