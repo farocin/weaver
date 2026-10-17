@@ -2152,6 +2152,7 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
                           int argc, JSValueConst *argv,
                           bool tagged, uintptr_t tag);
+static double js__now_ms(void);
 
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                   int argc, JSValueConst *argv)
@@ -2173,15 +2174,17 @@ static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
     assert(!rt->in_free);
 
     /* Weaver: a collection in one context can queue another context's
-       job; the embedder charges the entry to the job's context, and says
-       so by returning non-NULL. When that context is full the job is
+       job; the embedder charges the entry to the job's context, or to the
+       program its tag names, and says so by returning non-NULL. When that context is full the job is
        dropped without throwing: the running context's pending exception
        is not this job's to replace. */
+    if (!tagged)
+        tag = rt->job_tag ? rt->job_tag(ctx) : 0;
     {
-        void *restore = rt->charge_job ? rt->charge_job(ctx, NULL) : NULL;
+        void *restore = rt->charge_job ? rt->charge_job(ctx, tag, NULL) : NULL;
         e = js_malloc_rt(rt, sizeof(*e) + argc * sizeof(JSValue));
         if (restore)
-            rt->charge_job(NULL, restore);
+            rt->charge_job(NULL, 0, restore);
         if (!e) {
             if (!restore)
                 JS_ThrowOutOfMemory(ctx);
@@ -2189,7 +2192,7 @@ static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
         }
     }
     e->ctx = ctx;
-    e->tag = tagged ? tag : (rt->job_tag ? rt->job_tag(ctx) : 0);
+    e->tag = tag;
     e->job_func = job_func;
     e->argc = argc;
     for(i = 0; i < argc; i++) {
@@ -2208,14 +2211,15 @@ void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func)
 /* Weaver: exchange the context's per-program state with '*state'; each
    reference moves to the other side. Several programs can then share one
    realm's built-ins, each running with globals, Error stack settings
-   (prepareStackTrace, stackTraceLimit) and Math.random state of its own
-   while its state is in the context. The last error's backtrace is the
+   (prepareStackTrace, stackTraceLimit), Math.random state and performance
+   time origin of its own while its state is in the context. The last error's backtrace is the
    outgoing program's: it goes, so it is neither kept in that program's
    memory nor seen by the next. */
 void JS_SwapProgramState(JSContext *ctx, JSProgramState *state)
 {
     JSValue held;
     uint64_t random_state;
+    double time_origin;
 
     JS_FreeValue(ctx, ctx->error_back_trace);
     ctx->error_back_trace = JS_UNDEFINED;
@@ -2235,13 +2239,49 @@ void JS_SwapProgramState(JSContext *ctx, JSProgramState *state)
     random_state = ctx->random_state;
     ctx->random_state = state->random_state;
     state->random_state = random_state;
+    time_origin = ctx->time_origin;
+    ctx->time_origin = state->time_origin;
+    state->time_origin = time_origin;
 }
 
-/* Weaver: how many classes the runtime has registered, for walking every
-   class prototype (JS_GetClassProto). */
-uint32_t JS_GetRuntimeClassCount(JSRuntime *rt)
+/* Weaver: a new program's state as a new realm would start it: no stack
+   formatter, a stack trace limit of 10, and performance time from now.
+   The caller sets the global object, lexical scope and random seed. */
+void JS_InitProgramState(JSContext *ctx, JSProgramState *state)
 {
-    return rt->class_count;
+    state->prepare_stack = JS_UNDEFINED;
+    state->stack_trace_limit = js_int32(10);
+    state->time_origin = js__now_ms();
+}
+
+/* Weaver: an array of every object alive in the runtime, the array
+   itself aside. Run before any program has made an object, it lists the
+   realm's built-ins, those only built-in closures reach among them, for
+   freezing the realm whole. */
+JSValue JS_GetLiveObjects(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el;
+    JSGCObjectHeader *gp;
+    JSValue all, obj;
+    JSObject *self;
+    uint32_t count = 0;
+
+    all = JS_NewArray(ctx);
+    if (JS_IsException(all))
+        return all;
+    self = JS_VALUE_GET_OBJ(all);
+    list_for_each(el, &rt->gc_obj_list) {
+        gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT || (JSObject *)gp == self)
+            continue;
+        obj = js_dup(JS_MKPTR(JS_TAG_OBJECT, gp));
+        if (JS_SetPropertyUint32(ctx, all, count++, obj) < 0) {
+            JS_FreeValue(ctx, all);
+            return JS_EXCEPTION;
+        }
+    }
+    return all;
 }
 
 void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func)
@@ -61755,8 +61795,16 @@ static JSValue js_perf_now(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     return js_float64(js__now_ms() - ctx->time_origin);
 }
 
+static JSValue js_perf_get_timeOrigin(JSContext *ctx, JSValueConst this_val)
+{
+    return js_float64(ctx->time_origin);
+}
+
+/* Weaver: timeOrigin is an accessor so that programs sharing one realm
+   (JS_SwapProgramState) each read their own. */
 static const JSCFunctionListEntry js_perf_proto_funcs[] = {
     JS_CFUNC_DEF2("now", 0, js_perf_now, JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF2("timeOrigin", js_perf_get_timeOrigin, NULL, JS_PROP_ENUMERABLE),
 };
 
 int JS_AddPerformance(JSContext *ctx)
@@ -61765,9 +61813,6 @@ int JS_AddPerformance(JSContext *ctx)
 
     JSValue performance = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, performance, js_perf_proto_funcs, countof(js_perf_proto_funcs));
-    JS_DefinePropertyValueStr(ctx, performance, "timeOrigin",
-                           js_float64(ctx->time_origin),
-                           JS_PROP_ENUMERABLE);
     JS_DefinePropertyValueStr(ctx, ctx->global_obj, "performance",
                            js_dup(performance),
                            JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE);

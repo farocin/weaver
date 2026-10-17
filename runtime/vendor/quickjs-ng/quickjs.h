@@ -1212,9 +1212,11 @@ typedef struct JSProgramState {
     JSValue prepare_stack;
     JSValue stack_trace_limit;
     uint64_t random_state;
+    double time_origin;
 } JSProgramState;
+JS_EXTERN void JS_InitProgramState(JSContext *ctx, JSProgramState *state);
 JS_EXTERN void JS_SwapProgramState(JSContext *ctx, JSProgramState *state);
-JS_EXTERN uint32_t JS_GetRuntimeClassCount(JSRuntime *rt);
+JS_EXTERN JSValue JS_GetLiveObjects(JSContext *ctx);
 /* Weaver: jobs tagged by who queued them (see VENDOR.md). */
 typedef uintptr_t JSJobTagFunc(JSContext *ctx);
 JS_EXTERN void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func);
@@ -1226,7 +1228,7 @@ JS_EXTERN void JS_FreeTaggedJobs(JSContext *ctx, uintptr_t tag);
    context returns non-NULL; QuickJS then calls it again with NULL and that
    value to switch back, and drops the job without throwing if the
    allocation fails. */
-typedef void *JSChargeJobFunc(JSContext *ctx, void *restore);
+typedef void *JSChargeJobFunc(JSContext *ctx, uintptr_t tag, void *restore);
 JS_EXTERN void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func);
 /* Called with NULL before QuickJS grows a runtime-wide table (the atom
    hash and array, the shape hash), which belongs to no context; an

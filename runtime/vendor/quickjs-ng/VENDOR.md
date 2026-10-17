@@ -24,15 +24,20 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   context's per-program state with the caller's `JSProgramState`: the
   global object and global lexical scope (top-level `let`, `const`,
   `class`), the Error stack settings (`Error.prepareStackTrace`,
-  `Error.stackTraceLimit`, which built-in setters store on the context) and
-  the `Math.random` state. QuickJS reads all of them from the context when
+  `Error.stackTraceLimit`, which built-in setters store on the context), the
+  `Math.random` state and the performance time origin
+  (`performance.now()`, and `performance.timeOrigin`, an accessor here so
+  each program reads its own). QuickJS reads all of them from the context when
   used, so a program whose state is in the context sees its own, and the
   shared realm's built-ins through its global object's prototype. It also
   drops the context's last-error backtrace, which belongs to the outgoing
   program. Used by Weaver's shared realm: each widget's turn swaps its
-  state in. `JS_GetRuntimeClassCount(rt)` lets the embedder walk every
-  class prototype (`JS_GetClassProto`), hidden ones included, to freeze
-  them.
+  state in. `JS_InitProgramState(ctx, &state)` starts a program's state as
+  a new realm would (no stack formatter, a limit of 10, time from now).
+  `JS_GetLiveObjects(ctx)` returns an array of every object alive in the
+  runtime. Run before any program has made one, it lists the realm's
+  built-ins, including those only a built-in's closure holds, which no
+  property walk reaches; Weaver freezes them all.
 - `JS_SetJobTagFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` tags each job
   with `func(ctx)`. `JS_ExecuteTaggedJob(ctx, tag)`,
   `JS_IsTaggedJobPending(ctx, tag)` and `JS_FreeTaggedJobs(ctx, tag)` run,
@@ -42,8 +47,9 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   tag of the program that made it, and its cleanup jobs are queued under
   that tag, not the tag of whichever program's turn ran the collection.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
-  around allocating a job, so a garbage collection in one widget's turn
-  charges another widget's queued cleanup job to that widget's heap.
+  around allocating a job, with the job's tag, so a garbage collection in
+  one widget's turn charges another widget's queued cleanup job to that
+  widget's heap (the one its tag names).
 - `JS_SetChargeSharedFunc(rt, func)` (`quickjs.h`): QuickJS calls `func`
   around growing a runtime-wide table (atom hash and array, shape hash), so
   the table is charged to the host's heap, not to the widget whose turn grew
