@@ -34,10 +34,17 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   program. Used by Weaver's shared realm: each widget's turn swaps its
   state in. `JS_InitProgramState(ctx, &state)` starts a program's state as
   a new realm would (no stack formatter, a limit of 10, time from now).
-  `JS_GetLiveObjects(ctx)` returns an array of every object alive in the
-  runtime. Run before any program has made one, it lists the realm's
-  built-ins, including those only a built-in's closure holds, which no
-  property walk reaches; Weaver freezes them all.
+  `JS_FreezeRealm(ctx)` freezes every object alive in the runtime: run
+  before any program has made one, those are the realm's built-ins,
+  including those only a built-in's closure holds, which no property walk
+  reaches. It leaves the built-in methods QuickJS makes on first use
+  (autoinit properties) unmade, with their flags set frozen; each is made
+  frozen, and outside the running program's memory charge, when a program
+  first reaches it. Namespace objects (Math, JSON, Reflect, ...) and the
+  built-ins written in JavaScript (Array.fromAsync, Iterator.zip,
+  Iterator.zipKeyed) are made at once: the latter hold functions in
+  closures, and a namespace's property names are atoms a program could
+  otherwise create first and keep charged to itself.
 - `JS_SetJobTagFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` tags each job
   with `func(ctx)`. `JS_ExecuteTaggedJob(ctx, tag)`,
   `JS_IsTaggedJobPending(ctx, tag)` and `JS_FreeTaggedJobs(ctx, tag)` run,

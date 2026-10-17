@@ -1216,7 +1216,7 @@ typedef struct JSProgramState {
 } JSProgramState;
 JS_EXTERN void JS_InitProgramState(JSContext *ctx, JSProgramState *state);
 JS_EXTERN void JS_SwapProgramState(JSContext *ctx, JSProgramState *state);
-JS_EXTERN JSValue JS_GetLiveObjects(JSContext *ctx);
+JS_EXTERN int JS_FreezeRealm(JSContext *ctx);
 /* Weaver: jobs tagged by who queued them (see VENDOR.md). */
 typedef uintptr_t JSJobTagFunc(JSContext *ctx);
 JS_EXTERN void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func);

@@ -106,45 +106,18 @@ const tame_source =
     \\})();
 ;
 
-/// Freezes the objects it is given and says how many were not frozen yet.
-/// Freezing can create objects (a lazily built property's value), so
-/// `lockDown` runs it until it finds none.
-const freeze_source =
-    \\((objects) => {
-    \\  let frozen = 0;
-    \\  for (const value of objects) {
-    \\    if (Object.isFrozen(value)) continue;
-    \\    Object.freeze(value);
-    \\    frozen += 1;
-    \\  }
-    \\  return frozen;
-    \\})
-;
-
 /// Lock a newly built shared realm: tame, then freeze every object alive in
-/// the runtime. No widget has made one yet, so each is a built-in, and this
-/// reaches the ones no property leads to (functions only a built-in's
-/// closure holds, prototypes only syntax or an engine class reaches) as
-/// surely as the rest.
+/// the runtime (`JS_FreezeRealm`). No widget has made one yet, so each is a
+/// built-in, and this reaches the ones no property leads to (functions only
+/// a built-in's closure holds, prototypes only syntax or an engine class
+/// reaches) as surely as the rest. Built-in methods QuickJS makes on first
+/// use are not made now: each is frozen, and charged to the host, when a
+/// widget first reaches it.
 fn lockDown(realm: *c.JSContext) bool {
     const tamed = c.JS_Eval(realm, tame_source.ptr, tame_source.len, "tame.js", c.JS_EVAL_TYPE_GLOBAL);
     defer c.JS_FreeValue(realm, tamed);
     if (c.JS_IsException(tamed)) return false;
-    const freeze = c.JS_Eval(realm, freeze_source.ptr, freeze_source.len, "freeze.js", c.JS_EVAL_TYPE_GLOBAL);
-    defer c.JS_FreeValue(realm, freeze);
-    if (c.JS_IsException(freeze)) return false;
-    while (true) {
-        const objects = c.JS_GetLiveObjects(realm);
-        defer c.JS_FreeValue(realm, objects);
-        if (c.JS_IsException(objects)) return false;
-        var arguments = [_]c.JSValue{objects};
-        const frozen = c.JS_Call(realm, freeze, qjs.undefinedValue(), arguments.len, &arguments);
-        defer c.JS_FreeValue(realm, frozen);
-        if (c.JS_IsException(frozen)) return false;
-        var count: i32 = 0;
-        if (c.JS_ToInt32(realm, &count, frozen) < 0) return false;
-        if (count == 0) return true;
-    }
+    return c.JS_FreezeRealm(realm) == 0;
 }
 
 /// The engine whose turn is running: the interrupt budget is its.
@@ -1745,6 +1718,54 @@ test "in a realm of its own a job queued outside a turn is its widget's memory" 
     try std.testing.expect(widget.heapBytes() > before);
     try std.testing.expectEqual(host_before, heap().usedBytes(heap().hostOwner()));
     try widget.evaluate("globalThis.tick = 1;", "tick.js");
+}
+
+test "in the shared realm a built-in first used after lockdown is frozen, and the host's" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const second = try widgets.engine(1);
+    defer second.destroy(std.testing.allocator);
+    const first = try widgets.engine(0);
+    var alive = true;
+    defer if (alive) first.destroy(std.testing.allocator);
+    // Built-in methods QuickJS makes on first use are not made at lockdown:
+    // the first widget to reach one makes it, frozen, in the host's memory.
+    const reach =
+        \\globalThis.lazy = [String.prototype.localeCompare, Array.prototype.copyWithin, Math.hypot, Reflect.ownKeys];
+    ;
+    const host_before = heap().usedBytes(heap().hostOwner());
+    try first.evaluate(reach, "first.js");
+    try first.evaluate(
+        \\"use strict";
+        \\if (!lazy.every((f) => Object.isFrozen(f))) throw new Error("a built-in made after lockdown is not frozen");
+        \\for (const f of lazy) { try { f.mailbox = 1; } catch {} }
+    , "first-write.js");
+    try std.testing.expect(heap().usedBytes(heap().hostOwner()) > host_before);
+    const range = first.owner;
+    first.destroy(std.testing.allocator);
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(range));
+    try second.evaluate(reach, "second.js");
+    try second.evaluate("if (lazy.some((f) => f.mailbox !== undefined)) throw new Error('found something on it');", "second-read.js");
+}
+
+test "in the shared realm lockdown makes the built-ins it can leave for later" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const widget = try widgets.engine(0);
+    defer widget.destroy(std.testing.allocator);
+    // Freezing every object at once used to make every built-in method:
+    // 276 KB in the host's range against 125 KB for the realm unfrozen.
+    // Made on first use instead, the frozen realm stays near the latter.
+    const host = heap().usedBytes(heap().hostOwner());
+    std.debug.print("shared realm in the host's range: {d} bytes\n", .{host});
+    try std.testing.expect(host < 180 * 1024);
 }
 
 test "a widget in the shared realm costs far less than a realm of its own" {

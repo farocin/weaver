@@ -493,6 +493,9 @@ struct JSContext {
     /* Weaver: this realm's pending jobs (JSJobEntry.link), owned like its
        other fields: marked by JS_MarkContext, freed with the context. */
     struct list_head job_list;
+    /* Weaver: JS_FreezeRealm froze this realm's built-ins; a built-in
+       property created later (autoinit) is frozen as it is created. */
+    bool weaver_frozen;
 
     uint16_t binary_object_count;
     uint32_t binary_object_size : 31;
@@ -2255,34 +2258,203 @@ void JS_InitProgramState(JSContext *ctx, JSProgramState *state)
     state->time_origin = js__now_ms();
 }
 
-/* Weaver: an array of every object alive in the runtime, the array
-   itself aside. Run before any program has made an object, it lists the
-   realm's built-ins, those only built-in closures reach among them, for
-   freezing the realm whole. */
-JSValue JS_GetLiveObjects(JSContext *ctx)
+static int js_update_property_flags(JSContext *ctx, JSObject *p,
+                                    JSShapeProperty **pprs, int flags);
+static int convert_fast_array_to_array(JSContext *ctx, JSObject *p);
+static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
+                               JSProperty *pr, JSShapeProperty *prs);
+static JSAutoInitIDEnum js_autoinit_get_id(JSProperty *pr);
+
+/* Every JS object alive in the runtime, each with a reference the caller
+   frees (js_free_live_objects). Walking a collected list, not the
+   runtime's, lets the caller allocate and free as it goes. */
+static JSObject **js_collect_live_objects(JSContext *ctx, uint32_t *pcount)
 {
     JSRuntime *rt = ctx->rt;
     struct list_head *el;
     JSGCObjectHeader *gp;
-    JSValue all, obj;
-    JSObject *self;
+    JSObject **objects;
     uint32_t count = 0;
 
-    all = JS_NewArray(ctx);
-    if (JS_IsException(all))
-        return all;
-    self = JS_VALUE_GET_OBJ(all);
     list_for_each(el, &rt->gc_obj_list) {
         gp = list_entry(el, JSGCObjectHeader, link);
-        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT || (JSObject *)gp == self)
-            continue;
-        obj = js_dup(JS_MKPTR(JS_TAG_OBJECT, gp));
-        if (JS_SetPropertyUint32(ctx, all, count++, obj) < 0) {
-            JS_FreeValue(ctx, all);
-            return JS_EXCEPTION;
+        if (gp->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT)
+            count++;
+    }
+    objects = js_malloc(ctx, sizeof(*objects) * max_int(count, 1));
+    if (!objects)
+        return NULL;
+    count = 0;
+    list_for_each(el, &rt->gc_obj_list) {
+        gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) {
+            objects[count++] = (JSObject *)gp;
+            js_dup(JS_MKPTR(JS_TAG_OBJECT, gp));
         }
     }
-    return all;
+    *pcount = count;
+    return objects;
+}
+
+static void js_free_live_objects(JSContext *ctx, JSObject **objects, uint32_t count)
+{
+    uint32_t i;
+    for (i = 0; i < count; i++)
+        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, objects[i]));
+    js_free(ctx, objects);
+}
+
+/* Make now, rather than on first use, the built-ins a frozen realm cannot
+   leave for later:
+   - those written in JavaScript (autoinit bytecode: Array.fromAsync,
+     Iterator.zip, Iterator.zipKeyed): they hold functions in closures no
+     property reaches, so they are frozen with the rest;
+   - namespace objects (JS_DEF_OBJECT: Math, JSON, Reflect, ...): their
+     property names are atoms, and a program that wrote one of those names
+     first would otherwise own the atom the shared built-in then holds.
+   Their methods stay lazy. Returns how many it made, or -1. */
+static int js_make_early_builtins(JSContext *ctx, JSObject *p)
+{
+    uint32_t i;
+    int made = 0;
+
+    for (i = 0; i < p->shape->prop_count; i++) {
+        JSShapeProperty *prs = &p->shape->prop[i];
+        JSProperty *pr = &p->prop[i];
+        bool early;
+        if (prs->atom == JS_ATOM_NULL ||
+            (prs->flags & JS_PROP_TMASK) != JS_PROP_AUTOINIT)
+            continue;
+        switch (js_autoinit_get_id(pr)) {
+        case JS_AUTOINIT_ID_BYTECODE:
+            early = true;
+            break;
+        case JS_AUTOINIT_ID_PROP:
+            early = ((const JSCFunctionListEntry *)pr->u.init.opaque)->def_type == JS_DEF_OBJECT;
+            break;
+        default:
+            early = false;
+            break;
+        }
+        if (!early)
+            continue;
+        if (JS_AutoInitProperty(ctx, p, prs->atom, pr, prs))
+            return -1;
+        made++;
+    }
+    return made;
+}
+
+/* Weaver: freeze one object as Object.freeze would, without creating the
+   values of its autoinit properties (built-in methods QuickJS makes on
+   first use): their flags are set now, their values are frozen when they
+   are made (JS_AutoInitProperty). */
+static int js_freeze_object_lazily(JSContext *ctx, JSObject *p)
+{
+    uint32_t i;
+
+    if (p->class_id == JS_CLASS_PROXY || p->class_id == JS_CLASS_MODULE_NS)
+        return -1;
+    if (p->fast_array) {
+        if (p->class_id != JS_CLASS_ARRAY && p->u.array.count > 0)
+            return -1;
+        if (p->class_id == JS_CLASS_ARRAY && convert_fast_array_to_array(ctx, p))
+            return -1;
+    }
+    p->extensible = false;
+    for (i = 0; i < p->shape->prop_count; i++) {
+        /* An update can clone the shape: index it afresh each time. */
+        JSShapeProperty *prs = &p->shape->prop[i];
+        int flags;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        flags = prs->flags & ~JS_PROP_CONFIGURABLE;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET)
+            flags &= ~JS_PROP_WRITABLE;
+        if (js_update_property_flags(ctx, p, &prs, flags))
+            return -1;
+    }
+    return 0;
+}
+
+/* Weaver: freeze a value just made for a frozen built-in, and every object
+   it reaches that is not frozen yet: all of them are new, made with it. */
+static int js_freeze_new_lazily(JSContext *ctx, JSValueConst val, int depth)
+{
+    JSObject *p;
+    uint32_t i;
+
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(val);
+    if (!p->extensible)
+        return 0;
+    if (depth > 64 || js_freeze_object_lazily(ctx, p))
+        return -1;
+    for (i = 0; i < p->shape->prop_count; i++) {
+        JSShapeProperty *prs = &p->shape->prop[i];
+        JSProperty *pr = &p->prop[i];
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_NORMAL:
+            if (js_freeze_new_lazily(ctx, pr->u.value, depth + 1))
+                return -1;
+            break;
+        case JS_PROP_GETSET:
+            if (pr->u.getset.getter &&
+                js_freeze_new_lazily(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), depth + 1))
+                return -1;
+            if (pr->u.getset.setter &&
+                js_freeze_new_lazily(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter), depth + 1))
+                return -1;
+            break;
+        default:
+            break;
+        }
+    }
+    if (p->shape->proto &&
+        js_freeze_new_lazily(ctx, JS_MKPTR(JS_TAG_OBJECT, p->shape->proto), depth + 1))
+        return -1;
+    return 0;
+}
+
+/* Weaver: freeze every object alive in the runtime (a realm's built-ins,
+   before any program has made an object), without creating the built-in
+   methods QuickJS makes on first use; those are frozen when made, charged
+   to the runtime rather than the program that first touched them. */
+int JS_FreezeRealm(JSContext *ctx)
+{
+    JSObject **objects;
+    uint32_t count = 0, i;
+    int ret = 0;
+
+    /* Making one can add more (a namespace object's own namespaces). */
+    for (;;) {
+        int made = 0, n = 0;
+        objects = js_collect_live_objects(ctx, &count);
+        if (!objects)
+            return -1;
+        for (i = 0; i < count && n >= 0; i++) {
+            n = js_make_early_builtins(ctx, objects[i]);
+            made += n;
+        }
+        js_free_live_objects(ctx, objects, count);
+        if (n < 0)
+            return -1;
+        if (made == 0)
+            break;
+    }
+    /* Everything alive now, the closures those made included. */
+    objects = js_collect_live_objects(ctx, &count);
+    if (!objects)
+        return -1;
+    for (i = 0; i < count && ret == 0; i++)
+        ret = js_freeze_object_lazily(ctx, objects[i]);
+    js_free_live_objects(ctx, objects, count);
+    if (ret == 0)
+        ctx->weaver_frozen = true;
+    return ret;
 }
 
 void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func)
@@ -8931,14 +9103,31 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     JSValue val;
     JSContext *realm;
     JSAutoInitFunc *func;
-
-    if (js_shape_prepare_update(ctx, p, &prs))
-        return -1;
+    bool frozen;
+    void *restore;
 
     realm = js_autoinit_get_realm(pr);
     func = js_autoinit_func_table[js_autoinit_get_id(pr)];
+    /* Weaver: a frozen built-in's property (JS_FreezeRealm cleared its
+       writable and configurable flags) is shared by every program in the
+       realm: it is made, its object's shape copied included, outside the
+       running program's charge, and frozen. */
+    frozen = realm->weaver_frozen && !p->extensible &&
+        !(prs->flags & (JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE));
+    restore = frozen && ctx->rt->charge_shared ? ctx->rt->charge_shared(ctx->rt, NULL) : NULL;
+    if (js_shape_prepare_update(ctx, p, &prs)) {
+        if (restore)
+            ctx->rt->charge_shared(ctx->rt, restore);
+        return -1;
+    }
     /* 'func' shall not modify the object properties 'pr' */
     val = func(realm, p, prop, pr->u.init.opaque);
+    if (frozen && !JS_IsException(val) && js_freeze_new_lazily(realm, val, 0)) {
+        JS_FreeValue(ctx, val);
+        val = JS_ThrowInternalError(ctx, "a built-in could not be frozen");
+    }
+    if (restore)
+        ctx->rt->charge_shared(ctx->rt, restore);
     js_autoinit_free(ctx->rt, pr);
     prs->flags &= ~JS_PROP_TMASK;
     pr->u.value = JS_UNDEFINED;
