@@ -7,7 +7,8 @@
 //!
 //! weaverd also carries the CLI's client side of the host's control
 //! objects (`--probe`, `--probe-reload-ready`, `--signal-reload`,
-//! `--signal-down`): a small process the CLI can spawn quickly.
+//! `--request-status`, `--signal-down`): a small process the CLI can spawn
+//! quickly.
 const std = @import("std");
 const backoff = @import("backoff.zig");
 const contract = @import("host_contract.zig");
@@ -22,6 +23,10 @@ const c = @cImport({
 /// always met.
 const reload_signal_wait_ms: u32 = 10_000;
 const reload_answer_wait_ms: u32 = 10_000;
+/// How long `--request-status` waits for the host to write status: what
+/// `weaver up` waits for the host to come up (cli/src/index.ts upHost), so
+/// a request sent while weaverd restarts a host is answered by the next.
+const status_answer_wait_ms: u32 = 5_000;
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
@@ -37,6 +42,7 @@ fn run(init: std.process.Init) !void {
         const command = args[1];
         if (std.mem.eql(u8, command, "--signal-down")) return signalEvent(contract.shutdown_event);
         if (std.mem.eql(u8, command, "--signal-reload")) return signalReloadAndWait();
+        if (std.mem.eql(u8, command, "--request-status")) return requestStatus();
         if (std.mem.eql(u8, command, "--probe")) return probeMutex(contract.singleton_mutex);
         if (std.mem.eql(u8, command, "--probe-reload-ready")) {
             try probeMutex(contract.singleton_mutex);
@@ -45,42 +51,104 @@ fn run(init: std.process.Init) !void {
     }
     // An unknown argument must not start a supervisor against the real
     // profile.
-    std.debug.print("usage: weaverd [--probe | --probe-reload-ready | --signal-reload | --signal-down]\n", .{});
+    std.debug.print("usage: weaverd [--probe | --probe-reload-ready | --signal-reload | --request-status | --signal-down]\n", .{});
     return error.InvalidArguments;
 }
 
 /// What weaverd knows across host starts: the crashes no widget was blamed
-/// for, and how it started the host now running.
+/// for, and how it starts the next host.
 const Supervision = struct {
     crash_times: [backoff.history_capacity]u64 = @splat(0),
     crash_count: usize = 0,
-    /// Passed to the next host (`contract.env_host_crashes`): zero for a
+    /// What the next host is told (`contract.env_host_crashes`): zero for a
     /// fresh start.
     crashes: usize = 0,
     exit_code: u32 = 0,
+    /// The host now running was started holding every widget.
+    running_held: bool = false,
 
     const Decision = enum { stop, restart, give_up };
 
-    /// The host now running holds every widget stopped.
-    fn held(self: *const Supervision) bool {
+    /// The next host holds every widget stopped.
+    fn holds(self: *const Supervision) bool {
         return self.crashes > backoff.restart_limit;
     }
 
-    /// The host exited with `exit_code`. `stopped` is what its record says
-    /// (a clean `weaver down`, or a startup error returned from main), and
-    /// `attributed` whether it crashed inside a widget's turn.
-    fn hostExited(self: *Supervision, exit_code: u32, stopped: bool, attributed: bool, now_ms: u64) Decision {
-        if (stopped or exit_code == 0 or exit_code == contract.exit_already_running) return .stop;
-        // The next host quarantines that widget; the others start at once,
-        // and the crash counts toward nothing, as when weaverd ran them.
-        if (attributed) return .restart;
+    fn started(self: *Supervision) void {
+        self.running_held = self.holds();
+    }
+
+    /// The host exited with `exit_code`, and `record` is what it left, if
+    /// the record is its own. The record decides first: Zig's abort exits
+    /// with 3 and fail-fast with the exception code, so an exit code alone
+    /// cannot tell a crash from a clean stop.
+    fn hostExited(self: *Supervision, exit_code: u32, record: ?contract.Record, now_ms: u64) Decision {
+        if (record) |value| {
+            // A clean `weaver down`, or a startup error returned from main.
+            if (value.state == .stopped) return .stop;
+            if (value.crash.kind == .widget_turn) {
+                // The next host quarantines that widget; the others start
+                // at once, and the crash counts toward nothing, as when
+                // weaverd ran them.
+                self.crashes = 0;
+                return .restart;
+            }
+        } else if (exit_code == 0 or exit_code == contract.exit_already_running) {
+            // It never opened a record: another host owns the singleton.
+            return .stop;
+        }
         // A host holding every widget still crashed: the fault is the
         // host's own, and restarting it again would only loop.
-        if (self.held()) return .give_up;
+        if (self.running_held) return .give_up;
         _ = backoff.recordCrash(&self.crash_times, &self.crash_count, now_ms);
         self.crashes = self.crash_count;
         self.exit_code = exit_code;
         return .restart;
+    }
+};
+
+/// Handles on the host's control objects, held across a restart so the
+/// CLI still reaches weaverd while no host runs: `weaver down` in that gap
+/// stops weaverd instead of meeting "not running" and then a host that
+/// comes back, and a reload waits in its event for the next host. Step 5
+/// replaces this with the lifecycle mutex and stop marker.
+const Held = struct {
+    handles: [7]c.HANDLE = @splat(null),
+    count: usize = 0,
+
+    /// How long weaverd waits for the first host to create the objects:
+    /// what `weaver up` waits for the same objects (cli/src/index.ts
+    /// upHost, 5 s). A host that is slower runs without them held.
+    const wait_ms: u64 = 5_000;
+    const poll_ms: u32 = 20;
+
+    fn take(self: *Held, host: c.HANDLE) void {
+        const deadline = c.GetTickCount64() + wait_ms;
+        while (c.GetTickCount64() < deadline) {
+            if (self.open()) return;
+            if (c.WaitForSingleObject(host, poll_ms) == c.WAIT_OBJECT_0) return;
+        }
+    }
+
+    fn open(self: *Held) bool {
+        const mutex = c.OpenMutexW(c.SYNCHRONIZE, 0, contract.singleton_mutex) orelse return false;
+        var handles: [7]c.HANDLE = .{ mutex, null, null, null, null, null, null };
+        const events = [_][*:0]const u16{ contract.shutdown_event, contract.reload_event, contract.reload_success_event, contract.reload_failure_event, contract.status_request_event, contract.status_written_event };
+        for (events, 1..) |name, index| {
+            handles[index] = c.OpenEventW(c.SYNCHRONIZE, 0, name) orelse {
+                for (handles[0..index]) |handle| _ = c.CloseHandle(handle);
+                return false;
+            };
+        }
+        self.handles = handles;
+        self.count = handles.len;
+        return true;
+    }
+
+    /// `weaver down` was signalled while no host ran to see it.
+    fn downRequested(self: *const Held) bool {
+        if (self.count == 0) return false;
+        return c.WaitForSingleObject(self.handles[1], 0) == c.WAIT_OBJECT_0;
     }
 };
 
@@ -96,18 +164,19 @@ fn supervise(init: std.process.Init) !void {
     const runtime_exe = try std.fs.path.join(allocator, &.{ repo_root, "runtime", "zig-out", "bin", "weaver-widget.exe" });
     defer allocator.free(runtime_exe);
     var supervision: Supervision = .{};
+    var held: Held = .{};
     while (true) {
         const host = try startHost(allocator, runtime_exe, &supervision);
+        supervision.started();
+        if (held.count == 0) held.take(host.process);
         _ = c.WaitForSingleObject(host.process, c.INFINITE);
         var exit_code: c.DWORD = 1;
         _ = c.GetExitCodeProcess(host.process, &exit_code);
         const record = readHostRecord(record_path_w, host.process, host.pid);
         _ = c.CloseHandle(host.process);
-        const stopped = if (record) |value| value.state == .stopped else false;
-        const attributed = if (record) |value| value.state == .running and value.crash.kind == .widget_turn else false;
-        switch (supervision.hostExited(exit_code, stopped, attributed, c.GetTickCount64())) {
+        switch (supervision.hostExited(exit_code, record, c.GetTickCount64())) {
             .stop => return,
-            .restart => {},
+            .restart => if (held.downRequested()) return,
             .give_up => {
                 std.debug.print("weaverd: the widget host crashed again while it held every widget (exit code 0x{X:0>8}); not restarting it. Run 'weaver up' to try again.\n", .{exit_code});
                 return;
@@ -203,6 +272,17 @@ fn signalReloadAndWait() !void {
     return error.RegistryReloadTimedOut;
 }
 
+/// Ask the host to write status.json now, and wait until it has.
+fn requestStatus() !void {
+    const desired_access = c.SYNCHRONIZE | c.EVENT_MODIFY_STATE;
+    const written = c.OpenEventW(desired_access, 0, contract.status_written_event) orelse return error.HostNotRunning;
+    defer _ = c.CloseHandle(written);
+    const request = c.OpenEventW(c.EVENT_MODIFY_STATE, 0, contract.status_request_event) orelse return error.HostNotRunning;
+    defer _ = c.CloseHandle(request);
+    if (c.ResetEvent(written) == 0 or c.SetEvent(request) == 0) return error.SignalFailed;
+    if (c.WaitForSingleObject(written, status_answer_wait_ms) != c.WAIT_OBJECT_0) return error.StatusRequestTimedOut;
+}
+
 fn repositoryRoot(allocator: std.mem.Allocator) ![]u8 {
     // Windows' longest path, on the heap rather than weaverd's stack.
     const path_w = try allocator.alloc(u16, 32768);
@@ -223,34 +303,55 @@ fn setEnv(allocator: std.mem.Allocator, name: [*:0]const u16, value: []const u8)
     if (c.SetEnvironmentVariableW(name, value_w.ptr) == 0) return error.SetEnvironmentFailed;
 }
 
-test "a clean exit stops weaverd, and a widget's crash restarts at once without counting" {
+fn testRecord(state: contract.RecordState, kind: contract.CrashKind) contract.Record {
+    var record = std.mem.zeroes(contract.Record);
+    record.state = state;
+    record.crash.kind = kind;
+    return record;
+}
+
+test "the record decides before the exit code, and a widget's crash restarts at once without counting" {
     var supervision: Supervision = .{};
-    try std.testing.expectEqual(Supervision.Decision.stop, supervision.hostExited(0, false, false, 1_000));
-    try std.testing.expectEqual(Supervision.Decision.stop, supervision.hostExited(1, true, false, 1_000));
-    try std.testing.expectEqual(Supervision.Decision.stop, supervision.hostExited(contract.exit_already_running, false, false, 1_000));
-    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(0xC000_0005, false, true, 1_000));
+    try std.testing.expectEqual(Supervision.Decision.stop, supervision.hostExited(0, testRecord(.stopped, .none), 1_000));
+    // A startup error returned from main: a clean stop, whatever the code.
+    try std.testing.expectEqual(Supervision.Decision.stop, supervision.hostExited(1, testRecord(.stopped, .none), 1_000));
+    try std.testing.expectEqual(Supervision.Decision.stop, supervision.hostExited(contract.exit_already_running, null, 1_000));
+    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(0xC000_0005, testRecord(.running, .widget_turn), 1_000));
+    try std.testing.expectEqual(@as(usize, 0), supervision.crashes);
+    // Zig's abort exits with 3: a panic still restarts.
+    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(3, testRecord(.running, .ui), 2_000));
+    try std.testing.expectEqual(@as(usize, 1), supervision.crashes);
+    // A widget's crash after that starts the next host fresh.
+    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(contract.panic_code, testRecord(.running, .widget_turn), 3_000));
     try std.testing.expectEqual(@as(usize, 0), supervision.crashes);
 }
 
 test "crashes no widget is blamed for back off, then hold every widget, then give up" {
     var supervision: Supervision = .{};
     for (1..backoff.restart_limit + 2) |count| {
-        try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(0xC000_0005, false, false, count * 1_000));
+        supervision.started();
+        try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(0xC000_0005, testRecord(.running, .none), count * 1_000));
         try std.testing.expectEqual(count, supervision.crashes);
         try std.testing.expectEqual(@as(u32, 0xC000_0005), supervision.exit_code);
     }
-    try std.testing.expect(supervision.held());
-    // A widget's crash in a held host keeps it held.
-    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(0xC000_0005, false, true, 9_000));
-    try std.testing.expect(supervision.held());
-    try std.testing.expectEqual(Supervision.Decision.give_up, supervision.hostExited(1, false, false, 10_000));
+    try std.testing.expect(supervision.holds());
+    supervision.started();
+    // A widget's crash in a held host starts the next one fresh; its crash
+    // history stays, so another unblamed crash in the window holds again.
+    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(0xC000_0005, testRecord(.running, .widget_turn), 9_000));
+    try std.testing.expect(!supervision.holds());
+    supervision.started();
+    try std.testing.expectEqual(Supervision.Decision.restart, supervision.hostExited(1, null, 10_000));
+    try std.testing.expect(supervision.holds());
+    supervision.started();
+    try std.testing.expectEqual(Supervision.Decision.give_up, supervision.hostExited(1, null, 11_000));
 }
 
 test "crashes outside the window are forgotten" {
     var supervision: Supervision = .{};
-    _ = supervision.hostExited(1, false, false, 1_000);
-    _ = supervision.hostExited(1, false, false, 2_000);
-    _ = supervision.hostExited(1, false, false, 1_000 + backoff.crash_window_ms + 1);
+    _ = supervision.hostExited(1, null, 1_000);
+    _ = supervision.hostExited(1, null, 2_000);
+    _ = supervision.hostExited(1, null, 1_000 + backoff.crash_window_ms + 1);
     try std.testing.expectEqual(@as(usize, 2), supervision.crashes);
 }
 

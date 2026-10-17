@@ -28,10 +28,8 @@ pub const Crash = contract.Crash;
 /// The file's layout, shared with weaverd (host/src/host_contract.zig).
 pub const Record = contract.Record;
 
-/// The exception code recorded for a Zig panic (`notePanic`): "panic" in
-/// the customer bit range of NTSTATUS, so it never collides with a real
-/// exception code.
-pub const panic_code: u32 = 0xE057_0001;
+/// The exception code recorded for a Zig panic (`notePanic`).
+pub const panic_code = contract.panic_code;
 
 var record: ?*volatile Record = null;
 var ui_thread: u32 = 0;
@@ -154,6 +152,25 @@ pub fn noteCrash(code: u32) void {
     mapped.crash.kind = if (in_turn) .widget_turn else if (thread == ui_thread) .ui else .other;
 }
 
+/// The management thread found the UI thread still busy past its deadline
+/// (daemon.zig `apply`), and the host is about to stop itself with `code`.
+/// The widget whose turn is running, on whichever thread, held it up: that
+/// is the evidence, as for a crash in its turn. Outside any turn, the crash
+/// names no one.
+pub fn noteWedged(code: u32) void {
+    const mapped = record orelse return;
+    if (mapped.crash.kind != .none) return;
+    const turn_slot = mapped.turn.slot;
+    var now: u64 = 0;
+    GetSystemTimeAsFileTime(&now);
+    mapped.crash.code = code;
+    mapped.crash.thread = mapped.turn.thread;
+    mapped.crash.slot = turn_slot;
+    mapped.crash.bundle = if (turn_slot != 0) mapped.turn.bundle else 0;
+    mapped.crash.time = now;
+    mapped.crash.kind = if (turn_slot != 0) .widget_turn else .other;
+}
+
 /// A Zig panic, before its diagnostics run.
 pub fn notePanic() void {
     noteCrash(panic_code);
@@ -198,6 +215,25 @@ test "a crash in a widget's turn names it; one outside a turn names no one" {
     };
     const thread = try std.Thread.spawn(.{}, Other.crash, .{});
     thread.join();
+    try std.testing.expectEqual(CrashKind.other, storage.crash.kind);
+
+    // A stuck UI thread names the widget whose turn holds it, from the
+    // management thread; with no turn running it names no one.
+    storage.crash = .{};
+    beginTurn(6, 9);
+    const Management = struct {
+        fn wedge() void {
+            noteWedged(contract.exit_wedged);
+        }
+    };
+    const management = try std.Thread.spawn(.{}, Management.wedge, .{});
+    management.join();
+    try std.testing.expectEqual(CrashKind.widget_turn, storage.crash.kind);
+    try std.testing.expectEqual(@as(u32, 7), storage.crash.slot);
+    try std.testing.expectEqual(contract.exit_wedged, storage.crash.code);
+    storage.crash = .{};
+    endTurn();
+    noteWedged(contract.exit_wedged);
     try std.testing.expectEqual(CrashKind.other, storage.crash.kind);
 }
 

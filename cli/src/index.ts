@@ -1463,6 +1463,7 @@ async function devWidget(directory: string): Promise<void> {
   const presentationWatch = setInterval(() => {
     if (presentationFailureReported || Date.now() < presentationDeadline) return;
     try {
+      requestStatus();
       const status = readStatus().widgets.find((widget) => widget.name === project.config.name);
       if (status && status.backend !== "-") {
         clearInterval(presentationWatch);
@@ -1846,6 +1847,7 @@ async function downHost(): Promise<void> {
 function showStatus(json: boolean): void {
   assertHostLifecycleAvailable("status");
   if (!hostRunning()) throw new WeaverFailure(['weaverd is not running; run "weaver up"']);
+  requestStatus();
   try {
     const document = readStatus();
     process.stdout.write(`${json ? JSON.stringify(document, null, 2) : formatStatus(document)}\n`);
@@ -1871,6 +1873,15 @@ function assertHostReloadReady(): void {
   if (!hostReloadReady()) {
     throw new WeaverFailure(["The running weaverd predates acknowledged registry reloads.", 'Run "weaver down", then retry; Weaver will start the current host automatically.']);
   }
+}
+
+// The Windows host writes status.json when something changes and when asked,
+// and otherwise sleeps (runtime/src/daemon.zig). Asking is best effort: a host
+// that cannot answer leaves the last status, which the freshness warning in
+// statusDivergenceWarnings reports. macOS weaverd writes status on a timer.
+function requestStatus(): void {
+  if (process.platform !== "win32") return;
+  spawnSync(hostExecutable, ["--request-status"], { stdio: "ignore", windowsHide: true, env: hostEnvironment() });
 }
 
 function signalHost(signal: "--signal-down" | "--signal-reload"): void {

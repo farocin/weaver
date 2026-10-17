@@ -3,16 +3,22 @@
 //! shared renderer moved here from `weaverd`, which now only starts this
 //! process and restarts it after a crash (host/src/windows_host.zig).
 //!
-//! Control comes up before any widget: `Objects.claim` creates the
-//! singleton and the reload and shutdown events in `runHost`, before the
-//! host evaluates a single bundle, so `weaver down`, status and a fixed
-//! install always reach it.
+//! Control comes up before any widget: `Objects.claim` takes the singleton
+//! and creates the reload and shutdown events in main.zig `startDaemon`,
+//! before the host evaluates a single bundle, so `weaver down`, status and
+//! a fixed install always reach it.
 //!
 //! Management runs off the UI thread, on a thread of its own (`run`): it
 //! reconciles the registry, decides when each widget runs, starts and
-//! watches dev widgets and the renderer, and writes status every 2 s. The
-//! UI thread only applies a prepared load or unload (main.zig
-//! `applyControl`), and the reload acknowledgement goes out after it has.
+//! watches dev widgets and the renderer, and writes status. The UI thread
+//! only applies a prepared load or unload (main.zig `applyControl`), and the
+//! reload acknowledgement goes out after it has.
+//!
+//! When nothing changes, the management thread sleeps: it waits on the
+//! control events, a provider failure, the renderer's and dev widgets'
+//! processes, and the next backoff deadline, and polls nothing. Status is
+//! written when something changes and when the CLI asks for it
+//! (`contract.status_request_event`), which is when costs are sampled.
 //! Work that reads files through std.Io or runs `node` (registry reads,
 //! bundling, manifests) runs on a short-lived worker (`onWorker`): std.Io's
 //! Windows file calls take 256-512 KiB stack frames, and a thread's stack
@@ -55,13 +61,16 @@ const max_path_bytes = supervisor.max_path_bytes;
 /// in 6-15 ms, removing one in under 5 ms. Five seconds is what weaverd
 /// gave the host for the same answer.
 const apply_timeout_ms: u64 = 5_000;
-/// weaverd's cadence, unchanged: supervision every 250 ms, costs and status
-/// every 2 s (15 samples make the 30 s average status shows), thread
-/// counts every 30 s (one system-wide snapshot each).
-const tick_ms: u32 = 250;
-const status_interval_ms: u64 = 2_000;
-const thread_sample_interval_ms: u64 = 30_000;
-const cost_samples: usize = 15;
+/// How often that wait looks for `weaver down`: weaverd's supervision tick,
+/// which is how soon weaverd noticed it.
+const apply_poll_ms: u64 = 250;
+/// Handles the management thread waits on: its four events, the renderer,
+/// and a dev widget per registry slot. WaitForMultipleObjects takes at most
+/// 64 (MAXIMUM_WAIT_OBJECTS).
+const max_wait_handles: usize = 5 + max_widgets;
+comptime {
+    std.debug.assert(max_wait_handles <= 64);
+}
 /// The management thread's stack. It only uses small_fs, JSON encoding
 /// into the heap and Win32 calls; everything that takes std.Io frames runs
 /// on a worker. Receipt (2026-10-17, ReleaseFast, resident stack pages by
@@ -90,14 +99,21 @@ pub const Objects = struct {
     reload: win.HANDLE,
     reload_success: win.HANDLE,
     reload_failure: win.HANDLE,
+    status_request: win.HANDLE,
+    status_written: win.HANDLE,
 
     /// Create them all, or fail with `error.AlreadyRunning` when another
-    /// host holds the singleton.
+    /// host owns the singleton. The singleton is owned, not merely
+    /// created: weaverd and CLI probes hold handles to it while no host
+    /// runs, and a crashed host's ownership is abandoned with it.
     pub fn claim() !Objects {
         const mutex = win.CreateMutexW(null, 0, contract.singleton_mutex) orelse return error.CreateMutexFailed;
-        if (win.GetLastError() == win.ERROR_ALREADY_EXISTS) {
-            _ = win.CloseHandle(mutex);
-            return error.AlreadyRunning;
+        switch (win.WaitForSingleObject(mutex, 0)) {
+            win.WAIT_OBJECT_0, win.WAIT_ABANDONED => {},
+            else => {
+                _ = win.CloseHandle(mutex);
+                return error.AlreadyRunning;
+            },
         }
         return .{
             .mutex = mutex,
@@ -105,6 +121,8 @@ pub const Objects = struct {
             .reload = win.CreateEventW(null, 0, 0, contract.reload_event) orelse return error.CreateEventFailed,
             .reload_success = win.CreateEventW(null, 1, 0, contract.reload_success_event) orelse return error.CreateEventFailed,
             .reload_failure = win.CreateEventW(null, 1, 0, contract.reload_failure_event) orelse return error.CreateEventFailed,
+            .status_request = win.CreateEventW(null, 0, 0, contract.status_request_event) orelse return error.CreateEventFailed,
+            .status_written = win.CreateEventW(null, 1, 0, contract.status_written_event) orelse return error.CreateEventFailed,
         };
     }
 };
@@ -143,15 +161,14 @@ pub const Options = struct {
     restart: Restart,
 };
 
-/// A process's cost, sampled every `status_interval_ms`: what status
-/// averages over the last `cost_samples` samples.
+/// A process's cost as status shows it, sampled when the CLI asks for
+/// status: private bytes then, and CPU since the previous sample (or since
+/// it started).
 const Costs = struct {
     previous_ticks: u64 = 0,
     previous_ms: u64 = 0,
-    private_samples: [cost_samples]u64 = @splat(0),
-    cpu_samples: [cost_samples]f64 = @splat(0),
-    count: usize = 0,
-    cursor: usize = 0,
+    private_mb: f64 = 0,
+    cpu: f64 = 0,
 
     fn reset(self: *Costs, process: win.HANDLE, now_ms: u64) void {
         self.* = .{ .previous_ticks = processTicks(process), .previous_ms = now_ms };
@@ -165,22 +182,10 @@ const Costs = struct {
         const elapsed_ms = now_ms -| self.previous_ms;
         const tick_delta = ticks -| self.previous_ticks;
         const cpu = if (elapsed_ms == 0) 0 else 100.0 * @as(f64, @floatFromInt(tick_delta)) / 10_000.0 / @as(f64, @floatFromInt(elapsed_ms));
-        self.private_samples[self.cursor] = counters.PrivateUsage;
-        self.cpu_samples[self.cursor] = @round(cpu * 10.0) / 10.0;
-        self.cursor = (self.cursor + 1) % cost_samples;
-        self.count = @min(self.count + 1, cost_samples);
+        self.private_mb = @as(f64, @floatFromInt(counters.PrivateUsage)) / (1024.0 * 1024.0);
+        self.cpu = @round(cpu * 10.0) / 10.0;
         self.previous_ticks = ticks;
         self.previous_ms = now_ms;
-    }
-
-    fn averages(self: *const Costs) struct { private_mb: f64, cpu: f64 } {
-        if (self.count == 0) return .{ .private_mb = 0, .cpu = 0 };
-        var private_total: u64 = 0;
-        var cpu_total: f64 = 0;
-        for (self.private_samples[0..self.count]) |value| private_total += value;
-        for (self.cpu_samples[0..self.count]) |value| cpu_total += value;
-        const count: f64 = @floatFromInt(self.count);
-        return .{ .private_mb = @as(f64, @floatFromInt(private_total)) / count / (1024.0 * 1024.0), .cpu = cpu_total / count };
     }
 };
 
@@ -294,8 +299,15 @@ pub const Daemon = struct {
     costs: Costs = .{},
     threads: u32 = 0,
     started_ms: u64,
-    thread_sample_ms: u64 = 0,
     status_write_failures: u64 = 0,
+    /// Signalled by the providers when a widget's channel fails.
+    provider_failure: win.HANDLE,
+    /// `weaver down` is under way: the last status names no live process.
+    stopping: bool = false,
+    /// Why the registry last failed to load, shown on status's host row
+    /// until a load succeeds; empty when the last one did.
+    registry_failure: [256]u8 = undefined,
+    registry_failure_len: usize = 0,
 
     /// Everything the management thread needs, before it starts. Paths
     /// come from the data directory and this executable's place in the
@@ -321,7 +333,9 @@ pub const Daemon = struct {
             .cli_script = try std.fs.path.join(allocator, &.{ repo, "cli", "dist", "index.js" }),
             .slots = @splat(.{}),
             .started_ms = win.GetTickCount64(),
+            .provider_failure = win.CreateEventW(null, 0, 0, null) orelse return error.CreateEventFailed,
         };
+        options.service.setFailureSignal(self.provider_failure);
         self.costs.reset(win.GetCurrentProcess(), self.started_ms);
         return self;
     }
@@ -336,39 +350,62 @@ pub const Daemon = struct {
     fn run(self: *Daemon) void {
         // It runs no widget's code.
         widget_log.detachThread();
-        onWorker(begin, .{self}) catch |err| note("the registry could not be read at startup: {s}; widgets start on the next reload", .{@errorName(err)});
-        var next_status_ms: u64 = 0;
+        onWorker(begin, .{self}) catch |err| self.noteRegistryFailure(err);
+        // The host before this one died: a reload it took and never
+        // acknowledged (it may have died removing a widget) is answered
+        // here, once this start has read the registry as it now stands.
+        // The CLI that sent it still waits on the acknowledgement events,
+        // which weaverd kept alive across the restart.
+        if (self.predecessorCrashed()) _ = win.SetEvent(self.objects.reload);
+        var status_requested = true;
         while (true) {
-            const handles = [_]win.HANDLE{ self.objects.shutdown, self.objects.reload };
-            const wait = win.WaitForMultipleObjects(handles.len, &handles, 0, tick_ms);
+            const now = win.GetTickCount64();
+            self.supervise(now);
+            // Something woke the thread, so something may have changed.
+            if (status_requested) {
+                self.sampleCosts(now);
+                self.countThreads();
+            }
+            self.writeStatus(now);
+            if (status_requested) _ = win.SetEvent(self.objects.status_written);
+            status_requested = false;
+
+            var handles: [max_wait_handles]win.HANDLE = undefined;
+            const count = self.waitHandles(&handles);
+            const wait = win.WaitForMultipleObjects(@intCast(count), &handles, 0, self.nextDeadlineMs(win.GetTickCount64()));
             if (wait == win.WAIT_OBJECT_0) break;
             if (wait == win.WAIT_OBJECT_0 + 1) {
                 // Any widget this reload removed is out of the host when
                 // the worker returns: the CLI may delete its directory.
                 if (onWorker(loadRegistry, .{self})) |_| {
+                    self.registry_failure_len = 0;
                     _ = win.SetEvent(self.objects.reload_success);
                 } else |err| {
-                    note("registry reload failed: {s}; nothing changed", .{@errorName(err)});
+                    self.noteRegistryFailure(err);
                     _ = win.SetEvent(self.objects.reload_failure);
                 }
             }
-            const now = win.GetTickCount64();
-            self.supervise(now);
-            if (now >= next_status_ms) {
-                self.sampleCosts(now);
-                self.writeStatus(now);
-                next_status_ms = now + status_interval_ms;
-            }
+            if (wait == win.WAIT_OBJECT_0 + 2) status_requested = true;
+            // Anything else (a provider failure, a process that exited, a
+            // backoff deadline) is the next pass of `supervise`.
         }
         self.stopAll();
         crash_record.markStopped();
         std.process.exit(0);
     }
 
+    /// The previous host's record is still `running`: it did not stop.
+    fn predecessorCrashed(self: *const Daemon) bool {
+        const record = self.options.previous orelse return false;
+        return record.state == .running;
+    }
+
     /// The first work of a host start, before any widget loads.
     fn begin(self: *Daemon) !void {
         cleanupBackendStatusFiles(self.options.io, self.options.data_directory);
-        small_fs.delete(self.options.io, self.renderer_log_path) catch {};
+        // A crashed host's renderer log says what its renderer last did:
+        // kept for whoever reads it after the restart.
+        if (!self.predecessorCrashed()) small_fs.delete(self.options.io, self.renderer_log_path) catch {};
         self.loadLedger();
         try self.loadRegistry();
         self.applyCulprit();
@@ -388,6 +425,20 @@ pub const Daemon = struct {
         defer parsed.deinit();
         try supervisor.reconcile(&self.slots, parsed.value.widgets, self);
         self.pruneLedger();
+    }
+
+    /// Keep why the registry did not load for status, naming the limit
+    /// when it was one.
+    fn noteRegistryFailure(self: *Daemon, err: anyerror) void {
+        var writer = std.Io.Writer.fixed(&self.registry_failure);
+        (switch (err) {
+            error.RegistryFull => writer.print("registry.json registers more than max_widgets={d} widgets; uninstall one, then reinstall", .{max_widgets}),
+            error.RegistrationTooLong => writer.print("a registration's name or source path is longer than the host keeps (max_name_bytes={d}, max_path_bytes={d}); reinstall it from a shorter path", .{ supervisor.max_name_bytes, max_path_bytes }),
+            error.StreamTooLong => writer.print("registry.json is larger than max_registry_bytes={d}", .{max_registry_bytes}),
+            else => writer.print("registry.json could not be loaded: {s}; widgets did not change", .{@errorName(err)}),
+        }) catch {};
+        self.registry_failure_len = writer.buffered().len;
+        note("{s}", .{self.registry_failure[0..self.registry_failure_len]});
     }
 
     /// For `supervisor.reconcile`: the widget in registry slot `index` runs.
@@ -428,7 +479,7 @@ pub const Daemon = struct {
             if (!slot.used or nameHash(slot.name()) != identity.name_hash) continue;
             self.ledger.put(slot.name(), identity.artifact, record.crash.code);
             self.writeLedger();
-            note("the previous host crashed in '{s}' (exception 0x{X:0>8}); it is quarantined", .{ slot.name(), record.crash.code });
+            note("the previous host stopped in '{s}' (code 0x{X:0>8}); it is quarantined", .{ slot.name(), record.crash.code });
             return;
         }
     }
@@ -478,7 +529,11 @@ pub const Daemon = struct {
         // A reinstall changes the artifact; the reconcile compares against this.
         slot.artifact_mtime = artifact;
         slot.state = .stopped;
-        slot.setReason("quarantined: its code crashed the widget host (exception 0x{X:0>8}); reinstall or update it to run it again", .{entry.code});
+        if (entry.code == contract.exit_wedged) {
+            slot.setReason("quarantined: its code held the widget host's UI thread past apply_timeout_ms={d}, so the host stopped itself; reinstall or update it to run it again", .{apply_timeout_ms});
+        } else {
+            slot.setReason("quarantined: its code crashed the widget host (exception 0x{X:0>8}); reinstall or update it to run it again", .{entry.code});
+        }
         return true;
     }
 
@@ -522,19 +577,58 @@ pub const Daemon = struct {
     fn supervise(self: *Daemon, now_ms: u64) void {
         self.superviseRenderer(now_ms);
         self.takeProviderFailures(now_ms);
+        // An exited dev widget's handle stays signalled until it is let go:
+        // handled first, whatever its slot's state, so no wait spins on it.
+        for (&self.slots) |*slot| {
+            if (slot.platform.dev_running and self.devExited(slot)) self.handleDevExit(slot, now_ms);
+        }
         var launch_due = false;
         for (&self.slots, 0..) |*slot, index| {
             if (!slot.used or !slot.enabled) continue;
-            const exited = slot.platform.dev_running and self.devExited(slot);
-            switch (supervisor.nextSlotAction(slot, self.sourceExists(slot.source()), self.running(index), exited, now_ms)) {
-                .none => {},
+            switch (supervisor.nextSlotAction(slot, self.sourceExists(slot.source()), self.running(index), false, now_ms)) {
+                .none, .handle_exit => {},
                 .stop_missing => self.stopSlot(slot, true),
-                .handle_exit => self.handleDevExit(slot, now_ms),
                 .launch => launch_due = true,
             }
         }
         if (launch_due) onWorker(launchDue, .{ self, now_ms }) catch |err| note("could not start a widget: {s}", .{@errorName(err)});
         self.superviseRenderer(now_ms);
+    }
+
+    /// What the management thread waits on: shutdown, reload and status
+    /// requests first (WaitForMultipleObjects reports the lowest), then a
+    /// provider failure, the renderer and each running dev widget.
+    fn waitHandles(self: *Daemon, handles: *[max_wait_handles]win.HANDLE) usize {
+        handles[0] = self.objects.shutdown;
+        handles[1] = self.objects.reload;
+        handles[2] = self.objects.status_request;
+        handles[3] = self.provider_failure;
+        var count: usize = 4;
+        if (self.renderer.platform.process) |process| {
+            handles[count] = process;
+            count += 1;
+        }
+        for (&self.slots) |*slot| {
+            if (!slot.platform.dev_running) continue;
+            handles[count] = self.options.devs.process(self.slotIndex(slot)) orelse continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Milliseconds until the next backoff restart (a widget's or the
+    /// renderer's); INFINITE when none is pending.
+    fn nextDeadlineMs(self: *const Daemon, now_ms: u64) win.DWORD {
+        var deadline: ?u64 = null;
+        for (&self.slots) |*slot| {
+            if (!slot.used or !slot.enabled or slot.state != .backoff) continue;
+            deadline = @min(deadline orelse slot.next_restart_ms, slot.next_restart_ms);
+        }
+        if (self.renderer.platform.process == null and supervisor.rendererDesired(&self.slots, self.options.force_software)) {
+            deadline = @min(deadline orelse self.renderer.next_restart_ms, self.renderer.next_restart_ms);
+        }
+        const at = deadline orelse return win.INFINITE;
+        return @intCast(@min(at -| now_ms, win.INFINITE - 1));
     }
 
     /// Start every widget whose (re)start is due. Runs on a worker: it may
@@ -611,7 +705,6 @@ pub const Daemon = struct {
     fn markSlotRunning(self: *Daemon, slot: *Slot, now_ms: u64) void {
         supervisor.markRunning(slot, now_ms, self.artifactMtime(slot.source()));
         slot.platform.costs = .{};
-        self.thread_sample_ms = 0;
     }
 
     /// Load the widget into a free host slot, through the UI thread.
@@ -666,20 +759,27 @@ pub const Daemon = struct {
 
     /// Hand `command` to the UI thread and wait until it has taken effect.
     /// A UI thread that does not get to it in `apply_timeout_ms` is stuck
-    /// (in a widget's native code, or in Native itself): the host exits, and
-    /// weaverd restarts it as it restarted a host that did not answer.
+    /// (in a widget's native code, or in Native itself): the record names
+    /// the widget whose turn holds it, if one does, and the host exits for
+    /// weaverd to restart it, as weaverd restarted a host that did not
+    /// answer. `weaver down` during the wait stops the host cleanly.
     fn apply(self: *Daemon, command: host_control.Command) !void {
         var pending: host_control.Pending = .{ .command = command };
         self.options.post(&pending);
         const deadline = win.GetTickCount64() + apply_timeout_ms;
         while (!pending.done.isSet()) {
+            if (win.WaitForSingleObject(self.objects.shutdown, 0) == win.WAIT_OBJECT_0) {
+                crash_record.markStopped();
+                exitProcess(0);
+            }
             const now = win.GetTickCount64();
             if (now >= deadline) {
-                note("the UI thread did not apply a widget {s} within {d} ms; the host is stuck and exits for weaverd to restart it", .{ @tagName(command), apply_timeout_ms });
+                note("the UI thread did not apply a widget {s} within apply_timeout_ms={d}; the host is stuck and exits for weaverd to restart it", .{ @tagName(command), apply_timeout_ms });
+                crash_record.noteWedged(contract.exit_wedged);
                 _ = win.TerminateProcess(win.GetCurrentProcess(), contract.exit_wedged);
             }
             pending.done.waitTimeout(self.options.io, .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(deadline - now)),
+                .raw = .fromMilliseconds(@intCast(@min(deadline - now, apply_poll_ms))),
                 .clock = .awake,
             } }) catch {};
         }
@@ -736,7 +836,6 @@ pub const Daemon = struct {
         self.options.devs.stop(self.slotIndex(slot), graceful) catch {};
         slot.platform.dev_running = false;
         slot.platform.pid = 0;
-        self.thread_sample_ms = 0;
     }
 
     /// A dev widget's process exited: that is its crash.
@@ -783,6 +882,7 @@ pub const Daemon = struct {
     /// `weaver down`: dev widgets close their windows, the renderer stops,
     /// and status says nothing runs. Widgets in the host go with it.
     fn stopAll(self: *Daemon) void {
+        self.stopping = true;
         for (&self.slots) |*slot| {
             if (slot.platform.dev_running) self.stopDev(slot, true);
             if (slot.platform.hosted) {
@@ -808,7 +908,6 @@ pub const Daemon = struct {
                 _ = win.GetExitCodeProcess(process.?, &exit_code);
                 _ = win.CloseHandle(process.?);
                 self.renderer.platform = .{};
-                self.thread_sample_ms = 0;
                 supervisor.recordRendererExit(&self.renderer, now_ms);
                 self.noteRendererFailure("renderer process exited: code={d}; retrying in {d}ms", .{ exit_code, self.renderer.next_restart_ms -| now_ms });
             },
@@ -825,7 +924,6 @@ pub const Daemon = struct {
         _ = win.WaitForSingleObject(process, 1000);
         _ = win.CloseHandle(process);
         self.renderer = .{};
-        self.thread_sample_ms = 0;
     }
 
     fn ensureRenderer(self: *Daemon, now_ms: u64) !void {
@@ -860,7 +958,6 @@ pub const Daemon = struct {
         self.renderer.platform = .{ .process = started.process, .pid = started.pid };
         self.renderer.platform.costs.reset(started.process, now_ms);
         self.renderer.started_ms = now_ms;
-        self.thread_sample_ms = 0;
     }
 
     fn noteRendererFailure(self: *Daemon, comptime format: []const u8, args: anytype) void {
@@ -909,14 +1006,10 @@ pub const Daemon = struct {
     }
 
     fn writeStatus(self: *Daemon, now_ms: u64) void {
-        if (self.thread_sample_ms == 0 or now_ms -| self.thread_sample_ms >= thread_sample_interval_ms) {
-            self.countThreads();
-            self.thread_sample_ms = now_ms;
-        }
         var entries: [max_widgets + 2]supervisor.StatusEntry = undefined;
         var count: usize = 0;
-        const host_cost = self.costs.averages();
-        entries[count] = .{
+        const host_cost = self.costs;
+        if (!self.stopping) entries[count] = .{
             .name = "host",
             .pid = self.pid,
             .private_mb = host_cost.private_mb,
@@ -925,12 +1018,12 @@ pub const Daemon = struct {
             .backend = "-",
             .uptime_seconds = (now_ms -| self.started_ms) / 1000,
             .state = .running,
-            .reason = "",
+            .reason = self.registry_failure[0..self.registry_failure_len],
             .host_row = true,
         };
-        count += 1;
+        count += @intFromBool(!self.stopping);
         if (self.renderer.platform.process != null) {
-            const cost = self.renderer.platform.costs.averages();
+            const cost = self.renderer.platform.costs;
             entries[count] = .{
                 .name = "renderer",
                 .pid = self.renderer.platform.pid,
@@ -964,7 +1057,7 @@ pub const Daemon = struct {
                 self.renderer_failure_reason[0..self.renderer_failure_reason_len]
             else
                 "";
-            const cost = slot.platform.costs.averages();
+            const cost = slot.platform.costs;
             entries[count] = .{
                 .name = slot.name(),
                 .pid = slot.platform.pid,
@@ -1053,6 +1146,13 @@ fn nameHash(name: []const u8) u64 {
 /// who starts it by hand sees them.
 fn note(comptime format: []const u8, args: anytype) void {
     std.debug.print("weaver-widget --host: " ++ format ++ "\n", args);
+}
+
+/// End this process with `code`: a u32, which std.process.exit (a u8)
+/// cannot carry (contract.exit_already_running).
+pub fn exitProcess(code: u32) noreturn {
+    win.ExitProcess(code);
+    unreachable;
 }
 
 /// Put the renderer pipe in this process's environment, where Native's

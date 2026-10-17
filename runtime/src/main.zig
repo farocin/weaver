@@ -166,8 +166,6 @@ var control_environment: ?HostEnvironment = null;
 /// The anchored host's own providers: every widget it runs subscribes to
 /// them in process, and its dev widgets through their pipes. Windows only.
 var host_providers: if (builtin.os.tag == .windows) ?*provider_service.Service else ?*anyopaque = null;
-/// The anchored host's dev widgets and renderer, in its job (`dev_widgets`).
-var dev_widgets: if (builtin.os.tag == .windows) ?*dev_widgets_mod.DevWidgets else ?*anyopaque = null;
 
 /// The first slot that renders in a declared window.
 fn firstDeclaredSlot() u16 {
@@ -1882,8 +1880,10 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
 
-    if (builtin.os.tag == .windows and anchored_host) try startDaemon(init, environment);
+    // A startup error returned from here is a clean stop, not a crash: its
+    // record says `stopped`, and weaverd does not restart it (ADR 0022).
     defer crash_record.markStopped();
+    if (builtin.os.tag == .windows and anchored_host) try startDaemon(init, environment);
 
     var loader: Loader = .{ .environment = environment, .directories = directories };
     const widgets = try loader.run();
@@ -2026,7 +2026,7 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment) !void {
     const objects = daemon_mod.Objects.claim() catch |err| switch (err) {
         error.AlreadyRunning => {
             std.debug.print("weaver-widget --host: another widget host is already running for this user; this one exits\n", .{});
-            std.process.exit(@intCast(host_contract.exit_already_running));
+            daemon_mod.exitProcess(host_contract.exit_already_running);
         },
         else => return err,
     };
@@ -2050,7 +2050,6 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment) !void {
     host_providers = service;
     const devs = try allocator.create(dev_widgets_mod.DevWidgets);
     devs.* = try .init(service, init.environ_map, .{ .renderer_pipe = renderer_pipe_name, .art_cache = art_cache_root });
-    dev_widgets = devs;
     control_environment = environment;
     daemon = try daemon_mod.Daemon.create(.{
         .io = init.io,

@@ -242,6 +242,9 @@ pub fn ServiceType(comptime Sources: type) type {
         stopping: bool = false,
         status: Status = .{},
         failures: Failures = .{},
+        /// Set when a channel fails, so the daemon wakes to restart that
+        /// widget instead of polling `takeFailures`.
+        failure_signal: ?win.HANDLE = null,
         lanes: [max_command_lanes]?*CommandLane = @splat(null),
 
         const Worker = struct {
@@ -385,6 +388,13 @@ pub fn ServiceType(comptime Sources: type) type {
             self.acquire();
             defer self.release();
             return self.status;
+        }
+
+        /// Signal `event` whenever a channel fails from now on.
+        pub fn setFailureSignal(self: *Self, event: win.HANDLE) void {
+            self.acquire();
+            defer self.release();
+            self.failure_signal = event;
         }
 
         /// The channels that failed since the last call.
@@ -535,6 +545,7 @@ pub fn ServiceType(comptime Sources: type) type {
                 .hosted => self.failures.hosted |= subscriber.owner.bit(),
                 .dev => self.failures.dev |= subscriber.owner.bit(),
             }
+            if (self.failure_signal) |event| _ = win.SetEvent(event);
             subscriber.notify(subscriber.context, .failed);
         }
 

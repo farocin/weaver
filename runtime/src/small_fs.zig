@@ -11,9 +11,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 
-/// Longest path these helpers take, in UTF-16 units: the widget data and
-/// log paths are a few hundred characters at most.
-const max_path_units: usize = 2048;
+/// Longest path these helpers take, in UTF-16 units. The longest the
+/// daemon builds is a registered source (at most supervisor.max_path_bytes,
+/// 2048 UTF-8 bytes, so at most 2048 units) plus `\dist\widget.json`;
+/// 64 more covers that and the `\\?\` prefix. Widget data and log paths
+/// are a few hundred characters.
+const max_path_units: usize = 2048 + 64;
 const WidePath = [max_path_units + 8:0]u16;
 
 const DWORD = u32;

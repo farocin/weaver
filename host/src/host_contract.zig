@@ -8,8 +8,11 @@ const std = @import("std");
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
-/// Held by the running host for its whole life: `weaver status` and `up`
-/// probe it (`weaverd --probe`), and a second host exits when it exists.
+/// Owned by the running host for its whole life: a second host that cannot
+/// take it exits. `weaver status` and `up` probe that it exists
+/// (`weaverd --probe`); weaverd holds a handle to it, and to the events
+/// below, across a restart, so they keep reaching weaverd while no host
+/// runs.
 pub const singleton_mutex = L("Local\\WeaverHostSingletonV2");
 /// Manual reset: `weaver down` sets it, and the host stops.
 pub const shutdown_event = L("Local\\WeaverHostShutdownV2");
@@ -24,14 +27,27 @@ pub const reload_success_event = L("Local\\WeaverHostReloadSuccessV2");
 /// Manual reset: the registry could not be read; nothing changed. Its
 /// existence is also how the CLI tells the host can acknowledge reloads.
 pub const reload_failure_event = L("Local\\WeaverHostReloadFailureV2");
+/// Auto reset: the CLI wants status.json current (`weaverd
+/// --request-status`). The host samples costs, writes it, and sets the
+/// manual-reset event below. The host also writes it whenever something
+/// changes, and otherwise not at all.
+pub const status_request_event = L("Local\\WeaverHostStatusRequestV2");
+pub const status_written_event = L("Local\\WeaverHostStatusWrittenV2");
 
-/// The host exited because another host already runs: `weaverd` stops
-/// rather than restart it. Every other non-zero exit is a crash.
-pub const exit_already_running: u32 = 3;
+/// Exit and crash codes the host itself sets, in the customer range of
+/// NTSTATUS so none collides with a real exception code, a Zig abort (3)
+/// or a C exit. weaverd reads the host's record before any exit code.
+///
+/// A Zig panic, as the crash record names it (crash_record.notePanic).
+pub const panic_code: u32 = 0xE057_0001;
+/// The host exited because another host already owns the singleton:
+/// weaverd stops rather than restart it.
+pub const exit_already_running: u32 = 0xE057_0002;
 /// The host's UI thread did not apply a widget's load or unload within the
-/// management thread's deadline, and the host stopped itself so `weaverd`
-/// restarts it, as `weaverd` stopped a host that did not answer.
-pub const exit_wedged: u32 = 4;
+/// management thread's deadline, and the host stopped itself so weaverd
+/// restarts it, as weaverd stopped a host that did not answer. The record
+/// names the widget whose turn held the UI thread, if one did.
+pub const exit_wedged: u32 = 0xE057_0003;
 
 /// Set by `weaverd` when it restarts a host after a crash it could not
 /// attribute to one widget: how many such crashes happened within
