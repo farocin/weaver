@@ -1177,6 +1177,35 @@ fn buildNode(ui: *WidgetUi, model: *Model, id: tree_mod.NodeId, is_root: bool) W
         noteProjectionFailure(model, "widget retained-node projection failed: node={d}, cause={s}", .{ id, @errorName(err) });
         return projectionFailurePanel(ui, is_root);
     };
+    // Leaves drop their retained children; building them anyway would only
+    // spend stack (and, deep enough, overflow it) for nodes nobody draws.
+    const child_count: usize = if (emitsChildren(retained.kind)) retained.child_count else 0;
+    const children = ui.arena.alloc(WidgetUi.Node, child_count) catch |err| {
+        noteProjectionFailure(
+            model,
+            "widget child projection capacity exhausted: node={d}, asked for {d}, cause={s}",
+            .{ id, retained.child_count, @errorName(err) },
+        );
+        return projectionFailurePanel(ui, is_root);
+    };
+    for (retained.children[0..child_count], 0..) |child_id, index| {
+        children[index] = buildNode(ui, model, child_id, false);
+    }
+    return buildElement(ui, model, id, retained, is_root, children);
+}
+
+// One node from its already-built children. noinline so the recursion in
+// buildNode stays small: each element kind's options and Node temporaries
+// (~68 KiB together) live here, in a frame that returns before the next
+// sibling recurses, instead of in every level of the tree.
+noinline fn buildElement(
+    ui: *WidgetUi,
+    model: *Model,
+    id: tree_mod.NodeId,
+    retained: *const tree_mod.Node,
+    is_root: bool,
+    children: []WidgetUi.Node,
+) WidgetUi.Node {
     var options: WidgetUi.ElementOptions = .{
         .global_key = .{ .int = id },
         // Every widget drags by its whole surface: the root is one OS
@@ -1291,20 +1320,6 @@ fn buildNode(ui: *WidgetUi, model: *Model, id: tree_mod.NodeId, is_root: bool) W
             .scale = retained.font_scale,
         }};
         return attachEffects(ui, model, retained, resolveFontId(model, retained), ui.paragraph(options, &span));
-    }
-    // Leaves drop their retained children; building them anyway would only
-    // spend stack (and, deep enough, overflow it) for nodes nobody draws.
-    const child_count: usize = if (emitsChildren(retained.kind)) retained.child_count else 0;
-    const children = ui.arena.alloc(WidgetUi.Node, child_count) catch |err| {
-        noteProjectionFailure(
-            model,
-            "widget child projection capacity exhausted: node={d}, asked for {d}, cause={s}",
-            .{ id, retained.child_count, @errorName(err) },
-        );
-        return projectionFailurePanel(ui, is_root);
-    };
-    for (retained.children[0..child_count], 0..) |child_id, index| {
-        children[index] = buildNode(ui, model, child_id, false);
     }
     const result = switch (retained.kind) {
         // SDK layout-only rows/columns/stacks do not paint their own style.
