@@ -580,12 +580,12 @@ fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
     // candidate on the heap prevents ReleaseFast from folding it into the
     // update callback's stack frame, where it would consume most of
     // QuickJS's recorded C-stack allowance.
-    const candidate_tree = try std.heap.page_allocator.create(tree_mod.Tree);
+    const candidate_tree = try native_sdk.lazy_commit.create(tree_mod.Tree);
     tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
     var candidate_tree_moved = false;
     defer {
         if (!candidate_tree_moved) candidate_tree.deinit();
-        std.heap.page_allocator.destroy(candidate_tree);
+        native_sdk.lazy_commit.destroy(candidate_tree);
     }
     var preserved = snapshot != null;
     const candidate = evaluateCandidate(model, candidate_tree, source, snapshot) catch |err| switch (err) {
@@ -1708,9 +1708,11 @@ fn nativeWindowLayers(manifest_layer: []const u8) NativeWindowLayers {
 /// A widget's Model, allocated and set one field at a time: `.{}` would copy
 /// the whole default image (4.3 MB, almost all of it the retained tree's
 /// node and canvas arenas) and make it resident before the tree uses a slot.
-/// The tree starts through `resetEmpty`, which leaves the arenas untouched.
+/// The tree starts through `resetEmpty`, which leaves the arenas untouched,
+/// and the Model is committed as it is touched (native_sdk.lazy_commit), so
+/// those arenas cost nothing until the tree uses them.
 fn createModel() !*Model {
-    const model = try std.heap.page_allocator.create(Model);
+    const model = try native_sdk.lazy_commit.create(Model);
     inline for (std.meta.fields(Model)) |field| {
         if (comptime std.mem.eql(u8, field.name, "tree")) {
             tree_mod.resetEmpty(&model.tree, std.heap.page_allocator);
@@ -1926,7 +1928,8 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     }};
     var tokens = native_sdk.canvas.DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark });
     tokens.colors.background = native_sdk.canvas.Color.rgba8(0, 0, 0, 0);
-    const app_state = try std.heap.page_allocator.create(HostApp);
+    // Committed as it is touched: most of its frame scratch never is.
+    const app_state = try native_sdk.lazy_commit.create(HostApp);
     HostApp.initInPlace(app_state, std.heap.page_allocator, .{
         .name = primary.name,
         .scene = .{ .windows = &shell_windows },
@@ -2271,7 +2274,7 @@ fn unloadWidget(model: *Model) void {
 /// Free an unloaded widget's Model and everything its load allocated.
 fn freeModel(model: *Model) void {
     if (model.arena) |*arena| arena.deinit();
-    std.heap.page_allocator.destroy(model);
+    native_sdk.lazy_commit.destroy(model);
 }
 
 /// Carry out the daemon's waiting command, if there is one. Runs on the
@@ -3091,7 +3094,7 @@ test "dev reload crosses requestFrame into the frame-requested hook exactly once
     const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{});
     defer harness.destroy(std.testing.allocator);
     const model = try createModel();
-    defer std.heap.page_allocator.destroy(model);
+    defer native_sdk.lazy_commit.destroy(model);
     var app_state: TestApp = .{ .host = .{} };
     app_state.host.widgets[0] = model;
     const app = app_state.app();
@@ -3354,7 +3357,7 @@ test "a widget whose new faces do not all fit takes no font ids" {
     content_font_count = content_fonts.len - 1;
     for (content_fonts[0..content_font_count], 0..) |*font, index| font.* = .{ .hash = index, .len = 0, .id = native_sdk.canvas.min_registered_font_id + index };
     const model = try createModel();
-    defer std.heap.page_allocator.destroy(model);
+    defer native_sdk.lazy_commit.destroy(model);
     var two = [_]HostApp.FontRegistration{ .{ .id = 0, .name = "a", .ttf = "face a" }, .{ .id = 0, .name = "b", .ttf = "face b" } };
     model.font_registrations = &two;
     try std.testing.expectError(error.FontRegistryFull, assignFontIds(model));
@@ -3608,4 +3611,40 @@ test "retained image projects fit tiling and class corner radii" {
     try std.testing.expect(projected.widget.image_tile);
     try std.testing.expectEqual(@as(?f32, 12), projected.widget.style.radius);
     try std.testing.expectEqual(@as(?f32, 3), projected.widget.cornerRadii().top_right);
+}
+
+test "a widget's Model is committed as it is touched" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const before = testPrivateBytes();
+    const model = try createModel();
+    defer native_sdk.lazy_commit.destroy(model);
+    // 4.3 MB of node and canvas capacity; a fresh Model touches its fields only.
+    try std.testing.expect(@sizeOf(Model) > 4 * 1024 * 1024);
+    try std.testing.expect(testPrivateBytes() -| before < 1024 * 1024);
+}
+
+/// This process's commit charge (private bytes): what a test pins a
+/// structure's commit against.
+fn testPrivateBytes() usize {
+    const Counters = extern struct {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    };
+    const api = struct {
+        extern "kernel32" fn K32GetProcessMemoryInfo(process: std.os.windows.HANDLE, counters: *Counters, size: u32) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
+    };
+    var counters = std.mem.zeroes(Counters);
+    counters.cb = @sizeOf(Counters);
+    _ = api.K32GetProcessMemoryInfo(api.GetCurrentProcess(), &counters, counters.cb);
+    return counters.private_usage;
 }
