@@ -1,6 +1,8 @@
 const std = @import("std");
-const backoff = @import("backoff.zig");
-const registry = @import("registry.zig");
+/// Re-exported for the Windows widget host, which compiles this file as a
+/// module of its own (runtime/build.zig `host_supervisor`).
+pub const backoff = @import("backoff.zig");
+pub const registry = @import("registry.zig");
 
 pub const max_widgets: usize = 32;
 pub const max_name_bytes: usize = 256;

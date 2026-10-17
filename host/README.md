@@ -1,14 +1,20 @@
 # weaverd
 
-`weaverd` is intentionally a standalone native process, not a Native SDK
+On macOS, `weaverd` is a standalone native process, not a Native SDK
 application. It owns singleton acquisition, registration reconciliation,
-crash/backoff supervision, process cost sampling, and acknowledged
-reload/shutdown; on macOS also provider lifetime/fan-out. On Windows the
-widget host runs the providers on threads of its own and launches `--dev`
-widgets in its job (ADR 0022 step 3, runtime/src/provider_service.zig and
-dev_widgets.zig); weaverd asks it for their counters. Constructing the Widget renderer and
-QuickJS in the one always-running process would spend memory without buying a
-host capability.
+crash/backoff supervision, process cost sampling, acknowledged
+reload/shutdown, and provider lifetime/fan-out.
+
+Windows has no `weaverd` (ADR 0022). The widget host is the daemon
+(runtime/src/daemon.zig): it owns the singleton and the control objects, the
+registry, status, the crash ledger, the providers, `--dev` widgets and the
+shared renderer, the last two in a job only it holds. It asks Windows to
+restart it after a crash, up to a cap. The CLI starts, stops and asks after
+it through client verbs of the same executable (`weaver-widget --up`,
+`--down`, `--status`, `--reload`, `--probe`; runtime/src/host_lifecycle.zig).
+The registry slots, backoff and status format stay in src/supervisor.zig,
+which both platforms compile; src/host_contract.zig holds what the Windows
+host and its client agree on.
 
 The macOS host reads the shared renderer's wire contract from the pinned
 Native SDK submodule. Initialize it with `git submodule update --init
@@ -37,21 +43,14 @@ their state and use the Native SDK's reconnect behavior; this launch gate does
 not promote a widget that already selected software during a renderer outage
 or a later packet/presentation refusal.
 
-On Windows, build with the repository's Zig toolchain and an installed Windows
-10 SDK:
-
-```powershell
-zig build -Doptimize=ReleaseFast
-zig build test -Doptimize=ReleaseFast
-```
-
-The runtime's build (runtime/build.zig) discovers the SDK and compiles the
-Windows providers here with its C++/WinRT projection plus `windowsapp.lib`;
-no package-manager C++ dependency is required. weaverd itself no longer
-links them. The
-TypeScript CLI remains the sole Widget checker/bundler on both platforms. The
-host invokes it only when `widget.tsx` is newer than `dist/bundle.js` or the
-dist manifest is missing.
+On Windows nothing here is built on its own: the runtime's build
+(runtime/build.zig) compiles the supervisor, the contract and the Windows
+providers from this package, the providers with its C++/WinRT projection plus
+`windowsapp.lib` from an installed Windows 10 SDK. No package-manager C++
+dependency is required. `zig build test` here runs the supervisor and
+contract tests on their own. The TypeScript CLI remains the sole Widget checker/bundler on both
+platforms. The host invokes it only when `widget.tsx` is newer than
+`dist/bundle.js` or the dist manifest is missing.
 
 Persistent state lives at `%LOCALAPPDATA%\weaver` on Windows and
 `~/Library/Application Support/Weaver` on macOS. macOS logs live at
