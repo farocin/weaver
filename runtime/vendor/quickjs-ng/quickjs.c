@@ -2149,8 +2149,22 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 }
 
 /* return 0 if OK, < 0 if exception */
+static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv,
+                          bool tagged, uintptr_t tag);
+
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                   int argc, JSValueConst *argv)
+{
+    return js_enqueue_job(ctx, job_func, argc, argv, false, 0);
+}
+
+/* Weaver: queue a job under an explicit tag (JS_SetJobTagFunc), e.g. a
+   FinalizationRegistry cleanup under the program that made the registry,
+   whichever program's turn the collection ran in. */
+static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv,
+                          bool tagged, uintptr_t tag)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2175,7 +2189,7 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
         }
     }
     e->ctx = ctx;
-    e->tag = rt->job_tag ? rt->job_tag(ctx) : 0;
+    e->tag = tagged ? tag : (rt->job_tag ? rt->job_tag(ctx) : 0);
     e->job_func = job_func;
     e->argc = argc;
     for(i = 0; i < argc; i++) {
@@ -2191,25 +2205,43 @@ void JS_SetChargeJobFunc(JSRuntime *rt, JSChargeJobFunc *func)
     rt->charge_job = func;
 }
 
-/* Weaver: exchange the context's global object and global lexical scope
-   with '*global' and '*lexical'; each reference moves to the other side.
-   Several programs can then share one realm's built-ins, each running
-   with globals of its own while its pair is in the context. The last
-   error's backtrace is the outgoing program's: it goes, so it is neither
-   kept in that program's memory nor seen by the next. */
-void JS_SwapGlobals(JSContext *ctx, JSValue *global, JSValue *lexical)
+/* Weaver: exchange the context's per-program state with '*state'; each
+   reference moves to the other side. Several programs can then share one
+   realm's built-ins, each running with globals, Error stack settings
+   (prepareStackTrace, stackTraceLimit) and Math.random state of its own
+   while its state is in the context. The last error's backtrace is the
+   outgoing program's: it goes, so it is neither kept in that program's
+   memory nor seen by the next. */
+void JS_SwapProgramState(JSContext *ctx, JSProgramState *state)
 {
     JSValue held;
+    uint64_t random_state;
 
     JS_FreeValue(ctx, ctx->error_back_trace);
     ctx->error_back_trace = JS_UNDEFINED;
 
     held = ctx->global_obj;
-    ctx->global_obj = *global;
-    *global = held;
+    ctx->global_obj = state->global;
+    state->global = held;
     held = ctx->global_var_obj;
-    ctx->global_var_obj = *lexical;
-    *lexical = held;
+    ctx->global_var_obj = state->lexical;
+    state->lexical = held;
+    held = ctx->error_prepare_stack;
+    ctx->error_prepare_stack = state->prepare_stack;
+    state->prepare_stack = held;
+    held = ctx->error_stack_trace_limit;
+    ctx->error_stack_trace_limit = state->stack_trace_limit;
+    state->stack_trace_limit = held;
+    random_state = ctx->random_state;
+    ctx->random_state = state->random_state;
+    state->random_state = random_state;
+}
+
+/* Weaver: how many classes the runtime has registered, for walking every
+   class prototype (JS_GetClassProto). */
+uint32_t JS_GetRuntimeClassCount(JSRuntime *rt)
+{
+    return rt->class_count;
 }
 
 void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func)
@@ -61857,12 +61889,16 @@ typedef struct JSFinRecEntry {
     JSValue token;
     JSValue cb;
     JSContext *ctx;
+    /* Weaver: the job tag of the program that made the registry. */
+    uintptr_t tag;
 } JSFinRecEntry;
 
 typedef struct JSFinalizationRegistryData {
     struct list_head entries;
     JSContext *ctx;
     JSValue cb;
+    /* Weaver: the job tag of the program that made it (JS_SetJobTagFunc). */
+    uintptr_t tag;
 } JSFinalizationRegistryData;
 
 static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
@@ -61948,6 +61984,7 @@ static JSValue js_finrec_constructor(JSContext *ctx, JSValueConst new_target,
     init_list_head(&frd->entries);
     frd->ctx = ctx;
     frd->cb = js_dup(cb);
+    frd->tag = ctx->rt->job_tag ? ctx->rt->job_tag(ctx) : 0;
     JS_SetOpaqueInternal(obj, frd);
     return obj;
 }
@@ -61983,6 +62020,7 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
     }
     fre->cb = js_dup(frd->cb);
     fre->ctx = JS_DupContext(frd->ctx);
+    fre->tag = frd->tag;
     fre->target = target;
     fre->held_val = js_dup(held_val);
     fre->token = js_dup(token);
@@ -62146,7 +62184,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
                 JSValueConst args[2];
                 args[0] = fre->cb;
                 args[1] = fre->held_val;
-                JS_EnqueueJob(fre->ctx, js_finrec_job, 2, args);
+                js_enqueue_job(fre->ctx, js_finrec_job, 2, args, true, fre->tag);
             }
             js_finrec_free(rt, fre);
             break;

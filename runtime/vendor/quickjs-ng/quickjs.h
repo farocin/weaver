@@ -1205,8 +1205,16 @@ JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 /* Weaver additions: each context queues its own jobs; see VENDOR.md. */
 JS_EXTERN bool JS_IsContextJobPending(JSContext *ctx);
 JS_EXTERN int JS_ExecuteContextJob(JSContext *ctx);
-/* Weaver: per-program globals in one shared realm (see VENDOR.md). */
-JS_EXTERN void JS_SwapGlobals(JSContext *ctx, JSValue *global, JSValue *lexical);
+/* Weaver: per-program state in one shared realm (see VENDOR.md). */
+typedef struct JSProgramState {
+    JSValue global;
+    JSValue lexical;
+    JSValue prepare_stack;
+    JSValue stack_trace_limit;
+    uint64_t random_state;
+} JSProgramState;
+JS_EXTERN void JS_SwapProgramState(JSContext *ctx, JSProgramState *state);
+JS_EXTERN uint32_t JS_GetRuntimeClassCount(JSRuntime *rt);
 /* Weaver: jobs tagged by who queued them (see VENDOR.md). */
 typedef uintptr_t JSJobTagFunc(JSContext *ctx);
 JS_EXTERN void JS_SetJobTagFunc(JSRuntime *rt, JSJobTagFunc *func);

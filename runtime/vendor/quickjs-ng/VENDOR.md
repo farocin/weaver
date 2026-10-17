@@ -20,19 +20,27 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   `JS_ExecutePendingJob` scan contexts in creation order. A context marks
   its queued jobs for the collector and frees them with itself, so a
   dropped context's jobs never outlive it.
-- `JS_SwapGlobals(ctx, &global, &lexical)` (`quickjs.h`): exchanges the
-  context's global object and global lexical scope (top-level `let`,
-  `const`, `class`) with the caller's pair. QuickJS reads both from the
-  context each time a global name is looked up, declared or assigned, so a
-  program whose pair is in the context sees its own globals, and the shared
-  realm's built-ins through its global object's prototype. Used by
-  Weaver's shared realm: each widget's turn swaps its pair in.
+- `JS_SwapProgramState(ctx, &state)` (`quickjs.h`): exchanges the
+  context's per-program state with the caller's `JSProgramState`: the
+  global object and global lexical scope (top-level `let`, `const`,
+  `class`), the Error stack settings (`Error.prepareStackTrace`,
+  `Error.stackTraceLimit`, which built-in setters store on the context) and
+  the `Math.random` state. QuickJS reads all of them from the context when
+  used, so a program whose state is in the context sees its own, and the
+  shared realm's built-ins through its global object's prototype. It also
+  drops the context's last-error backtrace, which belongs to the outgoing
+  program. Used by Weaver's shared realm: each widget's turn swaps its
+  state in. `JS_GetRuntimeClassCount(rt)` lets the embedder walk every
+  class prototype (`JS_GetClassProto`), hidden ones included, to freeze
+  them.
 - `JS_SetJobTagFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` tags each job
   with `func(ctx)`. `JS_ExecuteTaggedJob(ctx, tag)`,
   `JS_IsTaggedJobPending(ctx, tag)` and `JS_FreeTaggedJobs(ctx, tag)` run,
   check and drop only one tag's jobs, so widgets sharing one context (the
   shared realm) each run, and are charged for, only the jobs they queued,
-  and a widget's queued jobs go with it.
+  and a widget's queued jobs go with it. A FinalizationRegistry keeps the
+  tag of the program that made it, and its cleanup jobs are queued under
+  that tag, not the tag of whichever program's turn ran the collection.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
   around allocating a job, so a garbage collection in one widget's turn
   charges another widget's queued cleanup job to that widget's heap.

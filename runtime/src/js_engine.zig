@@ -78,16 +78,22 @@ var shared: ?Shared = null;
 /// promise jobs (`jobTag`). Set before the first engine is created.
 pub var shared_realm_enabled = false;
 
-/// Freezes every built-in reachable from the global object (and the hidden
-/// ones reachable only through syntax), after making the handful of
-/// prototype properties programs routinely shadow by assignment
-/// (`this.name = ...` in an Error subclass) assignable on instances.
+/// Freezes every built-in of the shared realm: everything reachable from
+/// the global object, from the prototypes reached only through syntax, and
+/// from every class prototype the runtime has registered (`class_protos`,
+/// passed in from Zig: iterator helpers, CallSite and other hidden ones),
+/// after making the few prototype properties programs routinely shadow by
+/// assignment (`this.name = ...` in an Error subclass) assignable on
+/// instances. The walk runs after taming and includes each tamed original,
+/// which only its accessors' closures still reach.
 const lockdown_source =
-    \\(() => {
+    \\((class_protos) => {
+    \\  const originals = [];
     \\  const tame = (proto, key) => {
     \\    const d = Object.getOwnPropertyDescriptor(proto, key);
     \\    if (!d || !("value" in d)) return;
     \\    const value = d.value;
+    \\    originals.push(value);
     \\    Object.defineProperty(proto, key, {
     \\      get() { return value; },
     \\      set(next) {
@@ -98,13 +104,11 @@ const lockdown_source =
     \\      configurable: false,
     \\    });
     \\  };
-    \\  for (const key of ["constructor", "toString", "valueOf", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString"]) tame(Object.prototype, key);
+    \\  for (const key of ["constructor", "toString", "valueOf"]) tame(Object.prototype, key);
     \\  for (const E of [Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError, AggregateError]) {
     \\    for (const key of ["constructor", "name", "message", "toString"]) tame(E.prototype, key);
     \\  }
-    \\  for (const key of ["constructor", "toString", "name"]) tame(Function.prototype, key);
-    \\  for (const key of ["constructor", "toString", "push"]) tame(Array.prototype, key);
-    \\  for (const key of ["then", "catch", "finally", "constructor"]) tame(Promise.prototype, key);
+    \\  for (const key of ["constructor", "toString"]) tame(Function.prototype, key);
     \\  const roots = [
     \\    globalThis,
     \\    Object.getPrototypeOf(function* () {}),
@@ -117,6 +121,8 @@ const lockdown_source =
     \\    Object.getPrototypeOf(/x/[Symbol.matchAll]("")),
     \\    Object.getPrototypeOf((function* () {})()),
     \\    Object.getPrototypeOf((async function* () {})()),
+    \\    ...class_protos,
+    \\    ...originals,
     \\  ];
     \\  const seen = new Set();
     \\  const queue = roots.slice();
@@ -131,8 +137,35 @@ const lockdown_source =
     \\    queue.push(Object.getPrototypeOf(value));
     \\  }
     \\  for (const value of seen) Object.freeze(value);
-    \\})();
+    \\})
 ;
+
+/// Run the lockdown on a newly built shared realm, handing it every class
+/// prototype the runtime has registered.
+fn lockDown(realm: *c.JSContext) bool {
+    const lockdown = c.JS_Eval(realm, lockdown_source.ptr, lockdown_source.len, "lockdown.js", c.JS_EVAL_TYPE_GLOBAL);
+    defer c.JS_FreeValue(realm, lockdown);
+    if (c.JS_IsException(lockdown)) return false;
+    const class_protos = c.JS_NewArray(realm);
+    defer c.JS_FreeValue(realm, class_protos);
+    if (c.JS_IsException(class_protos)) return false;
+    var count: u32 = 0;
+    var class_id: u32 = 1;
+    while (class_id < c.JS_GetRuntimeClassCount(c.JS_GetRuntime(realm))) : (class_id += 1) {
+        const proto = c.JS_GetClassProto(realm, class_id);
+        if (!c.JS_IsObject(proto)) {
+            c.JS_FreeValue(realm, proto);
+            continue;
+        }
+        if (c.JS_SetPropertyUint32(realm, class_protos, count, proto) < 0) return false;
+        count += 1;
+    }
+    var arguments = [_]c.JSValue{class_protos};
+    const result = c.JS_Call(realm, lockdown, qjs.undefinedValue(), arguments.len, &arguments);
+    defer c.JS_FreeValue(realm, result);
+    return !c.JS_IsException(result);
+}
+
 /// The engine whose turn is running: the interrupt budget is its.
 var executing_engine: ?*Engine = null;
 
@@ -226,9 +259,7 @@ fn acquireShared() !*Shared {
                 shared = null;
                 return error.OutOfMemory;
             };
-            const locked = c.JS_Eval(realm, lockdown_source.ptr, lockdown_source.len, "lockdown.js", c.JS_EVAL_TYPE_GLOBAL);
-            defer c.JS_FreeValue(realm, locked);
-            if (c.JS_IsException(locked)) {
+            if (!lockDown(realm)) {
                 logExceptionFrom(realm, true);
                 c.JS_FreeContext(realm);
                 c.JS_FreeRuntime(runtime);
@@ -321,14 +352,17 @@ fn releaseShared(owner: js_heap.Owner) void {
 /// A single-widget QuickJS realm in the shared runtime. It runs only when the
 /// Native SDK main loop enters `fireTimer`; no JS thread, OS timer, or hidden
 /// render loop exists.
-/// A widget's own globals in the shared realm (`Engine.globals`).
+/// A widget's own state in the shared realm (`Engine.globals`): its global
+/// object and global lexical scope, its Error stack settings and its
+/// Math.random state (`JS_SwapProgramState`).
 const Globals = struct {
-    global: c.JSValue,
-    lexical: c.JSValue,
+    state: c.JSProgramState,
 
     fn deinit(self: *Globals, context: *c.JSContext) void {
-        c.JS_FreeValue(context, self.global);
-        c.JS_FreeValue(context, self.lexical);
+        c.JS_FreeValue(context, self.state.global);
+        c.JS_FreeValue(context, self.state.lexical);
+        c.JS_FreeValue(context, self.state.prepare_stack);
+        c.JS_FreeValue(context, self.state.stack_trace_limit);
     }
 };
 
@@ -398,7 +432,21 @@ pub const Engine = struct {
             if (c.JS_DefinePropertyValueStr(context, global, "globalThis", c.JS_DupValue(context, global), c.JS_PROP_WRITABLE | c.JS_PROP_CONFIGURABLE) < 0) return error.OutOfMemory;
             const lexical = c.JS_NewObjectProto(context, qjs.nullValue());
             if (c.JS_IsException(lexical)) return error.OutOfMemory;
-            break :globals .{ .global = global, .lexical = lexical };
+            // A seed of its own: Math.random's state otherwise lets one
+            // widget predict another's numbers. Never zero (xorshift).
+            var seed: u64 = 0;
+            while (seed == 0) {
+                var bytes: [8]u8 = undefined;
+                std.Io.Threaded.global_single_threaded.io().random(&bytes);
+                seed = std.mem.readInt(u64, &bytes, .little);
+            }
+            break :globals .{ .state = .{
+                .global = global,
+                .lexical = lexical,
+                .prepare_stack = qjs.undefinedValue(),
+                .stack_trace_limit = c.JS_NewInt32(context, 10),
+                .random_state = seed,
+            } };
         } else null;
         errdefer if (globals) |*pair| pair.deinit(context);
         errdefer if (c.JS_HasException(context)) c.JS_FreeValue(context, c.JS_GetException(context));
@@ -758,7 +806,7 @@ pub const Engine = struct {
     /// to do (its own realm, or already in): only a true caller leaves.
     fn enterRealm(self: *Engine) bool {
         if (self.globals == null or self.in_realm) return false;
-        c.JS_SwapGlobals(self.context, &self.globals.?.global, &self.globals.?.lexical);
+        c.JS_SwapProgramState(self.context, &self.globals.?.state);
         c.JS_SetContextOpaque(self.context, &self.bridge_state);
         self.in_realm = true;
         return true;
@@ -766,7 +814,7 @@ pub const Engine = struct {
 
     fn leaveRealm(self: *Engine) void {
         if (!self.in_realm) return;
-        c.JS_SwapGlobals(self.context, &self.globals.?.global, &self.globals.?.lexical);
+        c.JS_SwapProgramState(self.context, &self.globals.?.state);
         c.JS_SetContextOpaque(self.context, null);
         self.in_realm = false;
     }
@@ -1354,6 +1402,229 @@ test "in the shared realm a widget's promise jobs run only in its turns and go w
     owner.destroy(std.testing.allocator);
     try std.testing.expect(!c.JS_IsTaggedJobPending(bystander.context, tag));
     try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(range));
+}
+
+test "in the shared realm a widget cannot leave anything on a built-in for another to find" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const first = try widgets.engine(0);
+    defer first.destroy(std.testing.allocator);
+    const second = try widgets.engine(1);
+    defer second.destroy(std.testing.allocator);
+    // Every built-in object is frozen, the ones only syntax or an engine
+    // class reaches and the originals behind the assignable prototype
+    // properties among them: nothing one widget puts there is anything
+    // another can read.
+    try first.evaluate(
+        \\"use strict";
+        \\const original = (proto, key) => Object.getOwnPropertyDescriptor(proto, key).get();
+        \\const accessor = (proto, key) => Object.getOwnPropertyDescriptor(proto, key);
+        \\Error.prepareStackTrace = (_, sites) => sites;
+        \\const callSite = Object.getPrototypeOf(new Error().stack[0]);
+        \\Error.prepareStackTrace = undefined;
+        \\const reached = [
+        \\  Array.prototype.push,
+        \\  Promise.prototype.then,
+        \\  original(Object.prototype, "toString"),
+        \\  original(Error.prototype, "toString"),
+        \\  original(Function.prototype, "toString"),
+        \\  accessor(Error.prototype, "name").get,
+        \\  accessor(Error.prototype, "name").set,
+        \\  Object.getPrototypeOf([1].values().map((x) => x)),
+        \\  Object.getPrototypeOf(Iterator.from({ next() { return { done: true }; } })),
+        \\  Object.getPrototypeOf(Iterator.concat([1], [2])),
+        \\  callSite,
+        \\];
+        \\const open = reached.filter((value) => !Object.isFrozen(value));
+        \\if (open.length > 0) throw new Error(open.length + " built-ins are not frozen");
+        \\const changed = reached.filter((value) => { try { value.mailbox = 1; return true; } catch { return false; } });
+        \\if (changed.length > 0) throw new Error(changed.length + " changes went through");
+    , "first.js");
+    try second.evaluate(
+        \\if (Array.prototype.push.mailbox !== undefined) throw new Error("found something on push");
+        \\if ([1].values().map((x) => x).next().value !== 1) throw new Error("iterator helper changed");
+        \\if (Iterator.concat([3], [4]).next().value !== 3) throw new Error("concat changed");
+    , "second.js");
+}
+
+test "in the shared realm each widget has its own Error stack settings" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const first = try widgets.engine(0);
+    defer first.destroy(std.testing.allocator);
+    const second = try widgets.engine(1);
+    defer second.destroy(std.testing.allocator);
+    // Error.prepareStackTrace and Error.stackTraceLimit are stored on the
+    // context, not on the frozen Error: each widget's turn has its own.
+    try first.evaluate(
+        \\Error.prepareStackTrace = () => "first's format";
+        \\Error.stackTraceLimit = 3;
+    , "first.js");
+    try second.evaluate(
+        \\if (Error.prepareStackTrace !== undefined || Error.stackTraceLimit !== 10) throw new Error("first's settings leaked");
+        \\if (typeof new Error("m").stack !== "string" || new Error("m").stack === "first's format") throw new Error("first's format ran");
+        \\Error.stackTraceLimit = 5;
+    , "second.js");
+    try first.evaluate(
+        \\if (new Error("m").stack !== "first's format" || Error.stackTraceLimit !== 3) throw new Error("own settings lost");
+    , "first-again.js");
+}
+
+fn readNumberGlobal(engine: *Engine, name: [*:0]const u8) !f64 {
+    engine.beginTurn();
+    defer engine.endTurn();
+    const global = c.JS_GetGlobalObject(engine.context);
+    defer c.JS_FreeValue(engine.context, global);
+    const value = c.JS_GetPropertyStr(engine.context, global, name);
+    defer c.JS_FreeValue(engine.context, value);
+    var number: f64 = undefined;
+    try std.testing.expect(c.JS_ToFloat64(engine.context, &number, value) == 0);
+    return number;
+}
+
+/// QuickJS's Math.random step (xorshift64*).
+fn randomStep(state: *u64) u64 {
+    var x = state.*;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state.* = x;
+    return x *% 0x2545F4914F6CDD1D;
+}
+
+test "in the shared realm one widget's Math.random says nothing of another's" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const first = try widgets.engine(0);
+    defer first.destroy(std.testing.allocator);
+    const second = try widgets.engine(1);
+    defer second.destroy(std.testing.allocator);
+    try first.evaluate("globalThis.r1 = Math.random(); globalThis.r2 = Math.random();", "first.js");
+    const r1: u64 = @intFromFloat((try readNumberGlobal(first, "r1")) * 4503599627370496.0);
+    const r2: u64 = @intFromFloat((try readNumberGlobal(first, "r2")) * 4503599627370496.0);
+    // Two outputs give the state back: undo the multiplier, try the 12 bits
+    // each output drops, and keep the state whose next output is r2.
+    const multiplier: u64 = 0x2545F4914F6CDD1D;
+    var inverse: u64 = 1;
+    for (0..6) |_| inverse = inverse *% (2 -% (multiplier *% inverse));
+    var predicted: ?u64 = null;
+    for (0..4096) |low| {
+        var state = ((r1 << 12) | @as(u64, @intCast(low))) *% inverse;
+        if (randomStep(&state) >> 12 == r2) predicted = randomStep(&state) >> 12;
+    }
+    try std.testing.expect(predicted != null);
+    // That state is the first widget's alone: it predicts its own next
+    // number and not the second widget's.
+    try second.evaluate("globalThis.r3 = Math.random();", "second.js");
+    const theirs: u64 = @intFromFloat((try readNumberGlobal(second, "r3")) * 4503599627370496.0);
+    try std.testing.expect(predicted.? != theirs);
+    try first.evaluate("globalThis.r3 = Math.random();", "first-again.js");
+    const own: u64 = @intFromFloat((try readNumberGlobal(first, "r3")) * 4503599627370496.0);
+    try std.testing.expectEqual(predicted.?, own);
+}
+
+test "in the shared realm a finalizer runs in the turns of the widget that made it" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const owner = try widgets.engine(0);
+    defer owner.destroy(std.testing.allocator);
+    const bystander = try widgets.engine(1);
+    defer bystander.destroy(std.testing.allocator);
+    try owner.evaluate(
+        \\globalThis.registry = new FinalizationRegistry((held) => { globalThis.cleaned = held; });
+        \\(() => { const target = {}; target.self = target; registry.register(target, "token"); })();
+    , "owner.js");
+    // Collected in another widget's turn, the cleanup is still the owner's.
+    bystander.beginTurn();
+    c.JS_RunGC(owner.runtime);
+    bystander.endTurn();
+    try std.testing.expect(c.JS_IsTaggedJobPending(owner.context, jobTagOf(owner.owner)));
+    try std.testing.expect(!c.JS_IsTaggedJobPending(owner.context, jobTagOf(bystander.owner)));
+    try bystander.evaluate("if (globalThis.cleaned !== undefined) throw new Error('ran in the wrong widget');", "bystander.js");
+    try owner.evaluate("globalThis.next = true;", "owner-next.js");
+    try owner.evaluate("if (globalThis.cleaned !== 'token') throw new Error('cleanup did not run');", "owner-check.js");
+}
+
+test "in the shared realm a finalizer still queued when its widget goes goes with it" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    const owner = try widgets.engine(0);
+    var alive = true;
+    defer if (alive) owner.destroy(std.testing.allocator);
+    try owner.evaluate(
+        \\globalThis.registry = new FinalizationRegistry((held) => { globalThis.kept = held; });
+        \\(() => { const target = {}; target.self = target; registry.register(target, new ArrayBuffer(1024 * 1024)); })();
+    , "owner.js");
+    // A collection outside any turn (the host's) queues it under the owner.
+    c.JS_RunGC(owner.runtime);
+    const tag = jobTagOf(owner.owner);
+    try std.testing.expect(c.JS_IsTaggedJobPending(owner.context, tag));
+    try std.testing.expect(!c.JS_IsTaggedJobPending(owner.context, jobTagOf(heap().hostOwner())));
+    const range = owner.owner;
+    owner.destroy(std.testing.allocator);
+    alive = false;
+    try std.testing.expect(!c.JS_IsTaggedJobPending(survivor.context, tag));
+    try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(range));
+    // A target that dies only with its widget dies with its registry, in
+    // the collection its teardown runs: no cleanup is queued then.
+    const late = try widgets.engine(0);
+    var late_alive = true;
+    defer if (late_alive) late.destroy(std.testing.allocator);
+    try late.evaluate(
+        \\globalThis.registry = new FinalizationRegistry((held) => { globalThis.kept = held; });
+        \\globalThis.target = {}; target.self = target;
+        \\registry.register(target, new ArrayBuffer(1024 * 1024));
+    , "late.js");
+    const late_range = late.owner;
+    late.destroy(std.testing.allocator);
+    late_alive = false;
+    try std.testing.expect(!c.JS_IsTaggedJobPending(survivor.context, jobTagOf(late_range)));
+    try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(late_range));
+}
+
+test "in the shared realm a widget that goes mid-error leaves nothing behind" {
+    shared_realm_enabled = true;
+    defer shared_realm_enabled = false;
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const survivor = try widgets.engine(1);
+    defer survivor.destroy(std.testing.allocator);
+    const leaving = try widgets.engine(0);
+    var alive = true;
+    defer if (alive) leaving.destroy(std.testing.allocator);
+    leaving.bridge_state.emit_error_logs = false;
+    try std.testing.expectError(error.ScriptException, leaving.evaluate(
+        \\globalThis.cycle = { bytes: new ArrayBuffer(1024 * 1024) }; cycle.self = cycle;
+        \\Error.prepareStackTrace = () => new ArrayBuffer(1024 * 1024);
+        \\Promise.reject(new ArrayBuffer(1024 * 1024));
+        \\queueMicrotask(() => { globalThis.leftover = true; });
+        \\throw new Error("leaving");
+    , "leaving.js"));
+    const range = leaving.owner;
+    leaving.destroy(std.testing.allocator);
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 0), heap().usedBytes(range));
+    try std.testing.expect(!c.JS_IsTaggedJobPending(survivor.context, jobTagOf(range)));
+    try std.testing.expect(c.JS_GetContextOpaque(survivor.context) == null);
+    try survivor.evaluate("if (typeof cycle !== 'undefined' || typeof leftover !== 'undefined' || Error.prepareStackTrace !== undefined) throw 1;", "survivor.js");
 }
 
 test "a widget in the shared realm costs far less than a realm of its own" {
