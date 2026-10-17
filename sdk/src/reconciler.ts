@@ -1360,11 +1360,11 @@ const timeProvider = (() => {
   // was started, one wake for all clocks instead of one each. 20 ms past
   // the turn clears the 15.6 ms Windows timer tick, so a tick never reads
   // the second before. A delay under 40 ms would be a thread-pool timer on
-  // Windows (Native's short-interval path), so that second is skipped.
+  // Windows (Native's short-interval path), so a turn that close is waited
+  // out a little longer: up to 40 ms past it, never into the next second.
   const arm = (): void => {
     const intoSecond = captureNowMilliseconds() % 1000;
-    const untilTurn = 1000 - intoSecond + 20;
-    timerId = native.setInterval(untilTurn < 40 ? untilTurn + 1000 : untilTurn);
+    timerId = native.setInterval(Math.max(1000 - intoSecond + 20, 40));
     native.onTimer(timerId, () => runWidgetCallback("time provider callback", () => {
       native.clearInterval(timerId);
       arm();
