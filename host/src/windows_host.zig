@@ -323,6 +323,9 @@ const Host = struct {
     /// A widget that uses the providers has run in this host: its last
     /// counters are read before the host stops.
     provider_host_used: bool = false,
+    /// A member used the providers at the last ask: the ask after the last
+    /// one leaves still runs, so its final counters reach status.
+    provider_members_asked: bool = false,
     thread_sample_ms: u64 = 0,
     slot_threads: [max_widgets]u32 = [_]u32{0} ** max_widgets,
     renderer_threads: u32 = 0,
@@ -907,6 +910,7 @@ const Host = struct {
 
     fn closeSharedHost(self: *Host) void {
         self.provider_host_used = false;
+        self.provider_members_asked = false;
         self.provider_totals = self.provider_totals.plus(self.provider_report.counters);
         self.provider_report = .{};
         if (self.shared.process.process) |process| _ = c.CloseHandle(process);
@@ -1106,15 +1110,18 @@ const Host = struct {
     /// Ask the host for its providers' counters, and for the widgets whose
     /// provider channel failed since the last ask: those restart on their
     /// crash budget, as when weaverd ran the providers. It asks while a
-    /// member uses the providers, and after the last one goes until the
-    /// host reports audio idle (its audio worker closes the capture a moment
-    /// after the widget leaves), so status never keeps a stale "live".
+    /// member uses the providers, once more after the last one goes (its
+    /// final counters), and on until the host reports audio idle (its audio
+    /// worker closes the capture a moment after the widget leaves), so
+    /// status never keeps stale counters or a stale "live".
     fn refreshProviders(self: *Host, now_ms: u64) void {
         const report = &self.provider_report;
         const settled = !report.audio_capture_active and std.mem.eql(u8, report.availability(), "idle");
-        if (!self.hasProviderMember() and settled) return;
+        const members = self.hasProviderMember();
+        if (!members and !self.provider_members_asked and settled) return;
         var scratch: [2 * max_answer_bytes]u8 = undefined;
         const wire = self.queryProviders(&scratch) orelse return;
+        self.provider_members_asked = members;
         for (wire.failed.hosted) |host_slot| {
             const slot = self.slotInHost(host_slot) orelse continue;
             self.restartAfterMediaChannelFailure(slot, now_ms);
