@@ -1356,8 +1356,10 @@ const timeProvider = (() => {
   };
   // Each tick lands just after the wall-clock second turns, not a second
   // after the widget subscribed: the time shown changes when the second
-  // does, and every widget in a host wakes in the same instant however it
-  // was started, one wake for all clocks instead of one each. 20 ms past
+  // does, and the widgets in a host wake within a few timer ticks of each
+  // other however they were started (ten clocks: 8-24 ms apart), not at
+  // phases scattered across the second. Each still has its own timer.
+  // 20 ms past
   // the turn clears the 15.6 ms Windows timer tick, so a tick never reads
   // the second before. A delay under 40 ms would be a thread-pool timer on
   // Windows (Native's short-interval path), so a turn that close is waited
