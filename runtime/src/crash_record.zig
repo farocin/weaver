@@ -124,6 +124,7 @@ pub fn open(path: []const u8) !?Record {
     mapped.restart_count = 0;
     mapped.restart = .none;
     mapped.restart_error = 0;
+    mapped.restart_line_len = 0;
     mapped.stop_reason_len = 0;
     mapped.state = .running;
     ui_thread = GetCurrentThreadId();
@@ -195,11 +196,12 @@ pub fn markStoppedWith(reason: []const u8) void {
 
 /// The automatic restarts this start counts toward the cap, and what it
 /// asked of Windows (main.zig `startDaemon`).
-pub fn noteRestart(plan: contract.RestartPlan, request: contract.RestartRequest, hresult: u32) void {
+pub fn noteRestart(plan: contract.RestartPlan, request: contract.RestartRequest, hresult: u32, line_len: u32) void {
     const mapped = record orelse return;
     mapped.restarts = plan.restarts;
     mapped.restart_count = plan.count;
     mapped.restart_error = hresult;
+    mapped.restart_line_len = line_len;
     mapped.restart = request;
 }
 

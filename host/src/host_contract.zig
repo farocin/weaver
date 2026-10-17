@@ -79,16 +79,21 @@ pub const exit_stopped_by_down: u32 = 0xE057_0007;
 /// to exit and up to 1 s more after it stops it; 30 s is 6x that.
 pub const host_lock_wait_ms: u32 = 30_000;
 
-/// How long a host Windows restarted waits for the crashed host to be gone,
-/// and then for its record to open. Windows can start the restart before
-/// the crashed process has exited, and the record stays in use for a moment
-/// after it has. Receipts (2026-10-17, weaver-step5-scratch/gt-*): one
-/// restart began 0.24 s before the crashed host exited; in seven others the
-/// crashed host was gone, but the record refused a writer for another
-/// 203-250 ms. Before this wait the restarted host ran without its record,
-/// so it quarantined nothing and never asked for another restart. 30 s is
-/// two orders past both, room for a slow crash report.
+/// How long a host Windows restarted waits for the crashed host to be gone.
+/// Windows can start the restart before the crashed process has exited
+/// (receipt, 2026-10-17, weaver-step5-scratch/gt-ui: 0.24 s before), and
+/// until then that process owns the singleton. 30 s leaves room for a slow
+/// crash report.
 pub const predecessor_wait_ms: u32 = 30_000;
+/// How long any starting host retries opening its record while it is in
+/// use. It stays in use for a moment after a crashed host has exited:
+/// 203-250 ms in seven restarts (2026-10-17, weaver-step5-scratch/gt-*).
+/// 2 s is 8x that, and well inside the 5 s `weaver up` waits for a host. A
+/// host that still cannot open it reads it instead, so it quarantines the
+/// widget it names, but runs without a record of its own: its crashes go
+/// unattributed and it does not ask Windows to restart it, and status says
+/// so (host_lifecycle.hostNote).
+pub const record_open_wait_ms: u32 = 2_000;
 
 /// The arguments Windows restarts a crashed host with, after the
 /// executable's own path: `--host --restart-of <generation> --localappdata
@@ -235,6 +240,9 @@ pub const Record = extern struct {
     restart: RestartRequest,
     /// For `restart == .failed`: RegisterApplicationRestart's HRESULT.
     restart_error: u32,
+    /// The restart command line's length in UTF-16 units, without the
+    /// terminator, against `restart_max_command_line`.
+    restart_line_len: u32,
     stop_reason_len: u32,
     /// Why a host that returned an error from main stopped.
     stop_reason: [stop_reason_bytes]u8,
@@ -245,7 +253,8 @@ comptime {
     // version-2 place.
     std.debug.assert(@offsetOf(Record, "slots") == 80);
     std.debug.assert(@offsetOf(Record, "restarts") == 80 + record_slots * 16);
-    std.debug.assert(@sizeOf(Record) == 80 + record_slots * 16 + restart_cap * 8 + 16 + stop_reason_bytes);
+    // Five u32s after the restarts, then the reason, padded to 8 bytes.
+    std.debug.assert(@sizeOf(Record) == std.mem.alignForward(usize, 80 + record_slots * 16 + restart_cap * 8 + 20 + stop_reason_bytes, 8));
 }
 
 /// The record in `bytes`, if it is one this version wrote.

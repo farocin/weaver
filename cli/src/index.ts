@@ -1819,6 +1819,7 @@ async function upHost(announce: boolean): Promise<void> {
     const result = hostClient("--up");
     if (result.status === HostClientExit.ok) {
       if (announce) process.stdout.write("widget host started\n");
+      warnHostNote();
       return;
     }
     if (result.status === HostClientExit.alreadyRunning) {
@@ -1871,9 +1872,10 @@ function showStatus(json: boolean): void {
     const result = hostClient("--status");
     if (result.status === HostClientExit.notRunning) throw new WeaverFailure(describeHostDown(JSON.parse(result.stdout) as HostDown));
     if (result.status === HostClientExit.legacy) assertHostReloadReady();
-    // A host that did not answer in time leaves the last status, which the
-    // freshness warning below reports.
-    if (result.status !== HostClientExit.ok && result.status !== HostClientExit.timedOut) throw hostClientFailure("status", result);
+    // A host that did not answer in time (and has not crashed: the client
+    // checks) leaves its last status, shown with a warning.
+    if (result.status === HostClientExit.timedOut) process.stderr.write("weaver status warning: the widget host did not answer the status request within 5 seconds; this is the last status it wrote\n");
+    else if (result.status !== HostClientExit.ok) throw hostClientFailure("status", result);
   } else {
     if (!hostRunning()) throw new WeaverFailure(['weaverd is not running; run "weaver up"']);
     requestStatus();
@@ -1885,6 +1887,19 @@ function showStatus(json: boolean): void {
   } catch (error) {
     throw new WeaverFailure([`${hostLabel} status is unavailable at ${statusPath()}: ${errorMessage(error)}`]);
   }
+}
+
+/**
+ * After `weaver up` starts a host: anything its status row says about how it
+ * runs (no record of its own, Windows refusing its restart request, an
+ * unreadable registry) means a crash would leave Weaver down. Say so now.
+ */
+function warnHostNote(): void {
+  if (hostClient("--status").status !== HostClientExit.ok) return;
+  try {
+    const host = readStatus().widgets.find((widget) => widget.host);
+    if (host?.reason) process.stderr.write(`weaver warning: ${host.reason}\n`);
+  } catch { /* "weaver status" reports an unreadable status file. */ }
 }
 
 function hostRunning(): boolean {

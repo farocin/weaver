@@ -2149,7 +2149,8 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
     std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
     // From here on, a crash is recorded. Opening the record consumes the
     // previous host's: this start takes the next generation.
-    const previous = openRecord(paths.record, restart_of != null);
+    var record_failure: ?host_lifecycle.RecordFailure = null;
+    const previous = openRecord(paths.record, &record_failure);
     var now: u64 = 0;
     GetSystemTimeAsFileTime(&now);
     const plan = host_contract.RestartPlan.of(previous, restart_of != null, now);
@@ -2157,7 +2158,7 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
         host_lifecycle.registerRestart(plan, generation, init.environ_map.get("LOCALAPPDATA").?)
     else
         .{ .request = .none };
-    crash_record.noteRestart(plan, registration.request, registration.hresult);
+    crash_record.noteRestart(plan, registration.request, registration.hresult, registration.line_len);
     // Crashes fail fast from here on, so Windows restarts this host.
     var log_buffers: native_sdk.debug.LogPathBuffers = .{};
     const native_logs = try native_sdk.debug.resolveLogPaths(&log_buffers, "com.weaver.widget", native_sdk.debug.envFromMap(init.environ_map), init.environ_map.get("NATIVE_SDK_LOG_DIR"));
@@ -2187,28 +2188,32 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
         .devs = devs,
         .post = postControl,
         .previous = previous,
-        .restart_note = if (restart_of != null) try host_lifecycle.restartNote(allocator, previous, plan, registration) else "",
+        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration, record_failure),
     }, objects);
 }
 
-/// Open the host's record (crash_record.open). A host Windows restarted
-/// retries while the record is in use, up to `predecessor_wait_ms`: it
-/// stays in use for a moment after the crashed host has exited, and a
-/// restarted host without it would quarantine nothing and never ask to be
-/// restarted again.
-fn openRecord(path: []const u8, restarted: bool) ?host_contract.Record {
+/// Open the host's record (crash_record.open), retrying while it is in use
+/// for up to `record_open_wait_ms`: it stays in use for a moment after a
+/// crashed host has exited. A host that still cannot open it reads it
+/// instead, so the previous host's record still names the widget to
+/// quarantine, and runs without a record of its own (`failure`, which
+/// status shows): a host that ran a widget its record blames would crash
+/// again on it.
+fn openRecord(path: []const u8, failure: *?host_lifecycle.RecordFailure) ?host_contract.Record {
     const began = GetTickCount64();
     var attempts: u32 = 0;
     while (true) {
         attempts += 1;
         const previous = crash_record.open(path) catch |err| {
             const waited = GetTickCount64() - began;
-            if (restarted and err == error.RecordInUse and waited < host_contract.predecessor_wait_ms) {
+            if (err == error.RecordInUse and waited < host_contract.record_open_wait_ms) {
                 Sleep(50);
                 continue;
             }
-            std.debug.print("weaver-widget --host: no crash record at {s}: {s} (Win32 error {d}, {d} attempts over {d} ms); crashes go unattributed and Windows is not asked to restart this host\n", .{ path, @errorName(err), crash_record.open_error, attempts, waited });
-            return null;
+            failure.* = .{ .path = path, .err = err, .win32_error = crash_record.open_error };
+            const read = crash_record.read(path);
+            std.debug.print("weaver-widget --host: could not open the record at {s}: {s} (Win32 error {d}, {d} attempts over {d} ms); {s}; this host's crashes go unattributed and Windows is not asked to restart it\n", .{ path, @errorName(err), crash_record.open_error, attempts, waited, if (read != null) "read it to quarantine the widget it names" else "could not read it either" });
+            return read;
         };
         if (attempts > 1) std.debug.print("weaver-widget --host: the record opened after {d} attempts over {d} ms\n", .{ attempts, GetTickCount64() - began });
         return previous;

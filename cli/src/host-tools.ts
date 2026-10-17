@@ -200,6 +200,9 @@ export interface HostDown {
     crash: null | { kind: "widget" | "ui" | "other"; cause: "panic" | "wedged" | "exception"; code: number; at: number; widget: string | null };
     restart: "none" | "registered" | "capped" | "failed";
     restartError: number;
+    /** The restart command line's length in UTF-16 units, and Windows' limit with its terminator. */
+    restartLineLength: number;
+    restartLineLimit: number;
     automaticRestarts: number[];
   };
 }
@@ -212,8 +215,10 @@ export function describeHostDown(down: HostDown): string[] {
   if (down.stopped) return [`The widget host is not running: "weaver down" stopped it at ${clock(down.stopped.at)}.`, up];
   const record = down.record;
   if (!record) return [`The widget host is not running, and ${down.recordPath} holds no record of an earlier run.`, up];
-  if (record.process === "alive") return [`The widget host (pid ${record.pid}) is running but has not published its control objects, so it is starting or stopping.`, 'Run "weaver status" again in a few seconds; if this stays, run "weaver down", then "weaver up".'];
-  if (record.process === "unknown") return [`The widget host's state is unknown: its record names pid ${record.pid}, which Weaver could not open.`, 'Run "weaver down", then "weaver up".'];
+  // A host whose record holds a crash and whose process is alive is dying:
+  // Windows is reporting the crash. It is worded as the crash below.
+  if (record.process === "alive" && !record.crash) return [`The widget host (pid ${record.pid}) is running but has not published its control objects, so it is starting or stopping.`, 'Run "weaver status" again in a few seconds; if this stays, run "weaver down", then "weaver up".'];
+  if (record.process === "unknown" && !record.crash) return [`The widget host's state is unknown: its record names pid ${record.pid}, which Weaver could not open.`, 'Run "weaver down", then "weaver up".'];
   if (record.state === "stopped") {
     if (record.stopReason) return [`The widget host is not running: it stopped as it started, with error.${record.stopReason}.`, 'Run "weaver up" to try again.'];
     return ["The widget host is not running: it exited cleanly on its own.", up];
@@ -224,6 +229,7 @@ export function describeHostDown(down: HostDown): string[] {
   const what = crash.cause === "panic" ? `a panic (${code})` : crash.cause === "wedged" ? `its UI thread stuck past the apply deadline (${code})` : `exception ${code}`;
   const where = crash.kind === "widget" ? `in the turn of ${crash.widget ? `"${crash.widget}"` : "a widget"}` : crash.kind === "ui" ? "on its UI thread, outside any widget's turn" : "on a provider or management thread";
   const lines = [`The widget host is not running: it crashed at ${clock(crash.at)} with ${what} ${where}, ${seconds(crash.at - record.startedAt)} after it started.`];
+  if (record.process === "alive") lines.push(`Its process (pid ${record.pid}) is still exiting while Windows reports the crash.`);
   if (crash.kind === "widget") lines.push(`${crash.widget ? `"${crash.widget}"` : "That widget"} is quarantined when the host next starts; reinstall or update it to run it again.`);
   else lines.push("No widget is blamed.");
   const window = `${Math.round(down.restartWindowMs / 60_000)} minutes`;
@@ -233,8 +239,11 @@ export function describeHostDown(down: HostDown): string[] {
     return lines;
   }
   if (record.restart === "failed") {
-    const hint = record.restartError === 0x80070057 ? ": the restart command line carries the profile path, and Windows takes at most 1024 characters" : "";
-    lines.push(`Windows could not be asked to restart it (RegisterApplicationRestart returned 0x${record.restartError.toString(16).toUpperCase().padStart(8, "0")}${hint}).`);
+    if (record.restartLineLength >= record.restartLineLimit) {
+      lines.push(`Windows could not be asked to restart it: its restart command line carries the profile path and is ${record.restartLineLength} UTF-16 units, past RegisterApplicationRestart's limit of ${record.restartLineLimit} with its terminator. Set LOCALAPPDATA to a path at least ${record.restartLineLength - record.restartLineLimit + 1} characters shorter.`);
+    } else {
+      lines.push(`Windows could not be asked to restart it (RegisterApplicationRestart returned 0x${record.restartError.toString(16).toUpperCase().padStart(8, "0")}).`);
+    }
   } else if (record.restart === "none") {
     lines.push("It had not asked Windows to restart it.");
   } else if (crash.at - record.startedAt < down.minRunMs) {

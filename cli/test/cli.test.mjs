@@ -239,7 +239,7 @@ test("status shows hosted widgets' costs on the shared host row", () => {
 test("status says why no widget host runs, and what to run", () => {
   const now = Date.UTC(2026, 9, 17, 14, 0, 0);
   const base = { stopped: null, now, recordPath: "C:\\lad\\weaver\\host.record", restartCap: 3, restartWindowMs: 600_000, minRunMs: 60_000, restartWaitMs: 120_000, restartMeasuredMs: 37_000 };
-  const record = { generation: 4, pid: 70, state: "running", process: "gone", startedAt: now - 300_000, stopReason: "", restart: "registered", restartError: 0, automaticRestarts: [] };
+  const record = { generation: 4, pid: 70, state: "running", process: "gone", startedAt: now - 300_000, stopReason: "", restart: "registered", restartError: 0, restartLineLength: 60, restartLineLimit: 1024, automaticRestarts: [] };
   const crash = { kind: "widget", cause: "exception", code: 0xC0000005, at: now - 10_000, widget: "Clock" };
   const text = (down) => hostTools.describeHostDown(down).join("\n");
 
@@ -263,6 +263,13 @@ test("status says why no widget host runs, and what to run", () => {
   assert.match(text({ ...base, record: { ...record, crash: null } }), /ended without recording a crash/);
   assert.match(text({ ...base, record: { ...record, state: "stopped", stopReason: "RecordInUse" } }), /stopped as it started, with error\.RecordInUse/);
   assert.match(text({ ...base, record: { ...record, process: "unknown" } }), /state is unknown: its record names pid 70/);
+  // A host still exiting while Windows reports its crash is a crash, not a running host.
+  const dying = text({ ...base, record: { ...record, process: "alive", crash } });
+  assert.match(dying, /crashed at .* in the turn of "Clock"/);
+  assert.match(dying, /pid 70\) is still exiting while Windows reports the crash/);
+  // A refused restart request names the limit, the length and the fix.
+  const tooLong = text({ ...base, record: { ...record, restart: "failed", restartError: 0x80070057, restartLineLength: 1028, crash } });
+  assert.match(tooLong, /1028 UTF-16 units, past RegisterApplicationRestart's limit of 1024 with its terminator\. Set LOCALAPPDATA to a path at least 5 characters shorter/);
 });
 
 test("path helpers follow Windows case rules without weakening POSIX containment", () => {

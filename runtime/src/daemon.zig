@@ -41,6 +41,7 @@ const contract = @import("host_contract");
 const supervisor = @import("host_supervisor");
 const registry = supervisor.registry;
 const crash_record = @import("crash_record.zig");
+const host_lifecycle = @import("host_lifecycle.zig");
 const dev_widgets = @import("dev_widgets.zig");
 const host_control = @import("host_control.zig");
 const provider_service = @import("provider_service.zig");
@@ -152,9 +153,10 @@ pub const Options = struct {
     post: *const fn (*host_control.Pending) void,
     /// The previous host's record, read before this one opened its own.
     previous: ?contract.Record,
-    /// How this host came to run, when Windows restarted it: shown on
-    /// status's host row (main.zig `restartNote`). Empty otherwise.
-    restart_note: []const u8,
+    /// What status's host row says about how this host runs: a restart by
+    /// Windows, no record of its own, a refused restart request
+    /// (host_lifecycle.hostNote). Empty when there is nothing to say.
+    host_note: []const u8,
 };
 
 /// A process's cost as status shows it, sampled when the CLI asks for
@@ -1114,6 +1116,15 @@ pub const Daemon = struct {
         var entries: [max_widgets + 2]supervisor.StatusEntry = undefined;
         var count: usize = 0;
         const host_cost = self.costs;
+        // A registry failure and the host note both matter: shown together.
+        const registry_failure = self.registry_failure[0..self.registry_failure_len];
+        const host_reason = if (registry_failure.len == 0)
+            self.options.host_note
+        else if (self.options.host_note.len == 0)
+            registry_failure
+        else
+            std.fmt.allocPrint(self.allocator, "{s}; {s}", .{ registry_failure, self.options.host_note }) catch registry_failure;
+        defer if (host_reason.ptr != registry_failure.ptr and host_reason.ptr != self.options.host_note.ptr) self.allocator.free(host_reason);
         if (!self.stopping) entries[count] = .{
             .name = "host",
             .pid = self.pid,
@@ -1123,7 +1134,7 @@ pub const Daemon = struct {
             .backend = "-",
             .uptime_seconds = (now_ms -| self.started_ms) / 1000,
             .state = .running,
-            .reason = if (self.registry_failure_len > 0) self.registry_failure[0..self.registry_failure_len] else self.options.restart_note,
+            .reason = host_reason,
             .host_row = true,
         };
         count += @intFromBool(!self.stopping);
@@ -1236,11 +1247,10 @@ fn wantsOf(slot: *const Slot) provider_service.Wants {
 
 const nameHash = contract.nameHash;
 
-/// Host-level notices, on stderr. The host is a GUI-subsystem program with
-/// no console: only a parent that hands it a stderr (a developer's script)
-/// sees them. What the CLI needs goes to status.json.
+/// Host-level notices, in logs\host.log (host_lifecycle.note, which keeps
+/// it bounded). What the CLI needs goes to status.json.
 fn note(comptime format: []const u8, args: anytype) void {
-    std.debug.print("weaver-widget --host: " ++ format ++ "\n", args);
+    host_lifecycle.note("weaver-widget --host: " ++ format ++ "\n", args);
 }
 
 /// End this process with `code`: a u32, which std.process.exit (a u8)
