@@ -20,9 +20,44 @@ widgets receive Weaver's small `native` global, not QuickJS's OS or std modules.
   `JS_ExecutePendingJob` scan contexts in creation order. A context marks
   its queued jobs for the collector and frees them with itself, so a
   dropped context's jobs never outlive it.
+- `JS_SwapProgramState(ctx, &state)` (`quickjs.h`): exchanges the
+  context's per-program state with the caller's `JSProgramState`: the
+  global object and global lexical scope (top-level `let`, `const`,
+  `class`), the Error stack settings (`Error.prepareStackTrace`,
+  `Error.stackTraceLimit`, which built-in setters store on the context), the
+  `Math.random` state and the performance time origin
+  (`performance.now()`, and `performance.timeOrigin`, an accessor here so
+  each program reads its own). QuickJS reads all of them from the context when
+  used, so a program whose state is in the context sees its own, and the
+  shared realm's built-ins through its global object's prototype. It also
+  drops the context's last-error backtrace, which belongs to the outgoing
+  program. Used by Weaver's shared realm: each widget's turn swaps its
+  state in. `JS_InitProgramState(ctx, &state)` starts a program's state as
+  a new realm would (no stack formatter, a limit of 10, time from now).
+  `JS_FreezeRealm(ctx)` freezes every object alive in the runtime: run
+  before any program has made one, those are the realm's built-ins,
+  including those only a built-in's closure holds, which no property walk
+  reaches. It leaves the built-in methods QuickJS makes on first use
+  (autoinit properties) unmade, with their flags set frozen; each is made
+  frozen, and outside the running program's memory charge, when a program
+  first reaches it. Namespace objects (Math, JSON, Reflect, ...) and the
+  built-ins written in JavaScript (Array.fromAsync, Iterator.zip,
+  Iterator.zipKeyed) are made at once: the latter hold functions in
+  closures, and a namespace's property names are atoms a program could
+  otherwise create first and keep charged to itself.
+- `JS_SetJobTagFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` tags each job
+  with `func(ctx)`. `JS_ExecuteTaggedJob(ctx, tag)`,
+  `JS_IsTaggedJobPending(ctx, tag)` and `JS_FreeTaggedJobs(ctx, tag)` run,
+  check and drop only one tag's jobs, so widgets sharing one context (the
+  shared realm) each run, and are charged for, only the jobs they queued,
+  and a widget's queued jobs go with it. A FinalizationRegistry keeps the
+  tag of the program that made it, and its cleanup jobs are queued under
+  that tag, not the tag of whichever program's turn ran the collection.
 - `JS_SetChargeJobFunc(rt, func)` (`quickjs.h`): `JS_EnqueueJob` calls `func`
   around allocating a job, so a garbage collection in one widget's turn
-  charges another widget's queued cleanup job to that widget's heap.
+  charges another widget's queued cleanup job to that widget's heap: a job
+  queued under an explicit tag (a FinalizationRegistry cleanup) is charged
+  to the program that tag names, any other to its context's program.
 - `JS_SetChargeSharedFunc(rt, func)` (`quickjs.h`): QuickJS calls `func`
   around growing a runtime-wide table (atom hash and array, shape hash), so
   the table is charged to the host's heap, not to the widget whose turn grew

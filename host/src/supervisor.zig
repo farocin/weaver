@@ -1,6 +1,8 @@
 const std = @import("std");
-const backoff = @import("backoff.zig");
-const registry = @import("registry.zig");
+/// Re-exported for the Windows widget host, which compiles this file as a
+/// module of its own (runtime/build.zig `host_supervisor`).
+pub const backoff = @import("backoff.zig");
+pub const registry = @import("registry.zig");
 
 pub const max_widgets: usize = 32;
 pub const max_name_bytes: usize = 256;
@@ -198,15 +200,20 @@ pub fn recordCrash(slot: anytype, now_ms: u64, exit_code: ?u32) void {
 }
 
 pub fn recordLaunchFailure(slot: anytype, now_ms: u64, err: anyerror) void {
+    recordLaunchFailureNamed(slot, now_ms, @errorName(err));
+}
+
+/// A launch failure another process named: the widget host's answer.
+pub fn recordLaunchFailureNamed(slot: anytype, now_ms: u64, cause: []const u8) void {
     if (backoff.recordCrash(&slot.crash_times, &slot.crash_count, now_ms)) {
         slot.state = .stopped;
-        slot.setReason("launch failed after 3 restart attempts within 5 minutes: {s}", .{@errorName(err)});
+        slot.setReason("launch failed after 3 restart attempts within 5 minutes: {s}", .{cause});
         return;
     }
     slot.state = .backoff;
     slot.next_restart_ms = now_ms + backoff.delayMs(slot.crash_count);
     slot.setReason("launch failed: {s}; restart {d} in {d}s", .{
-        @errorName(err),
+        cause,
         slot.crash_count,
         backoff.delayMs(slot.crash_count) / 1000,
     });

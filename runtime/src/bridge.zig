@@ -6,6 +6,7 @@ const provider_mod = @import("provider.zig");
 const qjs = @import("qjs.zig");
 const storage_mod = @import("storage.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
+const weaver_build_options = @import("weaver_build_options");
 const c = qjs.c;
 
 pub const State = struct {
@@ -73,13 +74,42 @@ pub const CanvasFrameSlot = struct {
 
 pub const FetchSlot = struct {
     active: bool = false,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    cancelled: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    thread: ?std.Thread = null,
     resolve: c.JSValue = qjs.undefinedValue(),
     reject: c.JSValue = qjs.undefinedValue(),
+    /// The request in flight, shared with its worker.
+    work: ?*FetchWork = null,
+};
+
+/// One request's worker-side state, shared by the widget's slot and the
+/// worker thread and freed by whichever lets go last. A widget that unloads
+/// lets go without waiting: a request blocked on a slow server finishes, or
+/// times out, on its own thread, and the other widgets never wait for it.
+pub const FetchWork = struct {
     request: network.Request = .{},
     result: network.Result = .{},
+    done: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(u8) = .init(0),
+    holders: std.atomic.Value(u8) = .init(2),
+
+    fn create() ?*FetchWork {
+        const work = std.heap.page_allocator.create(FetchWork) catch return null;
+        work.* = .{};
+        work.request.cancelled = &work.cancelled;
+        return work;
+    }
+
+    /// Before the worker starts, only the slot holds it.
+    fn destroyUnstarted(self: *FetchWork) void {
+        self.request.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn release(self: *FetchWork) void {
+        if (self.holders.fetchSub(1, .acq_rel) != 1) return;
+        self.request.deinit(std.heap.page_allocator);
+        self.result.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(self);
+    }
 };
 
 /// Install the complete M0 capability surface. QuickJS's libc helpers are not
@@ -91,6 +121,7 @@ pub fn install(ctx: *c.JSContext, bridge_state: *State) !void {
     const native = c.JS_NewObject(ctx);
     if (c.JS_IsException(native)) return error.QuickJs;
     errdefer c.JS_FreeValue(ctx, native);
+    if (weaver_build_options.automation_seam) try setFunction(ctx, native, "testCrash", testCrash, 1);
     try setFunction(ctx, native, "createNode", createNode, 1);
     try setFunction(ctx, native, "setProp", setProp, 3);
     try setFunction(ctx, native, "setText", setText, 2);
@@ -151,14 +182,13 @@ pub fn deinit(ctx: *c.JSContext, bridge_state: *State) void {
     c.JS_FreeValue(ctx, bridge_state.provider_callback);
     c.JS_FreeValue(ctx, bridge_state.canvas_resize_callback);
     for (&bridge_state.fetches) |*slot| {
-        if (slot.thread != null) slot.cancelled.store(1, .release);
-    }
-    for (&bridge_state.fetches) |*slot| {
-        if (slot.thread) |thread| thread.join();
+        // Its requests finish without it: nothing waits for the network.
+        if (slot.work) |work| {
+            work.cancelled.store(1, .release);
+            work.release();
+        }
         c.JS_FreeValue(ctx, slot.resolve);
         c.JS_FreeValue(ctx, slot.reject);
-        slot.request.deinit(std.heap.page_allocator);
-        slot.result.deinit(std.heap.page_allocator);
         slot.* = .{};
     }
 }
@@ -204,6 +234,31 @@ fn stringArg(ctx: *c.JSContext, value: c.JSValueConst) !struct { bytes: []const 
     var len: usize = 0;
     const raw = c.JS_ToCStringLen2(ctx, &len, value, false) orelse return error.InvalidArgument;
     return .{ .bytes = raw[0..len], .raw = raw };
+}
+
+/// `native.testCrash("fault" | "panic" | "provider")`, in
+/// `-Dautomation-seam` builds only: crash the host from inside a widget's
+/// turn, as a bug in native code would, or (`provider`, Windows host) on
+/// the system provider's worker at its next sample, so crash attribution
+/// and the OS restart can be tested on a real process.
+fn testCrash(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {
+    const js = ctx orelse return qjs.exceptionValue();
+    var kind: [8]u8 = @splat(0);
+    if (argc > 0) {
+        if (c.JS_ToCString(js, argv[0])) |text| {
+            defer c.JS_FreeCString(js, text);
+            const span = std.mem.span(text);
+            @memcpy(kind[0..@min(span.len, kind.len)], span[0..@min(span.len, kind.len)]);
+        }
+    }
+    if (std.mem.startsWith(u8, &kind, "panic")) @panic("native.testCrash(\"panic\")");
+    if (std.mem.startsWith(u8, &kind, "provider")) {
+        if (@import("builtin").os.tag == .windows) @import("provider_service.zig").test_crash_requested.store(true, .release);
+        return qjs.undefinedValue();
+    }
+    const nowhere: *allowzero volatile u32 = @ptrFromInt(0);
+    nowhere.* = 1;
+    return qjs.undefinedValue();
 }
 
 fn createNode(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {
@@ -861,28 +916,32 @@ fn fetch(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValue
         c.JS_FreeValue(js, resolving[1]);
         return promise;
     };
-    slot.* = .{ .active = true, .resolve = resolving[0], .reject = resolving[1] };
-    slot.request.cancelled = &slot.cancelled;
-    slot.request.method = if (std.ascii.eqlIgnoreCase(method.bytes, "GET")) .get else if (std.ascii.eqlIgnoreCase(method.bytes, "POST")) .post else {
+    slot.* = .{ .active = true, .resolve = resolving[0], .reject = resolving[1], .work = FetchWork.create() };
+    const work = slot.work orelse {
+        rejectAndResetFetch(js, slot, "FetchFailed: request allocation failed");
+        return promise;
+    };
+    work.request.method = if (std.ascii.eqlIgnoreCase(method.bytes, "GET")) .get else if (std.ascii.eqlIgnoreCase(method.bytes, "POST")) .post else {
         rejectAndResetFetch(js, slot, "wfetch method must be GET or POST");
         return promise;
     };
-    slot.request.url = std.heap.page_allocator.dupe(u8, url.bytes) catch {
+    work.request.url = std.heap.page_allocator.dupe(u8, url.bytes) catch {
         rejectAndResetFetch(js, slot, "FetchFailed: request allocation failed");
         return promise;
     };
-    slot.request.body = std.heap.page_allocator.dupe(u8, body.bytes) catch {
+    work.request.body = std.heap.page_allocator.dupe(u8, body.bytes) catch {
         rejectAndResetFetch(js, slot, "FetchFailed: request allocation failed");
         return promise;
     };
-    slot.request.headers = copyHeadersJson(headers_json.bytes) orelse {
+    work.request.headers = copyHeadersJson(headers_json.bytes) orelse {
         rejectAndResetFetch(js, slot, "wfetch headers must be string values without CR/LF");
         return promise;
     };
-    slot.thread = std.Thread.spawn(.{}, fetchWorker, .{slot}) catch {
+    const thread = std.Thread.spawn(.{}, fetchWorker, .{work}) catch {
         rejectAndResetFetch(js, slot, "FetchFailed: could not start request worker");
         return promise;
     };
+    thread.detach();
     return promise;
 }
 
@@ -905,9 +964,10 @@ fn copyHeadersJson(source: []const u8) ?[]const u8 {
     return output.toOwnedSlice(std.heap.page_allocator) catch null;
 }
 
-fn fetchWorker(slot: *FetchSlot) void {
-    slot.result = network.perform(&slot.request, std.heap.page_allocator);
-    slot.done.store(true, .release);
+fn fetchWorker(work: *FetchWork) void {
+    defer work.release();
+    work.result = network.perform(&work.request, std.heap.page_allocator);
+    work.done.store(true, .release);
 }
 
 fn rejectPromise(ctx: *c.JSContext, reject: c.JSValue, message: []const u8) void {
@@ -922,7 +982,7 @@ fn rejectAndResetFetch(ctx: *c.JSContext, slot: *FetchSlot, message: []const u8)
     rejectPromise(ctx, slot.reject, message);
     c.JS_FreeValue(ctx, slot.resolve);
     c.JS_FreeValue(ctx, slot.reject);
-    slot.request.deinit(std.heap.page_allocator);
+    if (slot.work) |work| work.destroyUnstarted();
     slot.* = .{};
 }
 
@@ -943,33 +1003,35 @@ pub fn activeFetchCount(bridge_state: *const State) usize {
 /// update is batched by the same reconciler path as a timer or button event.
 pub fn drainFetches(ctx: *c.JSContext, bridge_state: *State) void {
     for (&bridge_state.fetches) |*slot| {
-        if (!slot.active or !slot.done.load(.acquire)) continue;
-        if (slot.thread) |thread| thread.join();
-        slot.thread = null;
-        if (slot.result.failure == .none) {
+        if (!slot.active) continue;
+        const work = slot.work orelse continue;
+        if (!work.done.load(.acquire)) continue;
+        if (work.result.failure == .none) {
             const response = c.JS_NewObject(ctx);
-            _ = c.JS_SetPropertyStr(ctx, response, "status", c.JS_NewUint32(ctx, slot.result.status));
-            const body = slot.result.body orelse &.{};
+            _ = c.JS_SetPropertyStr(ctx, response, "status", c.JS_NewUint32(ctx, work.result.status));
+            const body = work.result.body orelse &.{};
             _ = c.JS_SetPropertyStr(ctx, response, "body", c.JS_NewStringLen(ctx, body.ptr, body.len));
             var arguments = [_]c.JSValue{response};
             const call_result = c.JS_Call(ctx, slot.resolve, qjs.undefinedValue(), 1, &arguments);
             c.JS_FreeValue(ctx, call_result);
             c.JS_FreeValue(ctx, response);
+        } else if (work.result.failure == .unavailable) {
+            var buffer: [640]u8 = undefined;
+            rejectPromise(ctx, slot.reject, std.fmt.bufPrint(&buffer, "FetchUnavailable: wfetch cannot run on this machine: {s}", .{network.unavailableReason()}) catch "FetchUnavailable: wfetch cannot run on this machine: WINHTTP.dll could not be loaded");
         } else {
-            rejectPromise(ctx, slot.reject, switch (slot.result.failure) {
+            rejectPromise(ctx, slot.reject, switch (work.result.failure) {
                 .invalid_url => "HttpsRequired: wfetch accepts only https:// URLs",
                 .timed_out => "FetchTimeout: request exceeded 15 seconds",
                 .request_too_large => "RequestTooLarge: wfetch request exceeds 5 MB",
                 .response_too_large => "ResponseTooLarge: wfetch response exceeds 5 MB",
                 .cancelled => "FetchCancelled: request was cancelled",
                 .request_failed => "FetchFailed: request failed",
-                .none => unreachable,
+                .none, .unavailable => unreachable,
             });
         }
         c.JS_FreeValue(ctx, slot.resolve);
         c.JS_FreeValue(ctx, slot.reject);
-        slot.request.deinit(std.heap.page_allocator);
-        slot.result.deinit(std.heap.page_allocator);
+        work.release();
         slot.* = .{};
     }
 }
