@@ -1,14 +1,20 @@
 # weaverd
 
-`weaverd` is intentionally a standalone native process, not a Native SDK
+On macOS, `weaverd` is a standalone native process, not a Native SDK
 application. It owns singleton acquisition, registration reconciliation,
-crash/backoff supervision, process cost sampling, and acknowledged
-reload/shutdown; on macOS also provider lifetime/fan-out. On Windows the
-widget host runs the providers on threads of its own and launches `--dev`
-widgets in its job (ADR 0022 step 3, runtime/src/provider_service.zig and
-dev_widgets.zig); weaverd asks it for their counters. Constructing the Widget renderer and
-QuickJS in the one always-running process would spend memory without buying a
-host capability.
+crash/backoff supervision, process cost sampling, acknowledged
+reload/shutdown, and provider lifetime/fan-out.
+
+On Windows the widget host is the daemon (ADR 0022 step 4,
+runtime/src/daemon.zig): it owns the singleton and the control objects, the
+registry, status, the crash ledger, the providers, `--dev` widgets and the
+shared renderer, the last two in a job only it holds. `weaverd` only starts
+the host and restarts it after a crash (src/windows_host.zig), and is the
+CLI's quick client for the host's control objects (`--probe`,
+`--probe-reload-ready`, `--signal-reload`, `--signal-down`). The registry
+slots, backoff and status format stay in src/supervisor.zig, which both
+platforms compile; src/host_contract.zig holds what weaverd and the Windows
+host agree on.
 
 The macOS host reads the shared renderer's wire contract from the pinned
 Native SDK submodule. Initialize it with `git submodule update --init
@@ -48,10 +54,9 @@ zig build test -Doptimize=ReleaseFast
 The runtime's build (runtime/build.zig) discovers the SDK and compiles the
 Windows providers here with its C++/WinRT projection plus `windowsapp.lib`;
 no package-manager C++ dependency is required. weaverd itself no longer
-links them. The
-TypeScript CLI remains the sole Widget checker/bundler on both platforms. The
-host invokes it only when `widget.tsx` is newer than `dist/bundle.js` or the
-dist manifest is missing.
+links them. The TypeScript CLI remains the sole Widget checker/bundler on both
+platforms. The host invokes it only when `widget.tsx` is newer than
+`dist/bundle.js` or the dist manifest is missing.
 
 Persistent state lives at `%LOCALAPPDATA%\weaver` on Windows and
 `~/Library/Application Support/Weaver` on macOS. macOS logs live at

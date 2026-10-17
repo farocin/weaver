@@ -18,8 +18,9 @@
 //!   (media_commands.RateLimiter); every command is acknowledged, with
 //!   `ok:false` when it is refused, rate limited or declined;
 //! - a command the media session cannot carry (SMTC timed out or threw)
-//!   fails that widget's channel: it gets nothing more, and weaverd, which
-//!   reads `takeFailures`, restarts it on its crash budget;
+//!   fails that widget's channel: it gets nothing more, and the daemon
+//!   (daemon.zig), which reads `takeFailures`, restarts it on its crash
+//!   budget;
 //! - frames never wake a widget (its provider timer drains them); an
 //!   acknowledgement does;
 //! - cpu, memory and media frames reach a widget when they changed or it
@@ -42,7 +43,7 @@ const win = @cImport({
     @cInclude("windows.h");
 });
 
-/// Subscribers at once. weaverd registers at most 32 widgets
+/// Subscribers at once. The daemon registers at most 32 widgets
 /// (host/src/supervisor.zig max_widgets), each either hosted or a dev
 /// widget, and a widget unsubscribes before its replacement subscribes: 32
 /// is the most a registry reaches. Twice that is a tripwire.
@@ -120,8 +121,8 @@ pub const Delivery = enum {
     failed,
 };
 
-/// A subscriber, as weaverd knows it: a hosted widget's slot in the host,
-/// or a dev widget's id (its slot in weaverd's registry).
+/// A subscriber, as the daemon knows it: a hosted widget's slot in the
+/// host, or a dev widget's id (its slot in the daemon's registry).
 pub const Owner = union(enum) {
     hosted: u16,
     dev: u16,
@@ -170,7 +171,7 @@ pub const Subscriber = struct {
     lane: ?*anyopaque = null,
 };
 
-/// The channels that failed since weaverd last asked: a bit per hosted
+/// The channels that failed since the daemon last asked: a bit per hosted
 /// slot and per dev id.
 pub const Failures = struct {
     hosted: u32 = 0,
@@ -1147,7 +1148,7 @@ test "a declined command is acknowledged false" {
     service.unsubscribe(&player.subscriber);
 }
 
-test "a command the media session cannot carry fails the channel, for weaverd to restart" {
+test "a command the media session cannot carry fails the channel, for the daemon to restart" {
     var service = TestService.init(.{ .outcome = .channel_failure });
     defer service.deinit();
     var player: Probe = .{};

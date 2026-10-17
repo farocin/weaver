@@ -54,7 +54,7 @@ pub const Client = struct {
     subscriber: provider_service.Subscriber = undefined,
 
     /// Subscribe to the host's own providers for what `wants` names: the
-    /// widget in host slot `slot`, as weaverd knows it.
+    /// widget in host slot `slot`, as the daemon knows it.
     pub fn initLocal(self: *Client, io: std.Io, service: *provider_service.Service, wants: provider_service.Wants, slot: u16) !void {
         self.io = io;
         self.subscriber = .{

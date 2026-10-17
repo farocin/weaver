@@ -103,10 +103,29 @@ pub fn build(b: *std.Build) void {
 }
 
 fn addPlatformLinkage(b: *std.Build, compile: *std.Build.Step.Compile, os_tag: std.Target.Os.Tag, is_test: bool) void {
+    const target = compile.root_module.resolved_target.?;
+    const optimize = compile.root_module.optimize;
+    // What weaverd and the widget host agree on: the control objects' names,
+    // the host's exit codes and its record's layout.
+    compile.root_module.addImport("host_contract", b.createModule(.{
+        .root_source_file = b.path("../host/src/host_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     switch (os_tag) {
         .windows => {
             addWindowsMonitor(b, compile);
-            compile.root_module.addImport("host_providers", hostProvidersModule(b, compile.root_module.resolved_target.?, compile.root_module.optimize));
+            compile.root_module.addImport("host_providers", hostProvidersModule(b, target, optimize));
+            // The daemon host's registry slots, backoff and status format
+            // (runtime/src/daemon.zig): the same files macOS weaverd
+            // compiles, so the two platforms keep one state machine.
+            compile.root_module.addImport("host_supervisor", b.createModule(.{
+                .root_source_file = b.path("../host/src/supervisor.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+            // Process memory counters for the daemon's status rows.
+            compile.root_module.linkSystemLibrary("psapi", .{});
             compile.root_module.linkSystemLibrary("winhttp", .{});
             // windows_monitor.cpp: virtual-screen metrics (user32) and
             // the DPI fallback (gdi32). The exe gets both transitively

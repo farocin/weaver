@@ -116,8 +116,9 @@ pub fn build(b: *std.Build) void {
         return;
     }
     if (target.result.os.tag != .windows) @panic("weaverd supports only Windows and macOS");
-    // On Windows weaverd supervises the widget host and runs no provider:
-    // the host compiles them (runtime/build.zig addHostProviders).
+    // On Windows weaverd only starts the widget host and restarts it after a
+    // crash; the host is the daemon (runtime/src/daemon.zig) and compiles
+    // the providers (runtime/build.zig hostProvidersModule).
     const exe = b.addExecutable(.{
         .name = "weaverd",
         .root_module = b.createModule(.{
@@ -127,7 +128,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.subsystem = .Windows;
-    for ([_][]const u8{ "c", "kernel32", "psapi" }) |library| exe.root_module.linkSystemLibrary(library, .{});
+    for ([_][]const u8{ "c", "kernel32" }) |library| exe.root_module.linkSystemLibrary(library, .{});
     b.installArtifact(exe);
 
     const tests = b.addTest(.{
@@ -137,7 +138,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    for ([_][]const u8{ "c", "kernel32", "psapi" }) |library| tests.root_module.linkSystemLibrary(library, .{});
+    for ([_][]const u8{ "c", "kernel32" }) |library| tests.root_module.linkSystemLibrary(library, .{});
     const test_step = b.step("test", "Run weaverd unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

@@ -1,4 +1,4 @@
-//! Dev widgets (`weaver dev`) in the anchored host (ADR 0022 step 3). Each
+//! Dev widgets (`weaver dev`) in the daemon host (ADR 0022 steps 3, 4). Each
 //! keeps a process of its own, so its hot swaps touch only it, but the host
 //! launches it, inside a job object only the host holds: when the host dies,
 //! for whatever reason, Windows ends its dev widgets too, and none runs on
@@ -6,11 +6,11 @@
 //! a pipe only its own process may open, in the line protocol it spoke to
 //! weaverd before (provider_windows.Client).
 //!
-//! weaverd still decides when a dev widget runs: it sends `launchDev` and
-//! `stopDev` over the control pipe, and watches the process by the PID the
-//! host answers with. All of this runs on the control-pipe thread and the
-//! dev widget's own reader and writer threads; widgets in the host and the
-//! UI thread are never involved.
+//! The host's management thread (daemon.zig) decides when a dev widget runs
+//! and watches its process. All of this runs on that thread and the dev
+//! widget's own reader and writer threads; widgets in the host and the UI
+//! thread are never involved. The shared renderer runs in the same job
+//! (`startInJob`).
 const std = @import("std");
 const media_commands = @import("host_providers").media_commands;
 const host_control = @import("host_control.zig");
@@ -23,11 +23,11 @@ const win = @cImport({
     @cInclude("windows.h");
 });
 
-/// Dev widget ids are weaverd's registry slots (host/src/supervisor.zig
+/// Dev widget ids are the daemon's registry slots (host/src/supervisor.zig
 /// max_widgets).
 pub const max_dev_widgets: usize = 32;
 /// How long a dev widget has to open its provider pipe: weaverd's wait for
-/// the same pipe, which dev loads have always met.
+/// the same pipe before the host served it, which dev loads have always met.
 pub const connect_timeout_ms: u64 = 5_000;
 /// The provider pipe's buffers and its writes' deadline, as weaverd had them.
 const pipe_buffer_bytes: u32 = 8192;
@@ -44,36 +44,39 @@ const exit_wait_ms: u32 = 1000;
 const invalid_handle = win.INVALID_HANDLE_VALUE;
 
 pub const Launch = struct {
-    /// weaverd's slot for it.
+    /// The daemon's registry slot for it.
     id: u16,
     /// Its bundle directory (`dist`).
     dir: []const u8,
     /// Where it reports its renderer (WEAVER_BACKEND_FILE).
     backend: ?[]const u8 = null,
-    /// What its manifest declares; weaverd read it.
+    /// What its manifest declares; the daemon read it.
     wants: provider_service.Wants = .{},
     /// It draws through the shared renderer.
     gpu: bool = false,
 };
 
 pub const DevWidgets = struct {
-    /// Every dev widget's process is in it. Only this process holds it, and
-    /// it ends them all when that handle closes, as it does when the host
-    /// exits.
+    /// Every dev widget's process, and the shared renderer, is in it. Only
+    /// this process holds it, and it ends them all when that handle closes,
+    /// as it does when the host exits.
     job: win.HANDLE,
     service: *provider_service.Service,
     /// The host's environment, which a dev widget inherits less the
     /// host's own channels.
     environment: *const std.process.Environ.Map,
+    /// The renderer and art cache the host chose, for dev widgets whose
+    /// manifests use them.
+    channels: Channels,
     widgets: [max_dev_widgets]?*DevWidget = @splat(null),
 
-    pub fn init(service: *provider_service.Service, environment: *const std.process.Environ.Map) !DevWidgets {
+    pub fn init(service: *provider_service.Service, environment: *const std.process.Environ.Map, channels: Channels) !DevWidgets {
         const job = win.CreateJobObjectW(null, null) orelse return error.CreateJobFailed;
         errdefer _ = win.CloseHandle(job);
         var limits = std.mem.zeroes(win.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
         limits.BasicLimitInformation.LimitFlags = win.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (win.SetInformationJobObject(job, win.JobObjectExtendedLimitInformation, &limits, @sizeOf(@TypeOf(limits))) == 0) return error.SetJobLimitsFailed;
-        return .{ .job = job, .service = service, .environment = environment };
+        return .{ .job = job, .service = service, .environment = environment, .channels = channels };
     }
 
     /// Launch dev widget `request.id`: its PID, once it has opened its
@@ -90,6 +93,36 @@ pub const DevWidgets = struct {
         try widget.start(self, request);
         self.widgets[request.id] = widget;
         return widget.pid;
+    }
+
+    /// Dev widget `id`'s process while it runs: the daemon watches it exit
+    /// and samples its cost. The handle stays valid until `stop`.
+    pub fn process(self: *const DevWidgets, id: u16) ?win.HANDLE {
+        if (id >= max_dev_widgets) return null;
+        const widget = self.widgets[id] orelse return null;
+        return widget.process;
+    }
+
+    pub const Started = struct { process: win.HANDLE, pid: u32 };
+
+    /// Start `command_line`, with `environment` when given, suspended; put it
+    /// in the job, then let it run: from its first instruction it cannot
+    /// outlive the host. The caller owns the process handle.
+    pub fn startInJob(self: *DevWidgets, command_line: [:0]u16, environment: ?*const std.process.Environ.WindowsBlock) !Started {
+        var startup = std.mem.zeroes(win.STARTUPINFOW);
+        startup.cb = @sizeOf(win.STARTUPINFOW);
+        var info = std.mem.zeroes(win.PROCESS_INFORMATION);
+        const flags = win.CREATE_NO_WINDOW | win.CREATE_SUSPENDED | win.CREATE_UNICODE_ENVIRONMENT;
+        const block: ?*anyopaque = if (environment) |value| @ptrCast(@constCast(value.slice.ptr)) else null;
+        if (win.CreateProcessW(null, command_line.ptr, null, null, 0, flags, block, null, &startup, &info) == 0) return error.CreateProcessFailed;
+        defer _ = win.CloseHandle(info.hThread);
+        errdefer {
+            _ = win.TerminateProcess(info.hProcess, 1);
+            _ = win.CloseHandle(info.hProcess);
+        }
+        if (win.AssignProcessToJobObject(self.job, info.hProcess) == 0) return error.JobAssignFailed;
+        if (win.ResumeThread(info.hThread) == std.math.maxInt(win.DWORD)) return error.ResumeFailed;
+        return .{ .process = info.hProcess, .pid = info.dwProcessId };
     }
 
     /// Stop dev widget `id`: `graceful` lets it close its window first.
@@ -152,22 +185,13 @@ const DevWidget = struct {
             break :name name;
         } else null;
 
-        const block = try environmentBlock(allocator, owner.environment, request, pipe_name);
+        const block = try environmentBlock(allocator, owner.environment, owner.channels, request, pipe_name);
         defer block.deinit(allocator);
         const command_line = try commandLine(allocator, request.dir);
         defer allocator.free(command_line);
-        var startup = std.mem.zeroes(win.STARTUPINFOW);
-        startup.cb = @sizeOf(win.STARTUPINFOW);
-        var info = std.mem.zeroes(win.PROCESS_INFORMATION);
-        const flags = win.CREATE_NO_WINDOW | win.CREATE_SUSPENDED | win.CREATE_UNICODE_ENVIRONMENT;
-        if (win.CreateProcessW(null, command_line.ptr, null, null, 0, flags, @ptrCast(@constCast(block.slice.ptr)), null, &startup, &info) == 0) return error.CreateProcessFailed;
-        self.process = info.hProcess;
-        self.pid = info.dwProcessId;
-        defer _ = win.CloseHandle(info.hThread);
-        // In the job before it runs a single instruction: from here, it
-        // cannot outlive the host.
-        if (win.AssignProcessToJobObject(owner.job, info.hProcess) == 0) return error.DevJobAssignFailed;
-        if (win.ResumeThread(info.hThread) == std.math.maxInt(win.DWORD)) return error.ResumeFailed;
+        const started = try owner.startInJob(command_line, &block);
+        self.process = started.process;
+        self.pid = started.pid;
         if (pipe_name == null) return;
 
         if (!connectPipe(self.pipe, self.process, self.pid, connect_timeout_ms)) return error.ConnectPipeFailed;
@@ -314,8 +338,8 @@ const DevWidget = struct {
 
 /// `"<this executable>" --dev "<dir>"`, as weaverd launched dev widgets.
 fn commandLine(allocator: std.mem.Allocator, dir: []const u8) ![:0]u16 {
-    // Windows' longest path, on the heap: this runs on the control thread,
-    // whose stack stays as deep as it ever went.
+    // Windows' longest path, on the heap: a thread's stack stays as deep as
+    // it ever went.
     const exe_w = try allocator.alloc(u16, 32768);
     defer allocator.free(exe_w);
     const length = win.GetModuleFileNameW(null, exe_w.ptr, @intCast(exe_w.len));
@@ -330,7 +354,8 @@ fn commandLine(allocator: std.mem.Allocator, dir: []const u8) ![:0]u16 {
 /// The host's own channels, which a dev widget must not inherit; it gets
 /// its own where it needs them.
 const host_channels = [_][]const u8{
-    "WEAVER_CONTROL_PIPE",
+    "WEAVER_HOST_CRASHES",
+    "WEAVER_HOST_EXIT_CODE",
     "WEAVER_HOST_PIPE",
     "WEAVER_HOST_ENDPOINT",
     "WEAVER_BACKEND_FILE",
@@ -338,17 +363,26 @@ const host_channels = [_][]const u8{
     "WEAVER_ART_CACHE",
 };
 
+/// The renderer pipe and art cache the host passes to the dev widgets that
+/// use them.
+pub const Channels = struct {
+    renderer_pipe: ?[]const u8 = null,
+    art_cache: ?[]const u8 = null,
+};
+
 /// A dev widget's environment: the host's, less the host's channels, plus
 /// its provider pipe and backend file, and the renderer and art cache when
-/// its manifest uses them (what weaverd set for it).
-fn environmentBlock(allocator: std.mem.Allocator, base: *const std.process.Environ.Map, request: Launch, pipe_name: ?[]const u8) !std.process.Environ.WindowsBlock {
-    var map = try base.clone(allocator);
-    defer map.deinit();
+/// its manifest uses them (what weaverd set for it before the host
+/// launched it). Built for each launch and freed after it.
+fn environmentBlock(allocator: std.mem.Allocator, base: *const std.process.Environ.Map, channels: Channels, request: Launch, pipe_name: ?[]const u8) !std.process.Environ.WindowsBlock {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var map = try base.clone(arena_state.allocator());
     for (host_channels) |key| _ = map.orderedRemove(key);
     if (pipe_name) |name| try map.put("WEAVER_HOST_PIPE", name);
     if (request.backend) |path| try map.put("WEAVER_BACKEND_FILE", path);
-    if (request.gpu) if (base.get("WEAVER_RENDERER_PIPE")) |value| try map.put("WEAVER_RENDERER_PIPE", value);
-    if (request.wants.media) if (base.get("WEAVER_ART_CACHE")) |value| try map.put("WEAVER_ART_CACHE", value);
+    if (request.gpu) if (channels.renderer_pipe) |value| try map.put("WEAVER_RENDERER_PIPE", value);
+    if (request.wants.media) if (channels.art_cache) |value| try map.put("WEAVER_ART_CACHE", value);
     return map.createWindowsBlock(allocator, .{});
 }
 
@@ -427,9 +461,10 @@ test "a dev widget's environment holds its channels and none of the host's" {
     var base = std.process.Environ.Map.init(std.testing.allocator);
     defer base.deinit();
     try base.put("PATH", "C:\\Windows");
-    try base.put("WEAVER_CONTROL_PIPE", "\\\\.\\pipe\\control");
-    try base.put("WEAVER_RENDERER_PIPE", "\\\\.\\pipe\\renderer");
-    try base.put("WEAVER_ART_CACHE", "C:\\art");
+    try base.put("WEAVER_HOST_CRASHES", "2");
+    // The host's own, inherited from weaverd or a shell: never passed on.
+    try base.put("WEAVER_RENDERER_PIPE", "\\\\.\\pipe\\inherited");
+    try base.put("WEAVER_ART_CACHE", "C:\\inherited");
     try base.put("WEAVER_BACKEND_FILE", "C:\\host-backend");
     const Case = struct { request: Launch, pipe: ?[]const u8, expected: []const []const u8, absent: []const []const u8 };
     const cases = [_]Case{
@@ -437,17 +472,17 @@ test "a dev widget's environment holds its channels and none of the host's" {
             .request = .{ .id = 1, .dir = "d", .backend = "C:\\b", .gpu = true, .wants = .{ .media = true } },
             .pipe = "\\\\.\\pipe\\dev",
             .expected = &.{ "PATH=C:\\Windows", "WEAVER_HOST_PIPE=\\\\.\\pipe\\dev", "WEAVER_BACKEND_FILE=C:\\b", "WEAVER_RENDERER_PIPE=\\\\.\\pipe\\renderer", "WEAVER_ART_CACHE=C:\\art" },
-            .absent = &.{"WEAVER_CONTROL_PIPE"},
+            .absent = &.{"WEAVER_HOST_CRASHES"},
         },
         .{
             .request = .{ .id = 2, .dir = "d" },
             .pipe = null,
             .expected = &.{"PATH=C:\\Windows"},
-            .absent = &.{ "WEAVER_CONTROL_PIPE", "WEAVER_HOST_PIPE", "WEAVER_RENDERER_PIPE", "WEAVER_ART_CACHE", "WEAVER_BACKEND_FILE" },
+            .absent = &.{ "WEAVER_HOST_CRASHES", "WEAVER_HOST_PIPE", "WEAVER_RENDERER_PIPE", "WEAVER_ART_CACHE", "WEAVER_BACKEND_FILE" },
         },
     };
     for (cases) |case| {
-        const block = try environmentBlock(std.testing.allocator, &base, case.request, case.pipe);
+        const block = try environmentBlock(std.testing.allocator, &base, .{ .renderer_pipe = "\\\\.\\pipe\\renderer", .art_cache = "C:\\art" }, case.request, case.pipe);
         defer block.deinit(std.testing.allocator);
         const text = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, block.slice);
         defer std.testing.allocator.free(text);
@@ -467,7 +502,7 @@ test "a dev widget's job ends its process when the job's last handle closes" {
     defer service.deinit();
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    const devs = try DevWidgets.init(&service, &environment);
+    const devs = try DevWidgets.init(&service, &environment, .{});
     // A process that would wait a minute, in the job.
     var startup = std.mem.zeroes(win.STARTUPINFOW);
     startup.cb = @sizeOf(win.STARTUPINFOW);

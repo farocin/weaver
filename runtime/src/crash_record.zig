@@ -1,11 +1,13 @@
 //! The widget host's record of itself (ADR 0022): which generation of the
 //! host is running, and, when it dies, whether a widget's code was running
-//! on the thread that crashed. A daemon host keeps it mapped from
-//! `%LOCALAPPDATA%\weaver\host.record`; the daemon reads it after the
-//! process is gone. Mapped file pages outlive the process, so a crash needs
-//! no flush, and the crash path only does plain stores into a slot that
-//! was there from the start: the faulting thread's stack and heap may be
-//! broken.
+//! on the thread that crashed, and which widget each of its slots holds. A
+//! daemon host keeps it mapped from `%LOCALAPPDATA%\weaver\host.record`;
+//! after the process is gone, `weaverd` reads it to decide how to restart
+//! it, and the next host reads it to quarantine the widget that crashed
+//! (runtime/src/daemon.zig). Mapped file pages outlive the process, so a
+//! crash needs no flush, and the crash path only does plain stores into a
+//! slot that was there from the start: the faulting thread's stack and heap
+//! may be broken.
 //!
 //! A crash is attributed to a widget only on evidence: the thread that
 //! crashed was running that widget's JavaScript turn (`beginTurn`). Any
@@ -15,68 +17,21 @@ const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 
-pub const magic: u32 = 0x5248_5657; // "WVHR"
-pub const version: u32 = 1;
+const contract = @import("host_contract");
 
-pub const State = enum(u32) { none = 0, running = 1, stopped = 2, _ };
-
-pub const CrashKind = enum(u32) {
-    none = 0,
-    /// The thread was running a widget's turn: `Crash.slot` names it.
-    widget_turn = 1,
-    /// The UI thread, outside any widget's turn.
-    ui = 2,
-    /// Any other thread outside a widget's turn.
-    other = 3,
-    _,
-};
+pub const magic = contract.record_magic;
+pub const version = contract.record_version;
+pub const State = contract.RecordState;
+pub const CrashKind = contract.CrashKind;
+pub const Turn = contract.Turn;
+pub const Crash = contract.Crash;
+/// The file's layout, shared with weaverd (host/src/host_contract.zig).
+pub const Record = contract.Record;
 
 /// The exception code recorded for a Zig panic (`notePanic`): "panic" in
 /// the customer bit range of NTSTATUS, so it never collides with a real
 /// exception code.
 pub const panic_code: u32 = 0xE057_0001;
-
-/// The widget whose turn is running, and on which thread.
-pub const Turn = extern struct {
-    /// Its slot in the host plus one; zero between turns.
-    slot: u32 = 0,
-    thread: u32 = 0,
-    /// Wyhash of its bundle.js, as loaded.
-    bundle: u64 = 0,
-};
-
-pub const Crash = extern struct {
-    kind: CrashKind = .none,
-    /// The exception code, or `panic_code`.
-    code: u32 = 0,
-    thread: u32 = 0,
-    /// For `widget_turn`: the widget's slot plus one and its bundle.
-    slot: u32 = 0,
-    bundle: u64 = 0,
-    /// When it happened, as a Windows FILETIME.
-    time: u64 = 0,
-};
-
-/// The file's layout. weaverd mirrors it (host/src/windows_host.zig,
-/// `HostRecord`); change both together and bump `version`.
-pub const Record = extern struct {
-    magic: u32,
-    version: u32,
-    /// One more than the previous host's: tells a reader which start a
-    /// record belongs to.
-    generation: u64,
-    pid: u32,
-    state: State,
-    /// Process creation time (FILETIME): with `pid`, tells this process
-    /// from a later one that reused its PID.
-    start_time: u64,
-    turn: Turn,
-    crash: Crash,
-};
-
-comptime {
-    std.debug.assert(@sizeOf(Record) == 80);
-}
 
 var record: ?*volatile Record = null;
 var ui_thread: u32 = 0;
@@ -97,9 +52,11 @@ extern "kernel32" fn RaiseFailFastException(record: ?*windows.EXCEPTION_RECORD, 
 /// Map the record at `path` (creating it), start a new generation marked
 /// running, and route unhandled exceptions through `noteCrash`. Called on
 /// the UI thread, before any widget loads. A record that can't be opened
-/// leaves attribution off; the host still runs.
-pub fn open(path: []const u8) !void {
-    if (builtin.os.tag != .windows) return;
+/// leaves attribution off; the host still runs. Returns the previous
+/// host's record, when the file held one this version wrote: the host
+/// consumes it exactly once, because this start overwrites it.
+pub fn open(path: []const u8) !?Record {
+    if (builtin.os.tag != .windows) return null;
     var wide: [1024:0]u16 = undefined;
     const length = try std.unicode.utf8ToUtf16Le(&wide, path);
     if (length >= wide.len) return error.NameTooLong;
@@ -121,7 +78,7 @@ pub fn open(path: []const u8) !void {
     const file_map_write: u32 = 0x0002;
     const view = MapViewOfFile(mapping, file_map_write, 0, 0, @sizeOf(Record)) orelse return error.MapFailed;
     const mapped: *volatile Record = @ptrCast(@alignCast(view));
-    const previous = if (mapped.magic == magic and mapped.version == version) mapped.generation else 0;
+    const previous: ?Record = if (mapped.magic == magic and mapped.version == version) mapped.* else null;
     var created: u64 = 0;
     var unused: u64 = 0;
     _ = GetProcessTimes(GetCurrentProcess(), &created, &unused, &unused, &unused);
@@ -130,15 +87,17 @@ pub fn open(path: []const u8) !void {
     mapped.state = .none;
     mapped.magic = magic;
     mapped.version = version;
-    mapped.generation = previous + 1;
+    mapped.generation = if (previous) |last| last.generation + 1 else 1;
     mapped.pid = GetCurrentProcessId();
     mapped.start_time = created;
     mapped.turn = .{};
     mapped.crash = .{};
+    mapped.slots = @splat(.{});
     mapped.state = .running;
     ui_thread = GetCurrentThreadId();
     record = mapped;
     _ = SetUnhandledExceptionFilter(onUnhandledException);
+    return previous;
 }
 
 /// Stop recording and unmap the record (tests; a host keeps it to the end).
@@ -153,6 +112,15 @@ pub fn close() void {
 pub fn markStopped() void {
     const mapped = record orelse return;
     mapped.state = .stopped;
+}
+
+/// Host slot `slot` now holds the widget named by `name_hash`, launched
+/// from the bundle modified at `artifact`: what the next host quarantines
+/// if this one crashes in its turn. Plain stores, before the widget loads.
+pub fn noteSlot(slot: u16, name_hash: u64, artifact: i64) void {
+    const mapped = record orelse return;
+    if (slot >= mapped.slots.len) return;
+    mapped.slots[slot] = .{ .name_hash = name_hash, .artifact = artifact };
 }
 
 /// A widget's turn starts on this thread: `slot` is its slot in the host.
@@ -241,14 +209,23 @@ test "a new start takes the next generation and clears the last crash" {
     defer std.testing.allocator.free(directory);
     const path = try std.fs.path.join(std.testing.allocator, &.{ directory, "host.record" });
     defer std.testing.allocator.free(path);
-    try open(path);
+    _ = try open(path);
     const first = record.?.generation;
+    beginTurn(3, 7);
+    noteSlot(3, 0x1234, 99);
     noteCrash(0xC000_0005);
     close();
-    try open(path);
+    // The next start hands back the crashed one's record, then clears it.
+    const previous = (try open(path)).?;
     defer close();
+    try std.testing.expectEqual(first, previous.generation);
+    try std.testing.expectEqual(CrashKind.widget_turn, previous.crash.kind);
+    try std.testing.expectEqual(@as(u32, 4), previous.crash.slot);
+    try std.testing.expectEqual(@as(u64, 0x1234), previous.slots[3].name_hash);
+    try std.testing.expectEqual(@as(i64, 99), previous.slots[3].artifact);
     try std.testing.expectEqual(first + 1, record.?.generation);
     try std.testing.expectEqual(State.running, record.?.state);
     try std.testing.expectEqual(CrashKind.none, record.?.crash.kind);
+    try std.testing.expectEqual(@as(u64, 0), record.?.slots[3].name_hash);
     try std.testing.expectEqual(GetCurrentProcessId(), record.?.pid);
 }

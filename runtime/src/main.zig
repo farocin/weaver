@@ -22,6 +22,8 @@ const crash_record = @import("crash_record.zig");
 const small_fs = @import("small_fs.zig");
 const provider_service = if (builtin.os.tag == .windows) @import("provider_service.zig") else struct {};
 const dev_widgets_mod = if (builtin.os.tag == .windows) @import("dev_widgets.zig") else struct {};
+const daemon_mod = if (builtin.os.tag == .windows) @import("daemon.zig") else struct {};
+const host_contract = @import("host_contract");
 
 comptime {
     if (native_sdk.platform.max_windows != max_host_widgets or
@@ -149,22 +151,22 @@ fn slotLabels(comptime prefix: []const u8) [max_host_widgets][]const u8 {
     return labels;
 }
 
-/// The daemon's host on Windows: its main window is a hidden anchor that
-/// owns the app, and every widget is a declared window. Dev, capture and
-/// other platforms keep slot 0 in the main window. Set once, before the app
-/// starts.
+/// The daemon host on Windows (`weaver-widget --host` with no directories,
+/// ADR 0022): its main window is a hidden anchor that owns the app, and
+/// every widget is a declared window. Dev, capture and other platforms keep
+/// slot 0 in the main window. Set once, before the app starts.
 var anchored_host = false;
 
-/// The daemon's control pipe (`host_control`), open in an anchored host.
-var control_pipe: ?host_control.Pipe = null;
-/// Commands read from it, waiting for the UI thread (`applyControl`).
+/// The daemon's management thread (daemon.zig) and the loads and unloads
+/// it posts, waiting for the UI thread (`applyControl`).
+var daemon: if (builtin.os.tag == .windows) ?*daemon_mod.Daemon else ?*anyopaque = null;
 var control_mailbox: host_control.Mailbox = .{};
 /// What a widget the daemon adds loads with.
 var control_environment: ?HostEnvironment = null;
 /// The anchored host's own providers: every widget it runs subscribes to
 /// them in process, and its dev widgets through their pipes. Windows only.
 var host_providers: if (builtin.os.tag == .windows) ?*provider_service.Service else ?*anyopaque = null;
-/// The anchored host's dev widgets, in its job (`dev_widgets`).
+/// The anchored host's dev widgets and renderer, in its job (`dev_widgets`).
 var dev_widgets: if (builtin.os.tag == .windows) ?*dev_widgets_mod.DevWidgets else ?*anyopaque = null;
 
 /// The first slot that renders in a declared window.
@@ -175,6 +177,14 @@ fn firstDeclaredSlot() u16 {
 /// The slots an anchored host can fill: Native's window budget
 /// (`platform.max_windows`, equal to `max_host_widgets`) less the anchor.
 const max_anchored_widgets: usize = max_host_widgets - 1;
+
+comptime {
+    // The daemon hands out the slots, and the record names each one.
+    if (builtin.os.tag == .windows and daemon_mod.max_hosted_widgets != max_anchored_widgets) {
+        @compileError("daemon.max_hosted_widgets must be max_anchored_widgets");
+    }
+    if (host_contract.record_slots != max_host_widgets) @compileError("host_contract.record_slots must be max_host_widgets");
+}
 
 fn windowLabel(slot: u16) []const u8 {
     return if (slot < firstDeclaredSlot()) main_window_label else slot_window_labels[slot];
@@ -1771,6 +1781,10 @@ const HostEnvironment = struct {
     data_root: []const u8,
     log_directory: []const u8,
     capture_state_root: ?[]const u8,
+    /// Where media artwork lives (WEAVER_ART_CACHE): the daemon host's own
+    /// under its data root, a dev widget's from its environment, none in
+    /// capture.
+    art_cache_root: ?[]const u8,
     force_software: bool,
     dev: bool,
     /// Launched as `--host`: per-widget settings arrive as
@@ -1811,26 +1825,18 @@ const WidgetChannels = struct {
 /// QuickJS recursion guard.
 const loader_stack_bytes: usize = 16 * 1024 * 1024;
 
-/// Stack for the control-pipe reader (`serveControl`).
-const control_stack_bytes: usize = 256 * 1024;
-
 /// Run every widget in `directories` in this one process: one Native app,
 /// one window per widget. Slot 0 is the scene's main window. A single
 /// directory is the ordinary one-widget runtime.
 ///
-/// A `--host` launched with WEAVER_CONTROL_PIPE (Windows) is anchored
-/// instead: it starts with no widget, and the daemon adds and removes them
-/// over that pipe while the others keep running (`host_control`).
+/// A `--host` with no directories (Windows) is the daemon instead
+/// (daemon.zig): it starts with no widget, reads the registry itself, and
+/// adds and removes widgets while the others keep running.
 fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, hosted: bool) !void {
     const allocator = init.arena.allocator();
-    const control_pipe_name = if (hosted and builtin.os.tag == .windows) init.environ_map.get("WEAVER_CONTROL_PIPE") else null;
-    anchored_host = control_pipe_name != null;
-    if (anchored_host and directories.len > 0) {
-        std.debug.print("weaver-widget --host: with WEAVER_CONTROL_PIPE set, widgets arrive over the control pipe; drop the {d} directories from the command line\n", .{directories.len});
-        return error.InvalidArguments;
-    }
+    anchored_host = hosted and builtin.os.tag == .windows and directories.len == 0;
     if (!anchored_host and directories.len == 0) {
-        std.debug.print("weaver-widget --host: no widget directories, and no WEAVER_CONTROL_PIPE to add them over\n", .{});
+        std.debug.print("weaver-widget --host: no widget directories; with none, --host is the daemon host, which runs only on Windows\n", .{});
         return error.InvalidArguments;
     }
     if (directories.len > max_host_widgets) {
@@ -1847,17 +1853,24 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     backend_status_io = init.io;
     const local_app_data = init.environ_map.get("LOCALAPPDATA");
     const home = init.environ_map.get("HOME");
+    const data_root = if (capture_state_root) |root| root else try platform.dataRoot(allocator, local_app_data, home);
     // Capture receives its own empty state root from the CLI. Keeping the
     // branch here, beside the ordinary bootstrap, makes it impossible for a
     // headless run to inherit live storage, geometry, or per-widget logs.
     const environment: HostEnvironment = .{
         .init = init,
-        .data_root = if (capture_state_root) |root| root else try platform.dataRoot(allocator, local_app_data, home),
+        .data_root = data_root,
         .log_directory = if (capture_state_root) |root|
             try std.fs.path.join(allocator, &.{ root, "logs" })
         else
             try platform.logsRoot(allocator, local_app_data, home),
         .capture_state_root = capture_state_root,
+        .art_cache_root = if (capture_state_root != null)
+            null
+        else if (anchored_host)
+            try std.fs.path.join(allocator, &.{ data_root, "artcache" })
+        else
+            init.environ_map.get("WEAVER_ART_CACHE"),
         .force_software = if (init.environ_map.get("WEAVER_FORCE_SOFTWARE")) |value| std.mem.eql(u8, value, "1") else false,
         .dev = dev,
         .hosted = hosted,
@@ -1869,23 +1882,8 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         capture_warnings.initCaptureSink(init.io, try std.fs.path.join(allocator, &.{ root, "warnings.txt" }));
     }
 
-    if (anchored_host) {
-        // Before any widget loads: a crash from here on is recorded.
-        const record_path = try std.fs.path.join(allocator, &.{ environment.data_root, "host.record" });
-        std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
-        crash_record.open(record_path) catch |err| {
-            std.debug.print("weaver-widget --host: no crash record at {s}: {s}; crashes go unattributed\n", .{ record_path, @errorName(err) });
-        };
-        if (builtin.os.tag == .windows) try startHostProviders(init);
-    }
+    if (builtin.os.tag == .windows and anchored_host) try startDaemon(init, environment);
     defer crash_record.markStopped();
-    if (control_pipe_name) |name| {
-        control_pipe = host_control.Pipe.connect(name) catch |err| {
-            std.debug.print("weaver-widget --host: cannot open the control pipe {s}: {s}\n", .{ name, @errorName(err) });
-            return err;
-        };
-        control_environment = environment;
-    }
 
     var loader: Loader = .{ .environment = environment, .directories = directories };
     const widgets = try loader.run();
@@ -2015,22 +2013,63 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     };
 }
 
-/// The anchored host runs the providers itself (ADR 0022 step 3): their
-/// workers start with their first subscriber. Its dev widgets run in a job
-/// only it holds.
-fn startHostProviders(init: std.process.Init) !void {
+/// Everything the daemon host needs before any widget loads (ADR 0022):
+/// its crash record, the renderer pipe its widgets connect to, the
+/// providers (their workers start with their first subscriber), a job only
+/// it holds for its dev widgets and renderer, and the management thread's
+/// state. The management thread itself starts with the runtime
+/// (`startRendererDiagnostics`).
+fn startDaemon(init: std.process.Init, environment: HostEnvironment) !void {
+    const allocator = std.heap.page_allocator;
+    // Control comes up first, before any widget loads: a second host
+    // leaves at once.
+    const objects = daemon_mod.Objects.claim() catch |err| switch (err) {
+        error.AlreadyRunning => {
+            std.debug.print("weaver-widget --host: another widget host is already running for this user; this one exits\n", .{});
+            std.process.exit(@intCast(host_contract.exit_already_running));
+        },
+        else => return err,
+    };
+    std.Io.Dir.cwd().createDirPath(init.io, environment.data_root) catch {};
+    // From here on, a crash is recorded.
+    const record_path = try std.fs.path.join(allocator, &.{ environment.data_root, "host.record" });
+    const previous = crash_record.open(record_path) catch |err| previous: {
+        std.debug.print("weaver-widget --host: no crash record at {s}: {s}; crashes go unattributed\n", .{ record_path, @errorName(err) });
+        break :previous null;
+    };
+    const renderer_pipe_name = try std.fmt.allocPrint(allocator, "\\\\.\\pipe\\weaver-renderer-{d}", .{platform.currentProcessId()});
+    try daemon_mod.exportRendererPipe(renderer_pipe_name);
     // Widgets resolve media artwork under the art cache (image_paths), so
     // it must exist before any loads; the media worker owns what is in it.
-    const art_cache_root = init.environ_map.get("WEAVER_ART_CACHE");
-    if (art_cache_root) |root| std.Io.Dir.cwd().createDirPath(init.io, root) catch |err| {
-        std.debug.print("weaver-widget --host: the art cache {s} could not be created: {s}; media artwork is unavailable\n", .{ root, @errorName(err) });
+    const art_cache_root = environment.art_cache_root.?;
+    std.Io.Dir.cwd().createDirPath(init.io, art_cache_root) catch |err| {
+        std.debug.print("weaver-widget --host: the art cache {s} could not be created: {s}; media artwork is unavailable\n", .{ art_cache_root, @errorName(err) });
     };
-    const service = try std.heap.page_allocator.create(provider_service.Service);
+    const service = try allocator.create(provider_service.Service);
     service.* = .init(.{ .io = init.io, .art_cache_root = art_cache_root });
     host_providers = service;
-    const devs = try std.heap.page_allocator.create(dev_widgets_mod.DevWidgets);
-    devs.* = try .init(service, init.environ_map);
+    const devs = try allocator.create(dev_widgets_mod.DevWidgets);
+    devs.* = try .init(service, init.environ_map, .{ .renderer_pipe = renderer_pipe_name, .art_cache = art_cache_root });
     dev_widgets = devs;
+    control_environment = environment;
+    daemon = try daemon_mod.Daemon.create(.{
+        .io = init.io,
+        .environment = init.environ_map,
+        .data_directory = environment.data_root,
+        .renderer_pipe_name = renderer_pipe_name,
+        .force_software = environment.force_software,
+        .service = service,
+        .devs = devs,
+        .post = postControl,
+        .previous = previous,
+        .restart = .fromEnvironment(init.environ_map),
+    }, objects);
+}
+
+/// Hand the daemon's load or unload to the UI thread (`applyControl`).
+fn postControl(pending: *host_control.Pending) void {
+    control_mailbox.post(pending);
+    requestExternalWake("control");
 }
 
 /// Loads every widget on a short-lived thread. Loading reads manifests,
@@ -2161,7 +2200,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ch
         init.io,
         std.heap.page_allocator,
         directory,
-        if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
+        environment.art_cache_root,
     );
     model.image_resolver = image_resolver;
     // Fonts load with the widget, so a missing face is this widget's
@@ -2325,8 +2364,6 @@ fn applyControl(host: *Host, effects: *Effects) void {
     const outcome = switch (pending.command) {
         .add => |add| addWidget(host, effects, add),
         .remove => |remove| removeWidget(host, effects, remove.id),
-        // serveControl carries these out itself.
-        .launch_dev, .stop_dev, .providers => unreachable,
     };
     if (outcome) |_| {} else |err| pending.failure = err;
 }
@@ -2402,92 +2439,6 @@ fn retireWidget(model: *Model, effects: WidgetEffects) void {
     for (model.images[0..model.image_count]) |image| _ = effects.unregisterImage(image.id);
     for (model.image_states[0..model.image_state_count]) |state| {
         if (state.registered) _ = effects.unregisterImage(state.id);
-    }
-}
-
-/// Read the daemon's commands, one at a time, answering each when it has
-/// taken effect. `add` and `remove` go to the UI thread; dev widgets and the
-/// providers' counters are served here. The host lives as long as the
-/// daemon holds the pipe: when it closes, the host exits.
-fn serveControl(pipe: host_control.Pipe) void {
-    // It runs no widget's code, and launching a dev widget can log.
-    widget_log.detachThread();
-    const buffer = std.heap.page_allocator.alloc(u8, host_control.max_line_bytes) catch {
-        std.debug.print("weaver-widget: control pipe buffer allocation failed; exiting\n", .{});
-        std.process.exit(1);
-    };
-    var reader: host_control.LineReader = .{ .buffer = buffer };
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    while (true) {
-        while (reader.next()) |line| {
-            _ = arena_state.reset(.retain_capacity);
-            var answer_buffer: [host_control.max_answer_bytes]u8 = undefined;
-            var answer = std.Io.Writer.fixed(&answer_buffer);
-            if (host_control.parse(arena_state.allocator(), line)) |command| serve: {
-                if (!command.forUiThread()) {
-                    switch (builtin.os.tag) {
-                        .windows => serveOffUiThread(&answer, command) catch unreachable,
-                        else => unreachable,
-                    }
-                    break :serve;
-                }
-                var pending: host_control.Pending = .{ .command = command };
-                control_mailbox.post(&pending);
-                requestExternalWake("control");
-                pending.done.waitUncancelable(control_environment.?.init.io);
-                host_control.answer(&answer, command, pending.failure) catch unreachable;
-            } else |err| {
-                host_control.refuse(&answer, err) catch unreachable;
-            }
-            pipe.writeAll(answer.buffered()) catch break;
-        }
-        const room = reader.space();
-        if (room.len == 0) {
-            std.debug.print("weaver-widget: a control command is longer than max_line_bytes={d}; exiting\n", .{host_control.max_line_bytes});
-            std.process.exit(1);
-        }
-        // A page at a time: a read into the whole room made all of it
-        // resident (292 KiB measured), though commands are a few hundred
-        // bytes and a line that long is the rare case.
-        const count = pipe.read(room[0..@min(room.len, 4096)]);
-        if (count == 0) break;
-        reader.filled(count);
-    }
-    crash_record.markStopped();
-    std.process.exit(0);
-}
-
-/// A control command that touches no widget, carried out on the control
-/// thread: dev widgets (`dev_widgets`) and the providers' counters.
-fn serveOffUiThread(answer: *std.Io.Writer, command: host_control.Command) !void {
-    const devs = dev_widgets.?;
-    const service = host_providers.?;
-    switch (command) {
-        .launch_dev => |launch| try host_control.answerLaunched(answer, launch.id, devs.launch(.{
-            .id = launch.id,
-            .dir = launch.dir,
-            .backend = launch.backend,
-            .wants = provider_service.Wants.fromManifest(launch.subscribe, launch.capabilities),
-            .gpu = launch.gpu,
-        })),
-        .stop_dev => |stop| try host_control.answer(answer, command, if (devs.stop(stop.id, stop.graceful)) |_| null else |err| err),
-        .providers => {
-            const status = service.snapshot();
-            const failures = service.takeFailures();
-            try host_control.answerProviders(answer, .{
-                .system_sample_count = status.system_sample_count,
-                .system_frames = status.system_frames,
-                .audio_capture_active = status.audio_capture_active,
-                .audio_silent = status.audio_silent,
-                .audio_frames = status.audio_frames,
-                .audio_availability = status.audio_availability.label(),
-                .audio_capture_starts = status.audio_capture_starts,
-                .audio_provider_frames = status.audio_provider_frames,
-                .audio_last_error = status.audio_last_error,
-                .media_frames = status.media_frames,
-            }, failures.hosted, failures.dev);
-        },
-        .add, .remove => unreachable,
     }
 }
 
@@ -2990,15 +2941,9 @@ fn startRendererDiagnostics(context: *anyopaque, runtime: *native_sdk.Runtime) !
         }
     }
     if (wake_pending) try runtime.options.platform.services.requestFrame();
-    // Commands wake the runtime, so they are read only once it can be woken.
-    if (control_pipe) |pipe| {
-        // Zig's default spawn commits 16 MiB of stack on Windows. This
-        // thread blocks on a pipe and parses one small JSON line at a time:
-        // the provider reader's shape (provider_windows.zig's receipt sizes
-        // that at 256 KiB, 9x its live locals) with smaller locals.
-        const thread = try std.Thread.spawn(.{ .stack_size = control_stack_bytes }, serveControl, .{pipe});
-        thread.detach();
-    }
+    // Every load and unload wakes the runtime, so the daemon's management
+    // starts only once it can be woken.
+    if (builtin.os.tag == .windows) if (daemon) |management| try management.start();
 }
 
 fn requestExternalWake(label: []const u8) void {
@@ -3043,6 +2988,7 @@ test {
     if (builtin.os.tag == .windows) {
         _ = provider_service;
         _ = dev_widgets_mod;
+        _ = daemon_mod;
         _ = @import("provider_windows.zig");
     }
     const automatic_software_backend: native_sdk.app_manifest.GpuSurfaceBackend =

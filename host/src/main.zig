@@ -19,6 +19,7 @@ test {
     _ = platform_host;
     _ = @import("backoff.zig");
     _ = @import("registry.zig");
+    _ = @import("host_contract.zig");
     // The providers run in weaverd on macOS. On Windows the widget host runs
     // them, and runtime/build.zig tests them there
     // (windows_provider_sources.zig).
