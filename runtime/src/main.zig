@@ -2060,6 +2060,9 @@ fn hostMain(init: std.process.Init, directories: []const []const u8, dev: bool, 
         app.capture_pending_fn = capturePendingWork;
         app.capture_validate_fn = validateCapture;
     }
+    // Its own frame, below every live one: inlined, its marker would sit
+    // inside this function's frame, above some of its live variables.
+    if (builtin.os.tag == .windows and anchored_host) @call(.never_inline, discardDeadStack, .{});
     runner.runWithOptions(app, .{
         .app_name = "weaver-widget",
         .window_title = primary.name,
@@ -2215,6 +2218,27 @@ fn openRecord(path: []const u8, restarted: bool) ?host_contract.Record {
     }
 }
 
+/// Give back the main thread's stack pages below the caller's frame before
+/// the host settles into its event loop. Startup runs std.Io's Windows path
+/// helpers on this thread: directory creation and path conversion have
+/// 262 KiB and 197 KiB frames (dirCreateDirWindows, wToPrefixedFileW), and
+/// every page they touched stayed resident for the host's life (deep dive,
+/// 2026-10-17: 524 KiB of main-thread stack, 256 KiB of it in use once the
+/// widgets tick). Below the caller those pages are dead; discarded, Windows
+/// drops them, and a later call that reaches as deep gets fresh pages.
+/// Must not be inlined (see its call).
+fn discardDeadStack() void {
+    const page = std.heap.page_size_min;
+    const tib = &std.os.windows.teb().NtTib;
+    const low = @intFromPtr(tib.StackLimit);
+    var here: u8 = 0;
+    // Slack under this frame for the call below.
+    const high = std.mem.alignBackward(usize, @intFromPtr(&here), page) -| 2 * page;
+    if (high <= low) return;
+    _ = DiscardVirtualMemory(@ptrFromInt(low), high - low);
+}
+
+extern "kernel32" fn DiscardVirtualMemory(address: *anyopaque, size: usize) callconv(.winapi) u32;
 extern "kernel32" fn SetErrorMode(mode: u32) callconv(.winapi) u32;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
