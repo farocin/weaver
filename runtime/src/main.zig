@@ -400,7 +400,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
     // update callback's stack frame, where it would consume most of
     // QuickJS's recorded C-stack allowance.
     const candidate_tree = try std.heap.page_allocator.create(tree_mod.Tree);
-    candidate_tree.* = .{};
+    tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
     var candidate_tree_moved = false;
     defer {
         if (!candidate_tree_moved) candidate_tree.deinit();
@@ -411,7 +411,7 @@ fn reloadIfChanged(model: *Model, effects: *Effects) !void {
         error.HotSwapMismatch => block: {
             preserved = false;
             candidate_tree.deinit();
-            candidate_tree.* = .{};
+            tree_mod.resetEmpty(candidate_tree, std.heap.page_allocator);
             break :block try evaluateCandidate(model, candidate_tree, source, null);
         },
         else => return err,
@@ -1379,6 +1379,24 @@ fn nativeWindowLayers(manifest_layer: []const u8) NativeWindowLayers {
     return .{ .shell = .normal, .startup = .normal };
 }
 
+/// `WidgetApp.create` default-initializes the Model with `self.model = .{}`,
+/// which copies its whole default image: 4.3 MB, almost all of it the retained
+/// tree's node and canvas arenas, made resident in every Widget before the
+/// tree uses a slot. Setting the Model one field at a time, and the tree
+/// through `resetEmpty`, leaves the arenas untouched until nodes occupy them.
+fn createWidgetApp(options: WidgetApp.Options) !*WidgetApp {
+    const app = try std.heap.page_allocator.create(WidgetApp);
+    WidgetApp.initInPlace(app, std.heap.page_allocator, options);
+    inline for (std.meta.fields(Model)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "tree")) {
+            tree_mod.resetEmpty(&app.model.tree, std.heap.page_allocator);
+        } else {
+            @field(app.model, field.name) = field.defaultValue().?;
+        }
+    }
+    return app;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -1513,7 +1531,7 @@ pub fn main(init: std.process.Init) !void {
 
     var tokens = native_sdk.canvas.DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark });
     tokens.colors.background = native_sdk.canvas.Color.rgba8(0, 0, 0, 0);
-    const app_state = try WidgetApp.create(std.heap.page_allocator, .{
+    const app_state = try createWidgetApp(.{
         .name = loaded.manifest.name,
         .scene = scene,
         .canvas_label = "widget-canvas",
