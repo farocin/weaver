@@ -1534,7 +1534,7 @@ fn seedImageStates(model: *Model) !void {
 
 fn deinitImageStates(model: *Model) void {
     for (model.image_states[0..model.image_state_count]) |*state| {
-        if (state.observed) |observed| std.heap.page_allocator.free(observed);
+        if (state.observed) |observed| small_allocator.free(observed);
     }
     model.image_state_count = 0;
 }
@@ -1557,21 +1557,21 @@ fn addImageState(model: *Model, id: tree_mod.NodeId, lifetime: u64) !*ImageState
 fn removeImageState(model: *Model, effects: WidgetEffects, index: usize) void {
     const state = &model.image_states[index];
     if (state.registered) _ = effects.unregisterImage(state.id);
-    if (state.observed) |observed| std.heap.page_allocator.free(observed);
+    if (state.observed) |observed| small_allocator.free(observed);
     model.image_state_count -= 1;
     if (index != model.image_state_count) model.image_states[index] = model.image_states[model.image_state_count];
     model.image_states[model.image_state_count] = .{};
 }
 
 fn replaceObserved(state: *ImageState, observed: [:0]u8, valid: bool) void {
-    if (state.observed) |previous| std.heap.page_allocator.free(previous);
+    if (state.observed) |previous| small_allocator.free(previous);
     state.observed = observed;
     state.observed_valid = valid;
     state.load_failure_count = 0;
 }
 
 fn rememberRawSource(state: *ImageState, source: []const u8) !void {
-    replaceObserved(state, try std.heap.page_allocator.dupeZ(u8, source), false);
+    replaceObserved(state, try small_allocator.dupeZ(u8, source), false);
 }
 
 fn observedEquals(state: *const ImageState, source: []const u8, valid: bool) bool {
@@ -1620,7 +1620,7 @@ fn synchronizeImageNode(model: *Model, effects: WidgetEffects, id: tree_mod.Node
         return;
     };
     if (observedImageLoadSettled(state, resolved.path)) {
-        std.heap.page_allocator.free(resolved.path);
+        small_allocator.free(resolved.path);
         return;
     }
     const bytes = std.Io.Dir.cwd().readFileAlloc(
@@ -1646,27 +1646,44 @@ fn synchronizeImageNode(model: *Model, effects: WidgetEffects, id: tree_mod.Node
     clearImageFailure(state);
 }
 
+test "a widget's image paths are freed by the allocator that made them" {
+    const root = ".zig-cache/weaver-image-state-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const image = root ++ "/cover.img";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = image, .data = "image" });
+    var resolver = try image_paths.Resolver.init(std.testing.io, small_allocator, root, null);
+    defer resolver.deinit();
+    var state: ImageState = .{};
+    // A resolved path, a raw source and a failure each replace the last.
+    replaceObserved(&state, (try resolver.resolve("cover.img")).path, true);
+    try rememberRawSource(&state, "missing.img");
+    recordImageLoadFailure(&state, (try resolver.resolve("cover.img")).path);
+    if (state.observed) |observed| small_allocator.free(observed);
+}
+
 test "image reload failures retry twice then settle until the source changes" {
     var state: ImageState = .{};
-    defer if (state.observed) |observed| std.heap.page_allocator.free(observed);
+    defer if (state.observed) |observed| small_allocator.free(observed);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "first.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "first.img"));
     try std.testing.expect(!observedImageLoadSettled(&state, "first.img"));
     try std.testing.expectEqual(@as(u8, 1), state.load_failure_count);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "first.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "first.img"));
     try std.testing.expect(!observedImageLoadSettled(&state, "first.img"));
     try std.testing.expectEqual(@as(u8, 2), state.load_failure_count);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "first.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "first.img"));
     try std.testing.expect(observedImageLoadSettled(&state, "first.img"));
     try std.testing.expectEqual(max_image_load_attempts, state.load_failure_count);
 
-    recordImageLoadFailure(&state, try std.heap.page_allocator.dupeZ(u8, "second.img"));
+    recordImageLoadFailure(&state, try small_allocator.dupeZ(u8, "second.img"));
     try std.testing.expect(!observedImageLoadSettled(&state, "second.img"));
     try std.testing.expectEqual(@as(u8, 1), state.load_failure_count);
 
-    replaceObserved(&state, try std.heap.page_allocator.dupeZ(u8, "second.img"), true);
+    replaceObserved(&state, try small_allocator.dupeZ(u8, "second.img"), true);
     try std.testing.expect(observedImageLoadSettled(&state, "second.img"));
     try std.testing.expectEqual(@as(u8, 0), state.load_failure_count);
 }
