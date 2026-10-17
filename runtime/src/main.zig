@@ -1625,7 +1625,19 @@ fn createModel() !*Model {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(allocator);
+    const all_args = try init.minimal.args.toSlice(allocator);
+    // Every widget runs in the shared, frozen realm (js_engine.zig), in the
+    // host, under `weaver dev` and in capture alike, so a widget behaves
+    // the same everywhere. A leading `--own-realms` gives each widget a
+    // realm of its own instead.
+    const own_realms = all_args.len >= 2 and std.mem.eql(u8, all_args[1], "--own-realms");
+    js_engine.shared_realm_enabled = !own_realms;
+    const args = if (own_realms) rest: {
+        const rest = try allocator.alloc([:0]const u8, all_args.len - 1);
+        rest[0] = all_args[0];
+        @memcpy(rest[1..], all_args[2..]);
+        break :rest rest;
+    } else all_args;
     // Shared render host mode: this process becomes the one Metal-owning
     // renderer every macOS widget talks to (weaverd spawns and supervises
     // it; docs/macos-memory-handoff.md carries the receipts). It never
@@ -1649,9 +1661,9 @@ pub fn main(init: std.process.Init) !void {
         // The render-host form is parsed only on macOS; advertise it only
         // where it is accepted.
         std.debug.print(if (weaver_build_options.render_host_enabled)
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
+            "usage: weaver-widget [--own-realms] [--dev] <widget-directory> | weaver-widget [--own-realms] --host <widget-directory>... | weaver-widget --render-host <bootstrap-name>\n"
         else
-            "usage: weaver-widget [--dev] <widget-directory> | weaver-widget --host <widget-directory>...\n", .{});
+            "usage: weaver-widget [--own-realms] [--dev] <widget-directory> | weaver-widget [--own-realms] --host <widget-directory>...\n", .{});
         return error.InvalidArguments;
     }
     const directory_arg: usize = if (dev) 2 else 1;
@@ -1699,7 +1711,6 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
     backend_status_io = init.io;
     if (hosted) {
         if (init.environ_map.get("WEAVER_CRASH_BREADCRUMB")) |name| crash_breadcrumb.open(name);
-        if (init.environ_map.get("WEAVER_SHARED_REALM")) |value| js_engine.shared_realm_enabled = std.mem.eql(u8, value, "1");
     }
     const local_app_data = init.environ_map.get("LOCALAPPDATA");
     const home = init.environ_map.get("HOME");
