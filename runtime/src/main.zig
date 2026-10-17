@@ -2370,7 +2370,10 @@ fn serveControl(pipe: host_control.Pipe) void {
             std.debug.print("weaver-widget: a control command is longer than max_line_bytes={d}; exiting\n", .{host_control.max_line_bytes});
             std.process.exit(1);
         }
-        const count = pipe.read(room);
+        // A page at a time: a read into the whole room made all of it
+        // resident (292 KiB measured), though commands are a few hundred
+        // bytes and a line that long is the rare case.
+        const count = pipe.read(room[0..@min(room.len, 4096)]);
         if (count == 0) break;
         reader.filled(count);
     }
