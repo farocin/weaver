@@ -20,6 +20,8 @@ const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
 const crash_record = @import("crash_record.zig");
 const small_fs = @import("small_fs.zig");
+const provider_service = if (builtin.os.tag == .windows) @import("provider_service.zig") else struct {};
+const dev_widgets_mod = if (builtin.os.tag == .windows) @import("dev_widgets.zig") else struct {};
 
 comptime {
     if (native_sdk.platform.max_windows != max_host_widgets or
@@ -159,6 +161,11 @@ var control_pipe: ?host_control.Pipe = null;
 var control_mailbox: host_control.Mailbox = .{};
 /// What a widget the daemon adds loads with.
 var control_environment: ?HostEnvironment = null;
+/// The anchored host's own providers: every widget it runs subscribes to
+/// them in process, and its dev widgets through their pipes. Windows only.
+var host_providers: if (builtin.os.tag == .windows) ?*provider_service.Service else ?*anyopaque = null;
+/// The anchored host's dev widgets, in its job (`dev_widgets`).
+var dev_widgets: if (builtin.os.tag == .windows) ?*dev_widgets_mod.DevWidgets else ?*anyopaque = null;
 
 /// The first slot that renders in a declared window.
 fn firstDeclaredSlot() u16 {
@@ -1869,6 +1876,7 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         crash_record.open(record_path) catch |err| {
             std.debug.print("weaver-widget --host: no crash record at {s}: {s}; crashes go unattributed\n", .{ record_path, @errorName(err) });
         };
+        if (builtin.os.tag == .windows) try startHostProviders(init);
     }
     defer crash_record.markStopped();
     if (control_pipe_name) |name| {
@@ -2005,6 +2013,24 @@ fn runHost(init: std.process.Init, directories: []const []const u8, dev: bool, h
         std.log.err("widget runtime stopped after platform callback failure: {s}", .{@errorName(err)});
         return err;
     };
+}
+
+/// The anchored host runs the providers itself (ADR 0022 step 3): their
+/// workers start with their first subscriber. Its dev widgets run in a job
+/// only it holds.
+fn startHostProviders(init: std.process.Init) !void {
+    // Widgets resolve media artwork under the art cache (image_paths), so
+    // it must exist before any loads; the media worker owns what is in it.
+    const art_cache_root = init.environ_map.get("WEAVER_ART_CACHE");
+    if (art_cache_root) |root| std.Io.Dir.cwd().createDirPath(init.io, root) catch |err| {
+        std.debug.print("weaver-widget --host: the art cache {s} could not be created: {s}; media artwork is unavailable\n", .{ root, @errorName(err) });
+    };
+    const service = try std.heap.page_allocator.create(provider_service.Service);
+    service.* = .init(.{ .io = init.io, .art_cache_root = art_cache_root });
+    host_providers = service;
+    const devs = try std.heap.page_allocator.create(dev_widgets_mod.DevWidgets);
+    devs.* = try .init(service, init.environ_map);
+    dev_widgets = devs;
 }
 
 /// Loads every widget on a short-lived thread. Loading reads manifests,
@@ -2149,6 +2175,14 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ch
         const capture_command_fixture = try allocator.create(provider_mod.CaptureCommandFixture);
         capture_command_fixture.* = .{ .commands = fixture.commands };
         model.provider.initCaptureFixture(init.io, capture_command_fixture);
+    } else if (builtin.os.tag == .windows and host_providers != null and capture_state_root == null) {
+        // In the anchored host: the host's own providers, in process.
+        const wants = provider_service.Wants.fromManifest(loaded.manifest.subscribe, loaded.manifest.capabilities);
+        if (wants.any()) {
+            try model.provider.initLocal(init.io, host_providers.?, wants, slot);
+        } else {
+            try model.provider.init(init.io, null);
+        }
     } else {
         try model.provider.init(init.io, if (capture_state_root == null)
             platform.providerEndpoint(channels.host_pipe, channels.host_endpoint)
@@ -2291,6 +2325,8 @@ fn applyControl(host: *Host, effects: *Effects) void {
     const outcome = switch (pending.command) {
         .add => |add| addWidget(host, effects, add),
         .remove => |remove| removeWidget(host, effects, remove.id),
+        // serveControl carries these out itself.
+        .launch_dev, .stop_dev, .providers => unreachable,
     };
     if (outcome) |_| {} else |err| pending.failure = err;
 }
@@ -2305,7 +2341,7 @@ fn addWidget(host: *Host, effects: *Effects, add: host_control.Add) anyerror!voi
     var load: WidgetLoad = .{
         .directory = add.dir,
         .slot = add.id,
-        .channels = .{ .backend_file = add.backend, .host_pipe = add.pipe },
+        .channels = .{ .backend_file = add.backend },
     };
     const model = try load.run();
     errdefer {
@@ -2369,10 +2405,13 @@ fn retireWidget(model: *Model, effects: WidgetEffects) void {
     }
 }
 
-/// Read the daemon's commands and hand each to the UI thread, one at a
-/// time, answering when it has taken effect. The host lives as long as the
+/// Read the daemon's commands, one at a time, answering each when it has
+/// taken effect. `add` and `remove` go to the UI thread; dev widgets and the
+/// providers' counters are served here. The host lives as long as the
 /// daemon holds the pipe: when it closes, the host exits.
 fn serveControl(pipe: host_control.Pipe) void {
+    // It runs no widget's code, and launching a dev widget can log.
+    widget_log.detachThread();
     const buffer = std.heap.page_allocator.alloc(u8, host_control.max_line_bytes) catch {
         std.debug.print("weaver-widget: control pipe buffer allocation failed; exiting\n", .{});
         std.process.exit(1);
@@ -2382,9 +2421,16 @@ fn serveControl(pipe: host_control.Pipe) void {
     while (true) {
         while (reader.next()) |line| {
             _ = arena_state.reset(.retain_capacity);
-            var answer_buffer: [160]u8 = undefined;
+            var answer_buffer: [host_control.max_answer_bytes]u8 = undefined;
             var answer = std.Io.Writer.fixed(&answer_buffer);
-            if (host_control.parse(arena_state.allocator(), line)) |command| {
+            if (host_control.parse(arena_state.allocator(), line)) |command| serve: {
+                if (!command.forUiThread()) {
+                    switch (builtin.os.tag) {
+                        .windows => serveOffUiThread(&answer, command) catch unreachable,
+                        else => unreachable,
+                    }
+                    break :serve;
+                }
                 var pending: host_control.Pending = .{ .command = command };
                 control_mailbox.post(&pending);
                 requestExternalWake("control");
@@ -2409,6 +2455,40 @@ fn serveControl(pipe: host_control.Pipe) void {
     }
     crash_record.markStopped();
     std.process.exit(0);
+}
+
+/// A control command that touches no widget, carried out on the control
+/// thread: dev widgets (`dev_widgets`) and the providers' counters.
+fn serveOffUiThread(answer: *std.Io.Writer, command: host_control.Command) !void {
+    const devs = dev_widgets.?;
+    const service = host_providers.?;
+    switch (command) {
+        .launch_dev => |launch| try host_control.answerLaunched(answer, launch.id, devs.launch(.{
+            .id = launch.id,
+            .dir = launch.dir,
+            .backend = launch.backend,
+            .wants = provider_service.Wants.fromManifest(launch.subscribe, launch.capabilities),
+            .gpu = launch.gpu,
+        })),
+        .stop_dev => |stop| try host_control.answer(answer, command, if (devs.stop(stop.id, stop.graceful)) |_| null else |err| err),
+        .providers => {
+            const status = service.snapshot();
+            const failures = service.takeFailures();
+            try host_control.answerProviders(answer, .{
+                .system_sample_count = status.system_sample_count,
+                .system_frames = status.system_frames,
+                .audio_capture_active = status.audio_capture_active,
+                .audio_silent = status.audio_silent,
+                .audio_frames = status.audio_frames,
+                .audio_availability = status.audio_availability.label(),
+                .audio_capture_starts = status.audio_capture_starts,
+                .audio_provider_frames = status.audio_provider_frames,
+                .audio_last_error = status.audio_last_error,
+                .media_frames = status.media_frames,
+            }, failures.hosted, failures.dev);
+        },
+        .add, .remove => unreachable,
+    }
 }
 
 /// Route this process's logging to `model` and return it: every host hook
@@ -2960,6 +3040,11 @@ test {
     _ = @import("small_fs.zig");
     _ = @import("host_control.zig");
     _ = @import("crash_record.zig");
+    if (builtin.os.tag == .windows) {
+        _ = provider_service;
+        _ = dev_widgets_mod;
+        _ = @import("provider_windows.zig");
+    }
     const automatic_software_backend: native_sdk.app_manifest.GpuSurfaceBackend =
         if (@import("builtin").os.tag == .macos) .metal else .software;
     try std.testing.expectEqual(automatic_software_backend, declaredGpuBackend("software", false));

@@ -2,8 +2,11 @@
 
 `weaverd` is intentionally a standalone native process, not a Native SDK
 application. It owns singleton acquisition, registration reconciliation,
-crash/backoff supervision, process cost sampling, provider lifetime/fan-out,
-and acknowledged reload/shutdown. Constructing the Widget renderer and
+crash/backoff supervision, process cost sampling, and acknowledged
+reload/shutdown; on macOS also provider lifetime/fan-out. On Windows the
+widget host runs the providers on threads of its own and launches `--dev`
+widgets in its job (ADR 0022 step 3, runtime/src/provider_service.zig and
+dev_widgets.zig); weaverd asks it for their counters. Constructing the Widget renderer and
 QuickJS in the one always-running process would spend memory without buying a
 host capability.
 
@@ -42,24 +45,26 @@ zig build -Doptimize=ReleaseFast
 zig build test -Doptimize=ReleaseFast
 ```
 
-The build discovers the SDK and uses its C++/WinRT projection plus
-`windowsapp.lib`; no package-manager C++ dependency is required. The
+The runtime's build (runtime/build.zig) discovers the SDK and compiles the
+Windows providers here with its C++/WinRT projection plus `windowsapp.lib`;
+no package-manager C++ dependency is required. weaverd itself no longer
+links them. The
 TypeScript CLI remains the sole Widget checker/bundler on both platforms. The
 host invokes it only when `widget.tsx` is newer than `dist/bundle.js` or the
 dist manifest is missing.
 
 Persistent state lives at `%LOCALAPPDATA%\weaver` on Windows and
 `~/Library/Application Support/Weaver` on macOS. macOS logs live at
-`~/Library/Logs/Weaver`. Windows uses named synchronization objects and one
-outbound provider pipe per subscribed Widget. macOS uses one acknowledged
+`~/Library/Logs/Weaver`. Windows uses named synchronization objects; widgets
+in the host get provider frames in process, and each subscribed `--dev`
+widget gets one pipe from the host. macOS uses one acknowledged
 control Unix socket and one unguessable, user-only provider socket per Widget
 that subscribes to an available host provider; stale child ownership is
 validated against the exact runtime executable before recovery.
 
 Provider ownership stays obvious:
 
-- CPU and memory are sampled once by the host only while subscribed, then
-  fanned out.
+- CPU and memory are sampled once only while subscribed, then fanned out.
 - Audio uses one capture and the shared 2048-point FFT, 32-band AGC/silence
   pipeline. macOS uses the public Core Audio process tap from 14.2 and explicit
   authorization; Windows uses WASAPI loopback.

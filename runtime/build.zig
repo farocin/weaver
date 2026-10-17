@@ -81,6 +81,13 @@ pub fn build(b: *std.Build) void {
     // Cross-target reviewers can compile the complete test artifact without
     // trying to execute a foreign binary. Native Linux CI uses the ordinary
     // `test` step; this step is the local proof that the same graph builds.
+    if (os_tag == .windows) {
+        // The providers' own tests (audio analysis, media frames, the art
+        // cache, command parsing): weaverd's tests ran them until it
+        // stopped running the providers.
+        const provider_tests = b.addTest(.{ .root_module = hostProvidersModule(b, target, artifacts.tests.root_module.optimize) });
+        b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(provider_tests).step);
+    }
     const test_compile_step = b.step("test-compile", "Compile tests without running them");
     test_compile_step.dependOn(&artifacts.tests.step);
 
@@ -99,6 +106,7 @@ fn addPlatformLinkage(b: *std.Build, compile: *std.Build.Step.Compile, os_tag: s
     switch (os_tag) {
         .windows => {
             addWindowsMonitor(b, compile);
+            compile.root_module.addImport("host_providers", hostProvidersModule(b, compile.root_module.resolved_target.?, compile.root_module.optimize));
             compile.root_module.linkSystemLibrary("winhttp", .{});
             // windows_monitor.cpp: virtual-screen metrics (user32) and
             // the DPI fallback (gdi32). The exe gets both transitively
@@ -142,6 +150,39 @@ fn addWindowsMonitor(b: *std.Build, compile: *std.Build.Step.Compile) void {
         .flags = &.{"-std=c++17"},
     });
     compile.root_module.addIncludePath(b.path("src"));
+}
+
+/// The providers the anchored host runs on its own threads (ADR 0022 step
+/// 3): system sampling, WASAPI audio, SMTC media and its art cache. Their
+/// sources stay in host/src while macOS weaverd still compiles the shared
+/// ones from there (host/src/windows_provider_sources.zig).
+fn hostProvidersModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode) *std.Build.Module {
+    const windows_sdk = std.zig.WindowsSdk.find(b.allocator, b.graph.io, target.result.cpu.arch, &b.graph.environ_map) catch @panic("the Windows 10 SDK is required to build the host's providers (C++/WinRT)");
+    defer windows_sdk.free(b.allocator);
+    const windows_10 = windows_sdk.windows10sdk orelse @panic("the Windows 10 SDK is required to build the host's providers (C++/WinRT)");
+    const windows_arch: []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => "x64",
+        .x86 => "x86",
+        .aarch64 => "arm64",
+        else => @panic("unsupported Windows architecture for the host's providers"),
+    };
+    const module = b.createModule(.{
+        .root_source_file = b.path("../host/src/windows_provider_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    module.addCSourceFile(.{
+        .file = b.path("../host/src/windows_providers.cpp"),
+        .flags = &.{ "-std=c++20", "-fexceptions", "-frtti" },
+    });
+    module.addIncludePath(b.path("../host/src"));
+    module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ windows_10.path, "Include", windows_10.version, "cppwinrt" }) });
+    module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ windows_10.path, "Lib", windows_10.version, "um", windows_arch }) });
+    for ([_][]const u8{ "c++", "ntdll", "ole32", "windowscodecs", "windowsapp" }) |library| {
+        module.linkSystemLibrary(library, .{});
+    }
+    return module;
 }
 
 fn addQuickJs(b: *std.Build, compile: *std.Build.Step.Compile, sources: []const []const u8, c_flags: []const []const u8) void {

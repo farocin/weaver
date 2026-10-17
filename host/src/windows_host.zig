@@ -1,12 +1,6 @@
 const std = @import("std");
 const supervisor = @import("supervisor.zig");
-const art_cache = @import("art_cache.zig");
-const audio = @import("audio.zig");
 const backoff = @import("backoff.zig");
-const media = @import("media.zig");
-const media_commands = @import("media_commands.zig");
-const providers = @import("providers.zig");
-const provider_protocol = @import("provider_protocol.zig");
 const registry = @import("registry.zig");
 
 const c = @cImport({
@@ -22,8 +16,6 @@ const reload_event_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\WeaverH
 const reload_signal_mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\WeaverHostReloadSignalV2");
 const reload_success_event_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\WeaverHostReloadSuccessV2");
 const reload_failure_event_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\WeaverHostReloadFailureV2");
-const env_pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_HOST_PIPE");
-const env_backend_file = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_BACKEND_FILE");
 const env_renderer_pipe = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER_PIPE");
 const env_renderer_log = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_RENDERER_LOG");
 const env_art_cache = std.unicode.utf8ToUtf16LeStringLiteral("WEAVER_ART_CACHE");
@@ -37,120 +29,25 @@ const max_hosted_widgets = max_widgets - 1;
 /// adding a clock answers in 6-15 ms, removing one in under 5 ms. Five
 /// seconds is what a hosted widget already had to load and connect.
 const control_answer_timeout_ms: u32 = 5_000;
+/// How long the host may take to launch a dev widget: the widget has 5 s to
+/// open its provider pipe (runtime/src/dev_widgets.zig connect_timeout_ms),
+/// then the usual answer time.
+const dev_launch_answer_timeout_ms: u32 = 5_000 + control_answer_timeout_ms;
+/// How long the host may take to stop a dev widget: a graceful stop waits
+/// 1.5 s for its window to close and 1 s for it to exit (dev_widgets.zig
+/// close_wait_ms, exit_wait_ms), then the usual answer time.
+const dev_stop_answer_timeout_ms: u32 = 2_500 + control_answer_timeout_ms;
+/// The longest answer the host sends: runtime/src/host_control.zig
+/// max_answer_bytes.
+const max_answer_bytes: usize = 1024;
 const max_path_bytes: usize = 2048;
 const invalid_handle = c.INVALID_HANDLE_VALUE;
 
-const MediaCommandResult = struct {
-    id: u64,
-    outcome: media.Provider.CommandOutcome,
-};
-
-/// One bounded worker belongs to one transport-capable widget. SMTC async
-/// waits never run on the global supervision loop, while FIFO remains local
-/// to that widget and the host loop remains the sole endpoint writer.
-const MediaCommandExecutor = struct {
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    provider: *media.Provider,
-    thread: std.Thread,
-    mutex: std.Io.Mutex = .init,
-    condition: std.Io.Condition = .init,
-    commands: [media_commands.queue_capacity]media_commands.Command = undefined,
-    command_head: usize = 0,
-    command_count: usize = 0,
-    results: [media_commands.queue_capacity]MediaCommandResult = undefined,
-    result_head: usize = 0,
-    result_count: usize = 0,
-    stopping: bool = false,
-
-    fn start(io: std.Io, allocator: std.mem.Allocator, provider: *media.Provider) !*MediaCommandExecutor {
-        const self = try allocator.create(MediaCommandExecutor);
-        errdefer allocator.destroy(self);
-        self.* = .{ .io = io, .allocator = allocator, .provider = provider, .thread = undefined };
-        self.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, threadMain, .{self});
-        return self;
-    }
-
-    fn deinit(self: *MediaCommandExecutor) void {
-        self.mutex.lockUncancelable(self.io);
-        self.stopping = true;
-        self.condition.broadcast(self.io);
-        self.mutex.unlock(self.io);
-        self.thread.join();
-        const allocator = self.allocator;
-        allocator.destroy(self);
-    }
-
-    fn submit(self: *MediaCommandExecutor, command: media_commands.Command) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.stopping or self.command_count == self.commands.len) return false;
-        const index = (self.command_head + self.command_count) % self.commands.len;
-        self.commands[index] = command;
-        self.command_count += 1;
-        self.condition.signal(self.io);
-        return true;
-    }
-
-    fn takeResult(self: *MediaCommandExecutor) ?MediaCommandResult {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.result_count == 0) return null;
-        const result = self.results[self.result_head];
-        self.result_head = (self.result_head + 1) % self.results.len;
-        self.result_count -= 1;
-        self.condition.signal(self.io);
-        return result;
-    }
-
-    fn threadMain(self: *MediaCommandExecutor) void {
-        while (true) {
-            self.mutex.lockUncancelable(self.io);
-            while (self.command_count == 0 and !self.stopping) {
-                self.condition.waitUncancelable(self.io, &self.mutex);
-            }
-            if (self.stopping) {
-                self.mutex.unlock(self.io);
-                return;
-            }
-            const command = self.commands[self.command_head];
-            self.command_head = (self.command_head + 1) % self.commands.len;
-            self.command_count -= 1;
-            self.mutex.unlock(self.io);
-
-            const result: MediaCommandResult = .{
-                .id = command.id,
-                .outcome = self.provider.command(command.verb, command.seek_ms),
-            };
-            self.mutex.lockUncancelable(self.io);
-            while (self.result_count == self.results.len and !self.stopping) {
-                self.condition.waitUncancelable(self.io, &self.mutex);
-            }
-            if (self.stopping) {
-                self.mutex.unlock(self.io);
-                return;
-            }
-            const index = (self.result_head + self.result_count) % self.results.len;
-            self.results[index] = result;
-            self.result_count += 1;
-            self.mutex.unlock(self.io);
-        }
-    }
-};
-
 const WindowsSlotState = struct {
+    /// A dev widget's process, which the shared host launched in its job:
+    /// opened by its PID to watch it and sample its cost.
     process: c.HANDLE = null,
     pid: u32 = 0,
-    pipe: c.HANDLE = invalid_handle,
-    write_event: c.HANDLE = null,
-    command_shutdown_event: c.HANDLE = null,
-    command_thread: ?std.Thread = null,
-    command_stopping: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    test_before_command_read: c.HANDLE = null,
-    test_resume_command_read: c.HANDLE = null,
-    media_command_executor: ?*MediaCommandExecutor = null,
-    command_queue: media_commands.Queue = .{},
-    command_rate: media_commands.RateLimiter = .{},
     previous_process_ticks: u64 = 0,
     previous_sample_ms: u64 = 0,
     private_samples: [15]u64 = [_]u64{0} ** 15,
@@ -159,8 +56,6 @@ const WindowsSlotState = struct {
     sample_cursor: usize = 0,
     backend_path_buffer: [max_path_bytes]u8 = undefined,
     backend_path_len: usize = 0,
-    pipe_name_buffer: [256]u8 = undefined,
-    pipe_name_len: usize = 0,
     /// The widget runs inside the shared host (`SharedHost`) rather than
     /// a process of its own; `process` stays null.
     hosted: bool = false,
@@ -171,10 +66,6 @@ const WindowsSlotState = struct {
 
     fn backendPath(self: *const WindowsSlotState) []const u8 {
         return self.backend_path_buffer[0..self.backend_path_len];
-    }
-
-    fn pipeName(self: *const WindowsSlotState) []const u8 {
-        return self.pipe_name_buffer[0..self.pipe_name_len];
     }
 
     fn averages(self: *const WindowsSlotState) struct { private_mb: f64, cpu: f64 } {
@@ -219,9 +110,10 @@ const RendererState = supervisor.RendererState(WindowsRendererState);
 
 /// Every widget not in `--dev` runs in one `weaver-widget --host` process
 /// (ADR 0020), added and removed over its control pipe while the others
-/// keep running (ADR 0022). Hosted slots hold no process of their own.
-/// When the host dies, its record (`HostRecord`) says whether a widget's
-/// code crashed it.
+/// keep running (ADR 0022). Hosted slots hold no process of their own. The
+/// host also runs the providers, and launches `--dev` widgets in a job of
+/// its own, so they die with it (ADR 0022 step 3). When the host dies, its
+/// record (`HostRecord`) says whether a widget's code crashed it.
 const SharedHost = struct {
     process: WindowsRendererState = .{},
     started_ms: u64 = 0,
@@ -336,13 +228,69 @@ const Ledger = struct {
 /// The host's answer to one control command.
 const ControlAnswer = struct {
     ok: bool = false,
-    buffer: [128]u8 = undefined,
+    /// A launched dev widget's process.
+    pid: u32 = 0,
+    buffer: [max_answer_bytes]u8 = undefined,
+    len: usize = 0,
     error_start: usize = 0,
     error_len: usize = 0,
 
     /// The error that stopped the command; empty when it took effect.
     fn errorName(self: *const ControlAnswer) []const u8 {
         return self.buffer[self.error_start..][0..self.error_len];
+    }
+
+    /// The whole answer line, without its newline.
+    fn text(self: *const ControlAnswer) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+/// What the host last said of its providers (`{"providers":{}}`), for
+/// status. The counters add up across host restarts (`provider_totals`), as
+/// they did while weaverd ran the providers itself.
+const ProviderReport = struct {
+    counters: Counters = .{},
+    audio_capture_active: bool = false,
+    audio_silent: bool = true,
+    audio_availability_buffer: [32]u8 = undefined,
+    audio_availability_len: usize = 0,
+    audio_last_error: i32 = 0,
+
+    const Counters = struct {
+        system_sample_count: u64 = 0,
+        system_frames: u64 = 0,
+        audio_frames: u64 = 0,
+        media_frames: u64 = 0,
+        audio_capture_starts: u64 = 0,
+        audio_provider_frames: u64 = 0,
+
+        fn plus(a: Counters, b: Counters) Counters {
+            var sum: Counters = .{};
+            inline for (std.meta.fields(Counters)) |field| @field(sum, field.name) = @field(a, field.name) + @field(b, field.name);
+            return sum;
+        }
+    };
+
+    /// The answer's wire shape (runtime/src/host_control.zig answerProviders).
+    const Wire = struct {
+        providers: struct {
+            systemSampleCount: u64 = 0,
+            systemFrames: u64 = 0,
+            audioCaptureActive: bool = false,
+            audioSilent: bool = true,
+            audioPipeFrames: u64 = 0,
+            audioAvailability: []const u8 = "idle",
+            audioCaptureStarts: u64 = 0,
+            audioProviderFrames: u64 = 0,
+            audioLastError: i32 = 0,
+            mediaPipeFrames: u64 = 0,
+        } = .{},
+        failed: struct { hosted: []const u16 = &.{}, dev: []const u16 = &.{} } = .{},
+    };
+
+    fn availability(self: *const ProviderReport) []const u8 {
+        return if (self.audio_availability_len == 0) "idle" else self.audio_availability_buffer[0..self.audio_availability_len];
     }
 };
 
@@ -368,18 +316,10 @@ const Host = struct {
     renderer: RendererState = .{},
     shared: SharedHost = .{},
     slots: [max_widgets]Slot = [_]Slot{.{}} ** max_widgets,
-    sampler: providers.Sampler = .{},
-    audio_provider: audio.Provider = .{},
-    media_provider: media.Provider = .{},
-    previous_cpu: [8192]u8 = undefined,
-    previous_cpu_len: usize = 0,
-    previous_memory: [512]u8 = undefined,
-    previous_memory_len: usize = 0,
-    system_frames: u64 = 0,
-    previous_media: [media.max_media_frame_bytes]u8 = undefined,
-    previous_media_len: usize = 0,
-    audio_pipe_frames: u64 = 0,
-    media_pipe_frames: u64 = 0,
+    /// The running host's providers, as it last reported them.
+    provider_report: ProviderReport = .{},
+    /// Earlier hosts' last counters.
+    provider_totals: ProviderReport.Counters = .{},
     thread_sample_ms: u64 = 0,
     slot_threads: [max_widgets]u32 = [_]u32{0} ** max_widgets,
     renderer_threads: u32 = 0,
@@ -443,10 +383,7 @@ const Host = struct {
                 .stop_missing => self.stopSlot(slot, true),
                 .handle_exit => self.handleExit(slot, now_ms),
                 .launch => if (slot.dev) {
-                    self.launch(slot, now_ms) catch |err| {
-                        self.closePipe(slot);
-                        supervisor.recordLaunchFailure(slot, now_ms, err);
-                    };
+                    self.launchDev(slot, now_ms);
                 } else {
                     start_hosted = true;
                 },
@@ -456,33 +393,96 @@ const Host = struct {
         self.superviseRenderer(now_ms);
     }
 
-    /// A `--dev` widget keeps a process of its own: its hot-swap listener
-    /// and dev reloads touch only it.
-    fn launch(self: *Host, slot: *Slot, now_ms: u64) !void {
-        try self.prepareSlot(slot, now_ms);
+    /// A `--dev` widget keeps a process of its own, so its hot-swap
+    /// listener and dev reloads touch only it. The shared host launches it,
+    /// in a job only the host holds, and serves its providers (ADR 0022 step
+    /// 3); weaverd watches it by its PID and restarts it.
+    fn launchDev(self: *Host, slot: *Slot, now_ms: u64) void {
+        self.prepareSlot(slot, now_ms) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
+        self.ensureSharedHost(now_ms) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
+        const line = self.launchDevCommand(slot) catch |err| {
+            self.stopIdleHost();
+            return supervisor.recordLaunchFailure(slot, now_ms, err);
+        };
+        defer self.allocator.free(line);
+        const answer = self.controlRequest(line, dev_launch_answer_timeout_ms) catch |err| {
+            // No widget code runs in the host for a launch: a host that
+            // does not answer has a stuck control thread.
+            if (err == error.HostTimedOut) {
+                std.log.warn("shared widget host did not answer within {d} ms while launching dev widget '{s}'; stopping it", .{ dev_launch_answer_timeout_ms, slot.name() });
+                _ = c.TerminateProcess(self.shared.process.process.?, 1);
+            }
+            return supervisor.recordLaunchFailure(slot, now_ms, err);
+        };
+        if (!answer.ok) {
+            self.stopIdleHost();
+            return supervisor.recordLaunchFailureNamed(slot, now_ms, answer.errorName());
+        }
+        // The host holds its own handle until weaverd sends stopDev, so this
+        // PID is the widget's for as long as the host answers for it.
+        const access = c.SYNCHRONIZE | c.PROCESS_QUERY_LIMITED_INFORMATION | c.PROCESS_VM_READ;
+        const process = c.OpenProcess(access, 0, answer.pid) orelse {
+            self.stopDevInHost(slot, false);
+            self.stopIdleHost();
+            return supervisor.recordLaunchFailure(slot, now_ms, error.DevProcessUnavailable);
+        };
+        slot.platform.process = process;
+        slot.platform.pid = answer.pid;
+        self.thread_sample_ms = 0;
+        self.markSlotRunning(slot, process, now_ms);
+    }
+
+    fn launchDevCommand(self: *Host, slot: *Slot) ![]u8 {
         const dist = try self.distPath(slot);
         defer self.allocator.free(dist);
-        const command = try std.fmt.allocPrint(self.allocator, "\"{s}\" --dev \"{s}\"", .{ self.runtime_exe, dist });
-        defer self.allocator.free(command);
-        if (slot.platform.pipe_name_len > 0) try setEnv(self.allocator, env_pipe_name, slot.platform.pipeName());
-        defer if (slot.platform.pipe_name_len > 0) clearEnv(env_pipe_name);
-        try setEnv(self.allocator, env_backend_file, slot.platform.backendPath());
-        defer clearEnv(env_backend_file);
-        try self.setSharedEnv(slot.wants_gpu, slot.wants_media);
-        defer self.clearSharedEnv();
-        const started = try self.startProcess(command);
-        slot.platform.process = started.process;
-        slot.platform.pid = started.pid;
-        errdefer self.stopSlot(slot, false);
-        try self.connectSlot(slot, slot.platform.process, slot.platform.pid, now_ms);
+        var subscribe: [4][]const u8 = undefined;
+        var count: usize = 0;
+        inline for (.{ .{ slot.wants_cpu, "cpu" }, .{ slot.wants_memory, "memory" }, .{ slot.wants_audio, "audio" }, .{ slot.wants_media, "media" } }) |entry| {
+            if (entry[0]) {
+                subscribe[count] = entry[1];
+                count += 1;
+            }
+        }
+        const capabilities: []const []const u8 = if (slot.wants_media_transport) &.{"media-transport"} else &.{};
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer line.deinit();
+        try line.writer.print("{{\"launchDev\":{{\"id\":{d},\"dir\":{f},\"backend\":{f},\"subscribe\":{f},\"capabilities\":{f},\"gpu\":{}}}}}\n", .{
+            self.slotIndex(slot),
+            std.json.fmt(dist, .{}),
+            std.json.fmt(slot.platform.backendPath(), .{}),
+            std.json.fmt(subscribe[0..count], .{}),
+            std.json.fmt(capabilities, .{}),
+            slot.wants_gpu,
+        });
+        return line.toOwnedSlice();
+    }
+
+    /// Tell the host to stop dev widget `slot` and let go of it. A host
+    /// that is gone has taken it with it.
+    fn stopDevInHost(self: *Host, slot: *Slot, graceful: bool) void {
+        if (self.shared.process.process == null) return;
+        var buffer: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "{{\"stopDev\":{{\"id\":{d},\"graceful\":{}}}}}\n", .{ self.slotIndex(slot), graceful }) catch unreachable;
+        const answer = self.controlRequest(line, dev_stop_answer_timeout_ms) catch |err| {
+            if (err == error.HostTimedOut) {
+                std.log.warn("shared widget host did not answer within {d} ms while stopping dev widget '{s}'; stopping it", .{ dev_stop_answer_timeout_ms, slot.name() });
+                _ = c.TerminateProcess(self.shared.process.process.?, 1);
+            }
+            return;
+        };
+        if (!answer.ok) std.log.warn("shared widget host could not stop dev widget '{s}': {s}", .{ slot.name(), answer.errorName() });
+    }
+
+    fn slotIndex(self: *const Host, slot: *const Slot) usize {
+        return (@intFromPtr(slot) - @intFromPtr(&self.slots[0])) / @sizeOf(Slot);
     }
 
     fn distPath(self: *Host, slot: *const Slot) ![]const u8 {
         return std.fs.path.join(self.allocator, &.{ slot.source(), "dist" });
     }
 
-    /// Bundle, read the manifest, and open the slot's provider pipe and
-    /// backend status file: everything a launch needs before a process exists.
+    /// Bundle, read the manifest, and clear the slot's backend status file:
+    /// everything a launch needs before the host loads or launches it.
     fn prepareSlot(self: *Host, slot: *Slot, now_ms: u64) !void {
         try self.ensureBundle(slot.source());
         const dist = try std.fs.path.join(self.allocator, &.{ slot.source(), "dist" });
@@ -504,24 +504,6 @@ const Host = struct {
             // retry/backoff. The widget may still start so it can reconnect
             // as soon as the shared renderer recovers.
         };
-        slot.platform.pipe_name_len = 0;
-        if (slot.wants_cpu or slot.wants_memory or slot.wants_audio or slot.wants_media or slot.wants_media_transport) {
-            const pipe_name = try std.fmt.bufPrint(&slot.platform.pipe_name_buffer, "\\\\.\\pipe\\weaver-{d}-{x}", .{ c.GetCurrentProcessId(), std.hash.Wyhash.hash(now_ms, slot.name()) });
-            slot.platform.pipe_name_len = pipe_name.len;
-            const pipe_name_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, pipe_name);
-            defer self.allocator.free(pipe_name_w);
-            slot.platform.pipe = c.CreateNamedPipeW(
-                pipe_name_w.ptr,
-                c.PIPE_ACCESS_DUPLEX | c.FILE_FLAG_OVERLAPPED,
-                c.PIPE_TYPE_BYTE | c.PIPE_READMODE_BYTE | c.PIPE_WAIT,
-                1,
-                8192,
-                8192,
-                0,
-                null,
-            );
-            if (slot.platform.pipe == invalid_handle) return error.CreatePipeFailed;
-        }
         const backend_hash = std.hash.Wyhash.hash(0, slot.name());
         const backend_path = try std.fmt.bufPrint(&slot.platform.backend_path_buffer, "{s}.backend-{x}", .{ self.status_path, backend_hash });
         slot.platform.backend_path_len = backend_path.len;
@@ -556,27 +538,8 @@ const Host = struct {
         return .{ .process = process_info.hProcess, .pid = process_info.dwProcessId };
     }
 
-    /// Accept the slot's provider pipe from `process` and start serving it,
-    /// then mark the slot running.
-    fn connectSlot(self: *Host, slot: *Slot, process: c.HANDLE, pid: u32, now_ms: u64) !void {
-        if (slot.platform.pipe != invalid_handle) {
-            if (!connectPipe(slot.platform.pipe, process, pid, 5_000)) return error.ConnectPipeFailed;
-            slot.platform.write_event = c.CreateEventW(null, 0, 0, null) orelse return error.CreateEventFailed;
-            slot.platform.command_shutdown_event = c.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
-            slot.platform.command_stopping.store(0, .release);
-            slot.platform.command_thread = try std.Thread.spawn(
-                .{ .stack_size = 256 * 1024 },
-                commandReaderMain,
-                .{&slot.platform},
-            );
-            if (slot.wants_media_transport) {
-                slot.platform.media_command_executor = try MediaCommandExecutor.start(
-                    self.io,
-                    self.allocator,
-                    &self.media_provider,
-                );
-            }
-        }
+    /// Mark the slot running, its cost sampled from `process`.
+    fn markSlotRunning(self: *Host, slot: *Slot, process: c.HANDLE, now_ms: u64) void {
         supervisor.markRunning(slot, now_ms, self.artifactMtime(slot.source()));
         slot.platform.previous_process_ticks = processTicks(process);
         slot.platform.previous_sample_ms = now_ms;
@@ -604,7 +567,6 @@ const Host = struct {
         };
         self.prepareSlot(slot, now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
         if (self.quarantined(slot)) {
-            self.closePipe(slot);
             slot.platform.host_slot = null;
             return;
         }
@@ -617,11 +579,10 @@ const Host = struct {
         defer self.allocator.free(line);
         const process = self.shared.process.process.?;
         const pid = self.shared.process.pid;
-        const answer = self.controlRequest(line) catch |err| {
+        const answer = self.controlRequest(line, control_answer_timeout_ms) catch |err| {
             // The host died or hung loading this widget. It is a member
             // now, so the exit is settled once and the host's record
             // decides who pays.
-            self.closePipe(slot);
             slot.platform.hosted = true;
             slot.platform.pid = pid;
             if (err == error.HostTimedOut) {
@@ -633,20 +594,16 @@ const Host = struct {
         if (!answer.ok) {
             // Loading is deterministic (a broken bundle or manifest), so
             // the slot stops until it is reinstalled or its source changes.
-            self.closePipe(slot);
             slot.platform.host_slot = null;
             slot.state = .stopped;
             slot.setReason("widget did not load in the shared host: {s}; see 'weaver logs {s}'", .{ answer.errorName(), slot.name() });
-            if (self.hostedCount() == 0) self.stopSharedHost(true);
+            self.stopIdleHost();
             return;
         }
         slot.platform.hosted = true;
         slot.platform.pid = pid;
-        self.connectSlot(slot, process, pid, now_ms) catch |err| {
-            // It loaded, but its provider pipe never connected.
-            self.removeHosted(slot);
-            supervisor.recordLaunchFailure(slot, now_ms, err);
-        };
+        // Its providers are the host's own, in process: nothing to connect.
+        self.markSlotRunning(slot, process, now_ms);
     }
 
     /// Whether the ledger holds `slot` back: its bundle is the one that
@@ -712,8 +669,7 @@ const Host = struct {
         return record;
     }
 
-    fn failLaunch(self: *Host, slot: *Slot, now_ms: u64, err: anyerror) void {
-        self.closePipe(slot);
+    fn failLaunch(_: *Host, slot: *Slot, now_ms: u64, err: anyerror) void {
         slot.platform.host_slot = null;
         supervisor.recordLaunchFailure(slot, now_ms, err);
     }
@@ -743,18 +699,16 @@ const Host = struct {
         defer self.allocator.free(dist);
         var line: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer line.deinit();
-        try line.writer.print("{{\"add\":{{\"id\":{d},\"dir\":{f},\"backend\":{f}", .{ slot.platform.host_slot.?, std.json.fmt(dist, .{}), std.json.fmt(slot.platform.backendPath(), .{}) });
-        if (slot.platform.pipe_name_len > 0) try line.writer.print(",\"pipe\":{f}", .{std.json.fmt(slot.platform.pipeName(), .{})});
-        try line.writer.writeAll("}}\n");
+        try line.writer.print("{{\"add\":{{\"id\":{d},\"dir\":{f},\"backend\":{f}}}}}\n", .{ slot.platform.host_slot.?, std.json.fmt(dist, .{}), std.json.fmt(slot.platform.backendPath(), .{}) });
         return line.toOwnedSlice();
     }
 
     /// One widget leaves the shared host and the others keep running; the
-    /// host stops with its last widget.
+    /// host stops with its last widget, dev widgets included.
     fn removeHosted(self: *Host, slot: *Slot) void {
         var buffer: [48]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "{{\"remove\":{{\"id\":{d}}}}}\n", .{slot.platform.host_slot.?}) catch unreachable;
-        const answer = self.controlRequest(line);
+        const answer = self.controlRequest(line, control_answer_timeout_ms);
         if (answer) |result| {
             self.releaseHostedSlot(slot);
             if (!result.ok) std.log.warn("shared widget host could not remove '{s}': {s}", .{ slot.name(), result.errorName() });
@@ -770,13 +724,20 @@ const Host = struct {
             self.releaseHostedSlot(slot);
             return self.stopSharedHost(false);
         }
-        if (self.hostedCount() == 0) self.stopSharedHost(true);
+        self.stopIdleHost();
     }
 
-    fn hostedCount(self: *const Host) usize {
+    /// Widgets that live in the shared host or its job: hosted widgets and
+    /// running dev widgets.
+    fn memberCount(self: *const Host) usize {
         var count: usize = 0;
-        for (&self.slots) |*slot| count += @intFromBool(slot.platform.hosted);
+        for (&self.slots) |*slot| count += @intFromBool(slot.platform.hosted or (slot.dev and slot.platform.process != null));
         return count;
+    }
+
+    /// The host stops with its last member.
+    fn stopIdleHost(self: *Host) void {
+        if (self.memberCount() == 0) self.stopSharedHost(true);
     }
 
     /// Start the shared host with no widgets, unless it is running: a
@@ -822,11 +783,12 @@ const Host = struct {
         self.shared.control_event = control_event;
     }
 
-    /// Send one command line to the shared host and wait for its answer.
-    fn controlRequest(self: *Host, line: []const u8) !ControlAnswer {
+    /// Send one command line to the shared host and wait up to `timeout_ms`
+    /// for its answer.
+    fn controlRequest(self: *Host, line: []const u8, timeout_ms: u32) !ControlAnswer {
         const shared = &self.shared;
         const process = shared.process.process orelse return error.HostNotRunning;
-        const deadline = c.GetTickCount64() + control_answer_timeout_ms;
+        const deadline = c.GetTickCount64() + timeout_ms;
         var written: usize = 0;
         while (written < line.len) {
             written += try controlIo(.write, shared.control, shared.control_event, @constCast(line[written..]), process, deadline);
@@ -837,12 +799,14 @@ const Host = struct {
             if (filled == answer.buffer.len) return error.ControlAnswerTooLong;
             filled += try controlIo(.read, shared.control, shared.control_event, answer.buffer[filled..], process, deadline);
         }
-        const text = answer.buffer[0..std.mem.indexOfScalar(u8, answer.buffer[0..filled], '\n').?];
-        var scratch: [256]u8 = undefined;
+        answer.len = std.mem.indexOfScalar(u8, answer.buffer[0..filled], '\n').?;
+        const text = answer.text();
+        var scratch: [max_answer_bytes]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&scratch);
-        const Wire = struct { ok: bool = false, @"error": []const u8 = "" };
+        const Wire = struct { ok: bool = false, @"error": []const u8 = "", pid: u32 = 0 };
         const wire = std.json.parseFromSliceLeaky(Wire, fixed.allocator(), text, .{ .ignore_unknown_fields = true }) catch return error.ControlAnswerInvalid;
         answer.ok = wire.ok;
+        answer.pid = wire.pid;
         // The name is a substring of the answer: an error name needs no
         // escapes. Kept as a position, so the answer can be copied.
         if (std.mem.indexOf(u8, text, wire.@"error")) |at| {
@@ -859,9 +823,10 @@ const Host = struct {
         self.shared.control_event = null;
     }
 
-    /// The shared host exited. If its record shows that a widget's own code
-    /// crashed it, that widget is quarantined and the others start again at
-    /// once. Any other end (a crash outside widget code, a kill, a fault no
+    /// The shared host exited, and its job took its dev widgets with it. If
+    /// its record shows that a widget's own code crashed it, that widget is
+    /// quarantined and the others start again at once. Any other end (a
+    /// crash outside widget code or in a provider, a kill, a fault no
     /// handler saw) names no widget, and every member pays a crash backoff.
     fn settleSharedHostExit(self: *Host, now_ms: u64) void {
         const process = self.shared.process.process orelse return;
@@ -875,8 +840,11 @@ const Host = struct {
             break :blamed self.slotInHost(@intCast(crash.crash_slot - 1));
         };
         for (&self.slots) |*slot| {
-            if (!slot.platform.hosted) continue;
-            self.releaseHostedSlot(slot);
+            if (slot.dev and slot.platform.process != null) {
+                self.closeProcess(slot);
+            } else if (slot.platform.hosted) {
+                self.releaseHostedSlot(slot);
+            } else continue;
             // Blame first: a widget removed because its source went
             // missing can crash the host in its teardown, and the same
             // bundle put back must stay quarantined.
@@ -908,8 +876,12 @@ const Host = struct {
         if (!graceful or c.WaitForSingleObject(process, 1500) != c.WAIT_OBJECT_0) _ = c.TerminateProcess(process, 0);
         _ = c.WaitForSingleObject(process, 1000);
         for (&self.slots) |*slot| {
-            if (!slot.platform.hosted) continue;
-            self.releaseHostedSlot(slot);
+            if (slot.dev and slot.platform.process != null) {
+                // Its job ended it with the host.
+                self.closeProcess(slot);
+            } else if (slot.platform.hosted) {
+                self.releaseHostedSlot(slot);
+            } else continue;
             if (slot.state == .running) {
                 slot.state = .starting;
                 slot.next_restart_ms = 0;
@@ -918,14 +890,15 @@ const Host = struct {
         self.closeSharedHost();
     }
 
-    fn releaseHostedSlot(self: *Host, slot: *Slot) void {
-        self.closePipe(slot);
+    fn releaseHostedSlot(_: *Host, slot: *Slot) void {
         slot.platform.hosted = false;
         slot.platform.host_slot = null;
         slot.platform.pid = 0;
     }
 
     fn closeSharedHost(self: *Host) void {
+        self.provider_totals = self.provider_totals.plus(self.provider_report.counters);
+        self.provider_report = .{};
         if (self.shared.process.process) |process| _ = c.CloseHandle(process);
         self.shared.process = .{};
         self.closeControl();
@@ -1036,10 +1009,14 @@ const Host = struct {
         self.renderer_failure_reason_len = 0;
     }
 
+    /// A dev widget's process exited. The host still holds its pipe and
+    /// handle until told to let go.
     fn handleExit(self: *Host, slot: *Slot, now_ms: u64) void {
         var exit_code: c.DWORD = 1;
         _ = c.GetExitCodeProcess(slot.platform.process, &exit_code);
+        self.stopDevInHost(slot, false);
         self.closeProcess(slot);
+        self.stopIdleHost();
         if (!self.sourceExists(slot.source())) {
             _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
             return;
@@ -1049,44 +1026,18 @@ const Host = struct {
 
     fn stopSlot(self: *Host, slot: *Slot, graceful: bool) void {
         if (slot.platform.hosted) return self.removeHosted(slot);
-        if (slot.platform.process) |process| {
-            if (graceful) {
-                closeWindowsForProcess(slot.platform.pid);
-                if (c.WaitForSingleObject(process, 1500) != c.WAIT_OBJECT_0) _ = c.TerminateProcess(process, 0);
-            } else _ = c.TerminateProcess(process, 0);
-            _ = c.WaitForSingleObject(process, 1000);
-        }
+        if (slot.platform.process == null) return;
+        self.stopDevInHost(slot, graceful);
         self.closeProcess(slot);
+        self.stopIdleHost();
     }
 
     fn closeProcess(self: *Host, slot: *Slot) void {
-        self.closePipe(slot);
         if (slot.platform.process) |process| _ = c.CloseHandle(process);
         slot.platform.process = null;
         slot.platform.pid = 0;
         self.thread_sample_ms = 0;
         slot.platform.previous_process_ticks = 0;
-    }
-
-    fn closePipe(_: *Host, slot: *Slot) void {
-        if (slot.platform.pipe == invalid_handle) return;
-        slot.platform.command_queue.stop();
-        slot.platform.command_stopping.store(1, .release);
-        if (slot.platform.command_shutdown_event) |event| _ = c.SetEvent(event);
-        _ = c.CancelIoEx(slot.platform.pipe, null);
-        if (slot.platform.command_thread) |thread| thread.join();
-        slot.platform.command_thread = null;
-        if (slot.platform.media_command_executor) |executor| executor.deinit();
-        slot.platform.media_command_executor = null;
-        _ = c.DisconnectNamedPipe(slot.platform.pipe);
-        _ = c.CloseHandle(slot.platform.pipe);
-        slot.platform.pipe = invalid_handle;
-        if (slot.platform.write_event) |event| _ = c.CloseHandle(event);
-        slot.platform.write_event = null;
-        if (slot.platform.command_shutdown_event) |event| _ = c.CloseHandle(event);
-        slot.platform.command_shutdown_event = null;
-        slot.platform.command_queue = .{};
-        slot.platform.command_rate = .{};
     }
 
     fn sampleCosts(self: *Host, now_ms: u64) void {
@@ -1125,158 +1076,67 @@ const Host = struct {
         }
     }
 
-    fn sampleProviders(self: *Host) void {
-        var any = false;
-        for (&self.slots, 0..) |*slot, index| if (self.running(index) and (slot.wants_cpu or slot.wants_memory)) {
-            any = true;
-            break;
-        };
-        if (!any) return;
-        const sample = self.sampler.sample() catch return orelse return;
-        var cpu_buffer: [8192]u8 = undefined;
-        const cpu = providers.formatCpu(sample.cpu, &cpu_buffer) catch return;
-        var memory_buffer: [512]u8 = undefined;
-        const memory = providers.formatMemory(sample.memory, &memory_buffer) catch return;
-        const cpu_changed = !std.mem.eql(u8, cpu, self.previous_cpu[0..self.previous_cpu_len]);
-        const memory_changed = !std.mem.eql(u8, memory, self.previous_memory[0..self.previous_memory_len]);
-        for (&self.slots) |*slot| {
-            if (slot.platform.pipe == invalid_handle) continue;
-            if (provider_protocol.deliveryNeeded(slot.wants_cpu, slot.cpu_sent, cpu_changed) and writePipe(&slot.platform, cpu)) {
-                slot.cpu_sent = true;
-                self.system_frames += 1;
-            }
-            if (provider_protocol.deliveryNeeded(slot.wants_memory, slot.memory_sent, memory_changed) and writePipe(&slot.platform, memory)) {
-                slot.memory_sent = true;
-                self.system_frames += 1;
-            }
-        }
-        @memcpy(self.previous_cpu[0..cpu.len], cpu);
-        self.previous_cpu_len = cpu.len;
-        @memcpy(self.previous_memory[0..memory.len], memory);
-        self.previous_memory_len = memory.len;
-    }
-
-    fn hasAudioSubscribers(self: *const Host) bool {
-        return supervisor.hasSubscription(&self.slots, .audio, self);
-    }
-
-    fn hasMediaSubscribers(self: *const Host) bool {
-        return supervisor.hasSubscription(&self.slots, .media, self);
-    }
-
-    fn sampleAudio(self: *Host, now_ms: u64) void {
-        const active = self.hasAudioSubscribers();
-        self.audio_provider.setActive(active, now_ms);
-        if (!active) return;
-        const frame = self.audio_provider.poll(now_ms) orelse return;
-        var buffer: [512]u8 = undefined;
-        const encoded = audio.formatFrame(frame, &buffer) catch return;
-        var delivered = false;
-        for (&self.slots) |*slot| {
-            if (slot.platform.pipe == invalid_handle or !slot.wants_audio) continue;
-            if (writePipe(&slot.platform, encoded)) delivered = true;
-        }
-        if (delivered) self.audio_pipe_frames += 1;
-    }
-
-    fn sampleMedia(self: *Host, now_ms: u64) void {
-        const active = self.hasMediaSubscribers();
-        self.media_provider.setActive(active, now_ms);
-        if (!active) return;
-        const frame = self.media_provider.poll(now_ms) orelse return;
-        var buffer: [media.max_media_frame_bytes]u8 = undefined;
-        const encoded = media.formatFrame(&frame, &buffer) catch |err| {
-            std.log.err("media frame exceeded protocol bound or failed to encode: {s}", .{@errorName(err)});
-            return;
-        };
-        const changed = !std.mem.eql(u8, encoded, self.previous_media[0..self.previous_media_len]);
-        var delivered = false;
-        for (&self.slots) |*slot| {
-            if (slot.platform.pipe == invalid_handle or !slot.wants_media) continue;
-            if ((!slot.media_sent or changed) and writePipe(&slot.platform, encoded)) {
-                slot.media_sent = true;
-                delivered = true;
-            }
-        }
-        if (delivered) self.media_pipe_frames += 1;
-        @memcpy(self.previous_media[0..encoded.len], encoded);
-        self.previous_media_len = encoded.len;
-    }
-
-    fn drainMediaCommands(self: *Host, now_ms: u64) void {
-        var ack_buffer: [64]u8 = undefined;
-        for (&self.slots) |*slot| {
-            if (slot.platform.pipe == invalid_handle) continue;
-            var channel_failed = false;
-            if (slot.platform.media_command_executor) |executor| {
-                while (executor.takeResult()) |result| {
-                    switch (result.outcome) {
-                        .accepted, .declined => {
-                            const ack = media_commands.formatAck(
-                                result.id,
-                                result.outcome == .accepted,
-                                &ack_buffer,
-                            ) catch continue;
-                            if (!writePipe(&slot.platform, ack)) {
-                                channel_failed = true;
-                                break;
-                            }
-                        },
-                        .channel_failure => {
-                            channel_failed = true;
-                            break;
-                        },
-                    }
-                }
-            }
-            if (channel_failed) {
-                self.restartAfterMediaChannelFailure(slot, now_ms);
-                continue;
-            }
-            while (slot.platform.command_queue.takeNack()) |id| {
-                const ack = media_commands.formatAck(id, false, &ack_buffer) catch continue;
-                if (!writePipe(&slot.platform, ack)) {
-                    channel_failed = true;
-                    break;
-                }
-            }
-            if (channel_failed) {
-                self.restartAfterMediaChannelFailure(slot, now_ms);
-                continue;
-            }
-            while (slot.platform.command_queue.take()) |command| {
-                const allowed = media_commands.authorize(slot.wants_media_transport, &slot.platform.command_rate, now_ms);
-                if (!allowed) {
-                    const ack = media_commands.formatAck(command.id, false, &ack_buffer) catch continue;
-                    if (!writePipe(&slot.platform, ack)) {
-                        channel_failed = true;
-                        break;
-                    }
-                    continue;
-                }
-                const executor = slot.platform.media_command_executor orelse {
-                    channel_failed = true;
-                    break;
-                };
-                if (!executor.submit(command)) {
-                    channel_failed = true;
-                    break;
-                }
-            }
-            if (channel_failed) {
-                self.restartAfterMediaChannelFailure(slot, now_ms);
-                continue;
-            }
-            if (slot.platform.command_queue.malformed.swap(false, .acq_rel)) {
-                std.log.warn("dropping malformed media command frame from widget {s}", .{slot.name()});
-            }
-        }
-    }
-
     fn restartAfterMediaChannelFailure(self: *Host, slot: *Slot, now_ms: u64) void {
         std.log.warn("restarting widget {s} after fatal provider channel failure", .{slot.name()});
         self.stopSlot(slot, false);
         supervisor.recordChannelFailure(slot, now_ms);
+    }
+
+    fn hasProviderMember(self: *const Host) bool {
+        for (&self.slots, 0..) |*slot, index| {
+            if (!self.running(index)) continue;
+            if (slot.wants_cpu or slot.wants_memory or slot.wants_audio or slot.wants_media or slot.wants_media_transport) return true;
+        }
+        return false;
+    }
+
+    /// Ask the host for its providers' counters, and for the widgets whose
+    /// provider channel failed since the last ask: those restart on their
+    /// crash budget, as when weaverd ran the providers.
+    fn refreshProviders(self: *Host, now_ms: u64) void {
+        if (self.shared.process.process == null or !self.hasProviderMember()) return;
+        const answer = self.controlRequest("{\"providers\":{}}\n", control_answer_timeout_ms) catch |err| {
+            if (err == error.HostTimedOut) {
+                std.log.warn("shared widget host did not answer within {d} ms for its providers; stopping it", .{control_answer_timeout_ms});
+                _ = c.TerminateProcess(self.shared.process.process.?, 1);
+            }
+            return;
+        };
+        var scratch: [2 * max_answer_bytes]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const wire = std.json.parseFromSliceLeaky(ProviderReport.Wire, fixed.allocator(), answer.text(), .{ .ignore_unknown_fields = true }) catch |err| {
+            return std.log.warn("shared widget host's providers answer is invalid: {s}", .{@errorName(err)});
+        };
+        const value = wire.providers;
+        self.provider_report.counters = .{
+            .system_sample_count = value.systemSampleCount,
+            .system_frames = value.systemFrames,
+            .audio_frames = value.audioPipeFrames,
+            .media_frames = value.mediaPipeFrames,
+            .audio_capture_starts = value.audioCaptureStarts,
+            .audio_provider_frames = value.audioProviderFrames,
+        };
+        self.provider_report.audio_capture_active = value.audioCaptureActive;
+        self.provider_report.audio_silent = value.audioSilent;
+        self.provider_report.audio_last_error = value.audioLastError;
+        const label_len = @min(value.audioAvailability.len, self.provider_report.audio_availability_buffer.len);
+        @memcpy(self.provider_report.audio_availability_buffer[0..label_len], value.audioAvailability[0..label_len]);
+        self.provider_report.audio_availability_len = label_len;
+        for (wire.failed.hosted) |host_slot| {
+            const slot = self.slotInHost(host_slot) orelse continue;
+            self.restartAfterMediaChannelFailure(slot, now_ms);
+        }
+        for (wire.failed.dev) |id| {
+            if (id >= max_widgets) continue;
+            const slot = &self.slots[id];
+            const process = slot.platform.process orelse continue;
+            // A dev widget that exited broke its pipe: that is its crash.
+            if (c.WaitForSingleObject(process, 0) == c.WAIT_OBJECT_0) {
+                self.handleExit(slot, now_ms);
+            } else {
+                self.restartAfterMediaChannelFailure(slot, now_ms);
+            }
+        }
     }
 
     fn writeStatus(self: *Host, now_ms: u64) void {
@@ -1353,21 +1213,23 @@ const Host = struct {
         }
         var output: std.Io.Writer.Allocating = .init(self.allocator);
         defer output.deinit();
+        const report = &self.provider_report;
+        const counters = self.provider_totals.plus(report.counters);
         supervisor.writeStatus(&output.writer, c.GetCurrentProcessId(), .{
             .system_subscribers = supervisor.systemSubscriberCount(&self.slots, self),
-            .system_sample_count = self.sampler.sample_calls,
-            .system_frames = self.system_frames,
-            .audio_capture_active = self.audio_provider.capture != null,
-            .audio_silent = self.audio_provider.silent,
-            .audio_pipe_frames = self.audio_pipe_frames,
-            .media_pipe_frames = self.media_pipe_frames,
+            .system_sample_count = counters.system_sample_count,
+            .system_frames = counters.system_frames,
+            .audio_capture_active = report.audio_capture_active,
+            .audio_silent = report.audio_silent,
+            .audio_pipe_frames = counters.audio_frames,
+            .media_pipe_frames = counters.media_frames,
             .media_availability = "available",
             .media_subscribers = supervisor.subscriptionCount(&self.slots, .media, self),
-            .audio_availability = self.audio_provider.availability.label(),
+            .audio_availability = report.availability(),
             .audio_subscribers = supervisor.subscriptionCount(&self.slots, .audio, self),
-            .audio_capture_starts = self.audio_provider.capture_starts,
-            .audio_provider_frames = self.audio_provider.frame_count,
-            .audio_last_error = self.audio_provider.last_error,
+            .audio_capture_starts = counters.audio_capture_starts,
+            .audio_provider_frames = counters.audio_provider_frames,
+            .audio_last_error = report.audio_last_error,
         }, entries[0..entry_count]) catch |err| return self.noteStatusWriteFailure("encode", err);
         var cwd = std.Io.Dir.cwd();
         cwd.writeFile(self.io, .{ .sub_path = self.status_temp_path, .data = output.written() }) catch |err| return self.noteStatusWriteFailure("write temporary file", err);
@@ -1484,10 +1346,10 @@ fn run(init: std.process.Init) !void {
     const ledger_temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{ledger_path});
     defer allocator.free(ledger_temp_path);
     cleanupBackendStatusFiles(init.io, directory);
+    // The shared host owns the art cache (ADR 0022 step 3); weaverd only
+    // names it in WEAVER_ART_CACHE.
     const art_cache_root = try std.fs.path.join(allocator, &.{ directory, "artcache" });
     defer allocator.free(art_cache_root);
-    var media_art_cache = try art_cache.Cache.init(init.io, allocator, art_cache_root);
-    defer media_art_cache.deinit();
     const repo_root = try repositoryRoot(allocator);
     defer allocator.free(repo_root);
     const runtime_exe = try std.fs.path.join(allocator, &.{ repo_root, "runtime", "zig-out", "bin", "weaver-widget.exe" });
@@ -1519,17 +1381,12 @@ fn run(init: std.process.Init) !void {
         .art_cache_root = art_cache_root,
         .force_software = if (init.environ_map.get("WEAVER_FORCE_SOFTWARE")) |value| std.mem.eql(u8, value, "1") else false,
     };
-    host.media_provider.cache = &media_art_cache;
-    defer host.audio_provider.deinit();
-    defer host.media_provider.deinit();
     host.loadLedger();
     try host.loadRegistry();
-    var next_provider_ms: u64 = 0;
     var next_cost_ms: u64 = 0;
     while (true) {
         const handles = [_]c.HANDLE{ shutdown_event, reload_event };
-        const wait_ms: c.DWORD = if (host.hasAudioSubscribers()) 10 else 250;
-        const wait = c.WaitForMultipleObjects(handles.len, &handles, 0, wait_ms);
+        const wait = c.WaitForMultipleObjects(handles.len, &handles, 0, 250);
         if (wait == c.WAIT_OBJECT_0) break;
         if (wait == c.WAIT_OBJECT_0 + 1) {
             host.loadRegistry() catch {
@@ -1540,21 +1397,16 @@ fn run(init: std.process.Init) !void {
         }
         const now = c.GetTickCount64();
         host.supervise(now);
-        host.drainMediaCommands(now);
-        host.sampleAudio(now);
-        host.sampleMedia(now);
-        if (now >= next_provider_ms) {
-            host.sampleProviders();
-            next_provider_ms = now + 1000;
-        }
         if (now >= next_cost_ms) {
+            host.refreshProviders(now);
             host.sampleCosts(now);
             host.writeStatus(now);
             next_cost_ms = now + 2000;
         }
     }
-    host.stopSharedHost(true);
+    // Dev widgets close their windows first; the host's job would end them.
     for (&host.slots) |*slot| if (slot.platform.process != null) host.stopSlot(slot, true);
+    host.stopSharedHost(true);
     if (host.renderer.platform.process) |process| {
         _ = c.TerminateProcess(process, 0);
         _ = c.WaitForSingleObject(process, 1000);
@@ -1693,72 +1545,6 @@ fn collectThreadCounts(host: *Host, slot_counts: *[max_widgets]u32, renderer_cou
     }
 }
 
-fn commandReaderMain(platform: *WindowsSlotState) void {
-    const event = c.CreateEventW(null, 0, 0, null) orelse return;
-    defer _ = c.CloseHandle(event);
-    var framer: media_commands.Framer = .{};
-    var chunk: [512]u8 = undefined;
-    while (true) {
-        if (platform.command_stopping.load(.acquire) != 0) return;
-        var read: c.DWORD = 0;
-        _ = c.ResetEvent(event);
-        var overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
-        overlapped.hEvent = event;
-        if (platform.test_before_command_read) |barrier| {
-            _ = c.SetEvent(barrier);
-            if (platform.test_resume_command_read) |resume_event| _ = c.WaitForSingleObject(resume_event, c.INFINITE);
-        }
-        if (platform.command_stopping.load(.acquire) != 0) return;
-        if (c.ReadFile(platform.pipe, &chunk, chunk.len, &read, &overlapped) == 0) {
-            if (c.GetLastError() != c.ERROR_IO_PENDING) {
-                framer.finish(&platform.command_queue);
-                return;
-            }
-            const shutdown = platform.command_shutdown_event orelse {
-                framer.finish(&platform.command_queue);
-                return;
-            };
-            const handles = [_]c.HANDLE{ event, shutdown };
-            const wait = c.WaitForMultipleObjects(handles.len, &handles, 0, c.INFINITE);
-            if (wait == c.WAIT_OBJECT_0 + 1) {
-                _ = c.CancelIoEx(platform.pipe, &overlapped);
-                var cancelled: c.DWORD = 0;
-                _ = c.GetOverlappedResult(platform.pipe, &overlapped, &cancelled, 1);
-                return;
-            }
-            if (wait != c.WAIT_OBJECT_0 or c.GetOverlappedResult(platform.pipe, &overlapped, &read, 0) == 0) {
-                framer.finish(&platform.command_queue);
-                return;
-            }
-        }
-        if (platform.command_stopping.load(.acquire) != 0) return;
-        if (read == 0) {
-            framer.finish(&platform.command_queue);
-            return;
-        }
-        if (!framer.feed(&platform.command_queue, chunk[0..read])) return;
-    }
-}
-
-fn writePipe(platform: *WindowsSlotState, bytes: []const u8) bool {
-    const event = platform.write_event orelse return false;
-    _ = c.ResetEvent(event);
-    var overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
-    overlapped.hEvent = event;
-    var written: c.DWORD = 0;
-    if (c.WriteFile(platform.pipe, bytes.ptr, @intCast(bytes.len), &written, &overlapped) == 0) {
-        if (c.GetLastError() != c.ERROR_IO_PENDING) return false;
-        if (c.WaitForSingleObject(event, 1000) != c.WAIT_OBJECT_0) {
-            _ = c.CancelIoEx(platform.pipe, &overlapped);
-            var cancelled_bytes: c.DWORD = 0;
-            _ = c.GetOverlappedResult(platform.pipe, &overlapped, &cancelled_bytes, 1);
-            return false;
-        }
-        if (c.GetOverlappedResult(platform.pipe, &overlapped, &written, 0) == 0) return false;
-    }
-    return written == bytes.len;
-}
-
 fn connectPipe(pipe: c.HANDLE, process: c.HANDLE, expected_pid: u32, timeout_ms: u64) bool {
     const deadline = c.GetTickCount64() +| timeout_ms;
     while (true) {
@@ -1770,7 +1556,7 @@ fn connectPipe(pipe: c.HANDLE, process: c.HANDLE, expected_pid: u32, timeout_ms:
         };
         if (actual_pid == expected_pid) return true;
         std.log.warn(
-            "rejecting provider pipe client pid={d}; expected widget pid={d}",
+            "rejecting control pipe client pid={d}; expected widget host pid={d}",
             .{ actual_pid, expected_pid },
         );
         // Reset the sole pipe instance before accepting any bytes. The
@@ -1842,18 +1628,6 @@ fn controlIo(direction: ControlIo, pipe: c.HANDLE, event: c.HANDLE, bytes: []u8,
     return transferred;
 }
 
-fn closeWindowsForProcess(pid: u32) void {
-    const Callback = struct {
-        fn call(window: c.HWND, process_id: c.LPARAM) callconv(.c) c.BOOL {
-            var owner: c.DWORD = 0;
-            _ = c.GetWindowThreadProcessId(window, &owner);
-            if (owner == @as(u32, @intCast(process_id))) _ = c.PostMessageW(window, c.WM_CLOSE, 0, 0);
-            return 1;
-        }
-    };
-    _ = c.EnumWindows(Callback.call, @intCast(pid));
-}
-
 test "the crash ledger round-trips and keeps one entry per widget" {
     var ledger: Ledger = .{};
     ledger.put("Clock", 1234567890123456789, 0xC000_0005);
@@ -1874,33 +1648,11 @@ test "the crash ledger round-trips and keeps one entry per widget" {
 }
 
 test {
-    _ = audio;
     _ = registry;
     _ = backoff;
-    _ = media;
-    _ = providers;
 }
 
-test "Windows host command reader closes the cancel-before-read shutdown race" {
-    var platform: WindowsSlotState = .{};
-    platform.command_shutdown_event = c.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
-    defer _ = c.CloseHandle(platform.command_shutdown_event);
-    platform.test_before_command_read = c.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
-    defer _ = c.CloseHandle(platform.test_before_command_read);
-    platform.test_resume_command_read = c.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
-    defer _ = c.CloseHandle(platform.test_resume_command_read);
-    const thread = try std.Thread.spawn(.{}, commandReaderMain, .{&platform});
-    try std.testing.expectEqual(c.WAIT_OBJECT_0, c.WaitForSingleObject(platform.test_before_command_read, 1000));
-
-    // Cancellation occurs while the worker is deterministically between reads.
-    platform.command_stopping.store(1, .release);
-    _ = c.SetEvent(platform.command_shutdown_event);
-    _ = c.CancelIoEx(platform.pipe, null);
-    _ = c.SetEvent(platform.test_resume_command_read);
-    thread.join();
-}
-
-test "provider pipe rejects a connected client whose pid is not the launched child" {
+test "the control pipe rejects a connected client whose pid is not the launched host" {
     var name_buffer: [160]u8 = undefined;
     const name = try std.fmt.bufPrint(
         &name_buffer,
