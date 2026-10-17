@@ -954,6 +954,48 @@ test "unhandled promise rejection is visible while a handled rejection stays hea
     try std.testing.expect(!handled.renderFailed());
 }
 
+test "a widget unloads at once while a request of its waits on a server that never answers" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    // Accepts the connection and never answers the TLS handshake.
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const Silent = struct {
+        fn run(listener: *std.Io.net.Server, stream: *?std.Io.net.Stream, accepted: *std.atomic.Value(bool)) void {
+            stream.* = listener.accept(std.testing.io) catch null;
+            accepted.store(true, .release);
+        }
+    };
+    var held: ?std.Io.net.Stream = null;
+    var accepted = std.atomic.Value(bool).init(false);
+    const acceptor = try std.Thread.spawn(.{}, Silent.run, .{ &server, &held, &accepted });
+    defer {
+        acceptor.join();
+        // Closing the connection lets the orphaned request finish and free
+        // itself on its own thread.
+        if (held) |stream| stream.close(io);
+    }
+    const port = server.socket.address.getPort();
+    var origin_buffer: [32]u8 = undefined;
+    const origin = try std.fmt.bufPrint(&origin_buffer, "127.0.0.1:{d}", .{port});
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const origins = [_][]const u8{origin};
+    const engine = try Engine.create(std.testing.allocator, &widgets.trees[0], &widgets.store, &origins, &widgets.provider, false, false);
+    var script_buffer: [160]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buffer, "native.fetch(\"https://127.0.0.1:{d}/\", \"GET\", \"{{}}\", \"\");", .{port});
+    try engine.evaluate(script, "fetch.js");
+    const deadline = platform.monotonicMilliseconds() + 5_000;
+    while (!accepted.load(.acquire) and platform.monotonicMilliseconds() < deadline) std.Thread.yield() catch {};
+    try std.testing.expect(accepted.load(.acquire));
+    const started = platform.monotonicMilliseconds();
+    engine.destroy(std.testing.allocator);
+    // It did not wait for WinHTTP's timeout, or for the server.
+    try std.testing.expect(platform.monotonicMilliseconds() - started < 1_000);
+}
+
 test "a widget at its memory cap leaves its neighbour's realm untouched" {
     var provider: provider_mod.Client = .{};
     try provider.init(std.testing.io, null);
