@@ -1354,13 +1354,29 @@ const timeProvider = (() => {
     const value = currentTime();
     for (const listener of listeners) listener(value);
   };
+  // Each tick lands just after the wall-clock second turns, not a second
+  // after the widget subscribed: the time shown changes when the second
+  // does, and the widgets in a host wake within a few timer ticks of each
+  // other however they were started (ten clocks: 8-24 ms apart), not at
+  // phases scattered across the second. Each still has its own timer.
+  // 20 ms past
+  // the turn clears the 15.6 ms Windows timer tick, so a tick never reads
+  // the second before. A delay under 40 ms would be a thread-pool timer on
+  // Windows (Native's short-interval path), so a turn that close is waited
+  // out a little longer: up to 40 ms past it, never into the next second.
+  const arm = (): void => {
+    const intoSecond = captureNowMilliseconds() % 1000;
+    timerId = native.setInterval(Math.max(1000 - intoSecond + 20, 40));
+    native.onTimer(timerId, () => runWidgetCallback("time provider callback", () => {
+      native.clearInterval(timerId);
+      arm();
+      tick();
+    }));
+  };
   return {
     subscribe(listener: (value: TimeData) => void): () => void {
       listeners.add(listener);
-      if (timerId === 0) {
-        timerId = native.setInterval(1000);
-        native.onTimer(timerId, () => runWidgetCallback("time provider callback", tick));
-      }
+      if (timerId === 0) arm();
       return () => {
         listeners.delete(listener);
         if (listeners.size === 0 && timerId !== 0) {
