@@ -877,10 +877,13 @@ const Host = struct {
         for (&self.slots) |*slot| {
             if (!slot.platform.hosted) continue;
             self.releaseHostedSlot(slot);
-            if (!self.sourceExists(slot.source())) {
-                _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
-            } else if (blamed == slot) {
+            // Blame first: a widget removed because its source went
+            // missing can crash the host in its teardown, and the same
+            // bundle put back must stay quarantined.
+            if (blamed == slot) {
                 self.quarantine(slot, record.?.crash_code);
+            } else if (!self.sourceExists(slot.source())) {
+                _ = supervisor.nextSlotAction(slot, false, false, false, now_ms);
             } else if (blamed == null) {
                 supervisor.recordCrash(slot, now_ms, exit_code);
             } else {
