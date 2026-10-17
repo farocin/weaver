@@ -57,7 +57,11 @@ const Range = struct {
     /// Granules handed out from the heap area so far; everything above is
     /// untouched.
     bump: usize = 0,
-    /// Bytes from the range start committed for bump growth.
+    /// Bytes of the granule map committed from its start: as far as the
+    /// granules handed out need, not the whole map (256 KiB in a 32 MiB
+    /// range, where a clock uses a few hundred granules).
+    map_committed: usize = 0,
+    /// Bytes of the heap area committed from its start for bump growth.
     committed: usize = 0,
     /// Usable bytes currently allocated.
     used: usize = 0,
@@ -156,7 +160,8 @@ pub const Heap = struct {
     fn resetRange(self: *Heap, owner: Owner) void {
         const range = &self.ranges[owner];
         std.debug.assert(range.used == 0);
-        if (range.committed > 0) decommit(self.rangeBase(owner), range.committed);
+        if (range.map_committed > 0) decommit(self.rangeBase(owner), range.map_committed);
+        if (range.committed > 0) decommit(self.granuleAddress(owner, 0), range.committed);
         range.* = .{};
     }
 
@@ -207,12 +212,20 @@ pub const Heap = struct {
         map[start] = .{ .kind = first };
     }
 
-    /// Commit the bump region through `end` bytes from the range start.
+    /// Commit the granule map's records and the heap area for granules
+    /// [0, end): what bump growth to `end` touches.
     fn ensureCommitted(self: *Heap, owner: Owner, end: usize) bool {
         const range = &self.ranges[owner];
-        if (end <= range.committed) return true;
-        const target = @min(std.mem.alignForward(usize, end, commit_step), self.layout.range_bytes);
-        if (!commit(self.rangeBase(owner) + range.committed, target - range.committed)) return false;
+        const map_end = std.mem.alignForward(usize, end * @sizeOf(Granule), page_bytes);
+        if (map_end > range.map_committed) {
+            if (!commit(self.rangeBase(owner) + range.map_committed, map_end - range.map_committed)) return false;
+            range.map_committed = map_end;
+        }
+        const area_end = end * granule_bytes;
+        if (area_end <= range.committed) return true;
+        const area_bytes = self.layout.range_bytes - self.layout.mapBytes();
+        const target = @min(std.mem.alignForward(usize, area_end, commit_step), area_bytes);
+        if (!commit(self.granuleAddress(owner, 0) + range.committed, target - range.committed)) return false;
         range.committed = target;
         return true;
     }
@@ -261,9 +274,10 @@ pub const Heap = struct {
             // The top of the range: give it back to the bump region and
             // decommit what is no longer reachable from below.
             range.bump = start;
-            const keep = std.mem.alignForward(usize, self.layout.mapBytes() + start * granule_bytes, page_bytes);
+            // The map keeps its pages: 8 bytes a granule, a page per 512 KiB.
+            const keep = std.mem.alignForward(usize, start * granule_bytes, page_bytes);
             if (range.committed > keep) {
-                decommit(self.rangeBase(owner) + keep, range.committed - keep);
+                decommit(self.granuleAddress(owner, 0) + keep, range.committed - keep);
                 range.committed = keep;
             }
             return;
@@ -301,7 +315,7 @@ pub const Heap = struct {
         }
         if (range.bump + count > self.layout.granulesPerRange()) return null;
         const start = range.bump;
-        if (!self.ensureCommitted(owner, self.layout.mapBytes() + (start + count) * granule_bytes)) return null;
+        if (!self.ensureCommitted(owner, start + count)) return null;
         range.bump += count;
         return start;
     }
@@ -434,7 +448,7 @@ pub const Heap = struct {
             const count = runCount(old);
             const wanted = runGranules(size);
             if (granule + count == range.bump and granule + wanted <= self.layout.granulesPerRange() and
-                self.ensureCommitted(owner, self.layout.mapBytes() + (granule + wanted) * granule_bytes))
+                self.ensureCommitted(owner, granule + wanted))
             {
                 range.bump = granule + wanted;
                 self.markRun(owner, granule, wanted);
@@ -532,6 +546,24 @@ test "allocations stay in their owner's range and free by address" {
     heap.current = 0;
     try std.testing.expectEqual(a, heap.alloc(20).?);
     try std.testing.expectEqual(big, heap.alloc(4000).?);
+}
+
+test "a range commits its granule map as far as its granules reach" {
+    var heap = try Heap.init(std.testing.allocator, .{ .owners = 2, .range_bytes = 32 * 1024 * 1024 });
+    defer heap.deinit(std.testing.allocator);
+    heap.current = 0;
+    _ = heap.alloc(24).?;
+    // One granule: one page of a 256 KiB map.
+    try std.testing.expectEqual(page_bytes, heap.ranges[0].map_committed);
+    try std.testing.expectEqual(commit_step, heap.ranges[0].committed);
+    // 600 more granules reach a second map page (8 bytes each), no further.
+    const run = heap.alloc(600 * granule_bytes - header_bytes).?;
+    try std.testing.expectEqual(2 * page_bytes, heap.ranges[0].map_committed);
+    @memset(@as([*]u8, @ptrCast(run))[0 .. 600 * granule_bytes - header_bytes], 0xAB);
+    // The run at the top comes back; the heap area decommits, the map stays.
+    heap.free(run);
+    try std.testing.expectEqual(2 * page_bytes, heap.ranges[0].map_committed);
+    try std.testing.expect(heap.ranges[0].committed <= commit_step);
 }
 
 test "free runs merge and the top of the range comes back" {
