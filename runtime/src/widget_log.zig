@@ -60,9 +60,24 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Never inlined, so the 8 KiB line buffer lives only while a line is
+    // written. Inlined, it sat in the frames of every function that logs,
+    // the host's per-tick ones included (Native's frame and rebuild
+    // handlers, `view`, `update`), and the Windows stack probe touches every
+    // page of a frame on entry whether or not the log line runs. (Marking
+    // `logFn` itself `noinline` did not stop the inlining in a ReleaseFast
+    // build; this call does.)
+    @call(.never_inline, writeLogLine, .{ level, scope, format, args });
+}
+
+fn writeLogLine(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
     // reportError forwards at most 6,000 detail bytes; 8 KiB leaves >2 KiB
-    // for timestamp/level/scope and formatting. The stack cost exists only
-    // during one log call.
+    // for timestamp/level/scope and formatting.
     const sink = current orelse return;
     var buffer: [8192]u8 = undefined;
     const line = formatLogLine(level, scope, format, args, &buffer) catch |err| return noteFailure(sink, err);
