@@ -472,9 +472,8 @@ pub const Daemon = struct {
                 // answered now, before any widget starts, so a CLI that sent
                 // it and still waits on the events (one that could not watch
                 // the dead host's process) hears in time. A reload signalled
-                // since `begin`
-                // read the registry may carry a change that read missed: it
-                // runs next, and its result is the answer.
+                // since `begin` read the registry may carry a change that
+                // read missed: it runs next, and its result is the answer.
                 if (self.predecessorCrashed()) {
                     if (win.WaitForSingleObject(self.objects.reload, 0) == win.WAIT_OBJECT_0) {
                         reload_due.* = true;

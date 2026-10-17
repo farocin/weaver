@@ -82,11 +82,12 @@ pub const host_lock_wait_ms: u32 = 30_000;
 /// How long a host Windows restarted waits for the crashed host to be gone,
 /// and then for its record to open. Windows can start the restart before
 /// the crashed process has exited, and the record stays in use for a moment
-/// after it has. Receipts (2026-10-17, weaver-step5-scratch/gt-ui*): one
-/// restart began 0.24 s before the crashed host exited; in another, the
-/// record refused a writer for 203 ms after the crashed host was gone, and
-/// before this wait the restarted host ran without its record. 30 s is two
-/// orders past both, room for a slow crash report.
+/// after it has. Receipts (2026-10-17, weaver-step5-scratch/gt-*): one
+/// restart began 0.24 s before the crashed host exited; in seven others the
+/// crashed host was gone, but the record refused a writer for another
+/// 203-250 ms. Before this wait the restarted host ran without its record,
+/// so it quarantined nothing and never asked for another restart. 30 s is
+/// two orders past both, room for a slow crash report.
 pub const predecessor_wait_ms: u32 = 30_000;
 
 /// The arguments Windows restarts a crashed host with, after the
