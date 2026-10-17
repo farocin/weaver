@@ -18,6 +18,11 @@ const tree_mod = @import("tree.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
 const capture_warnings = @import("capture_warnings.zig");
 const widget_log = @import("widget_log.zig");
+
+/// Small objects that live as long as a widget: its engine, the arena its
+/// manifest, paths and stores live in, and the image resolver's paths. The C
+/// heap packs them; `page_allocator` rounds each to whole 4 KiB pages.
+const small_allocator = std.heap.c_allocator;
 const crash_breadcrumb = @import("crash_breadcrumb.zig");
 const small_fs = @import("small_fs.zig");
 
@@ -605,7 +610,7 @@ fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
     candidate_tree_moved = true;
     candidate.setTree(&model.tree);
     model.engine = candidate;
-    old_engine.destroy(std.heap.page_allocator);
+    old_engine.destroy(small_allocator);
     model.dev_seen_mtime = mtime;
     syncTimers(model, effects);
     std.log.info("dev hot swap applied ({s} root hook state)", .{if (preserved) "preserved" else "fresh"});
@@ -614,7 +619,7 @@ fn reloadIfChanged(model: *Model, effects: WidgetEffects) !void {
 fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, seed: ?[]const u8) !*js_engine.Engine {
     const storage = model.storage orelse return error.MissingStorage;
     const candidate = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         tree,
         storage,
         model.origins,
@@ -622,7 +627,7 @@ fn evaluateCandidate(model: *Model, tree: *tree_mod.Tree, source: []const u8, se
         model.media_transport_enabled,
         false,
     );
-    errdefer candidate.destroy(std.heap.page_allocator);
+    errdefer candidate.destroy(small_allocator);
     if (seed) |value| try candidate.setHotSwapSeed(value);
     try candidate.evaluate(source, "bundle.js");
     if (candidate.renderFailed()) return error.CandidateFirstRenderFailed;
@@ -2052,7 +2057,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     const init = environment.init;
     const capture_state_root = environment.capture_state_root;
     const model = try createModel();
-    model.arena = .init(std.heap.page_allocator);
+    model.arena = .init(small_allocator);
     const allocator = (&model.arena.?).allocator();
     // A failed load must stop the provider reader and free the engine
     // before the Model goes: the host keeps running the other widgets.
@@ -2127,7 +2132,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
     const image_resolver = try allocator.create(image_paths.Resolver);
     image_resolver.* = try image_paths.Resolver.init(
         init.io,
-        std.heap.page_allocator,
+        small_allocator,
         directory,
         if (capture_state_root == null) init.environ_map.get("WEAVER_ART_CACHE") else null,
     );
@@ -2162,7 +2167,7 @@ fn loadWidget(environment: HostEnvironment, directory: []const u8, slot: u16, ar
         if (std.mem.eql(u8, capability, "media-transport")) break true;
     } else false;
     const engine = try js_engine.Engine.create(
-        std.heap.page_allocator,
+        small_allocator,
         &model.tree,
         storage,
         loaded.manifest.origins,
@@ -2258,7 +2263,7 @@ fn reportLoadFailure(io: std.Io, backend_file: ?[]const u8, err: anyerror) void 
 
 fn unloadWidget(model: *Model) void {
     widget_log.use(model.log);
-    if (model.engine) |engine| engine.destroy(std.heap.page_allocator);
+    if (model.engine) |engine| engine.destroy(small_allocator);
     model.engine = null;
     model.provider.deinit();
     deinitImageStates(model);
