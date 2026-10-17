@@ -178,7 +178,10 @@ pub const Failures = struct {
 };
 
 /// The providers' counters, as weaverd's status has always published them
-/// (host/src/supervisor.zig ProviderStatus).
+/// (host/src/supervisor.zig ProviderStatus). One change: a frame for a dev
+/// widget counts when it is queued for its pipe, where weaverd counted it
+/// once written. A queued frame can still be replaced by a newer one, or
+/// lost with a pipe that fails (which restarts the widget).
 pub const Status = struct {
     /// System samples taken: one a second while anything subscribes to cpu
     /// or memory.
@@ -337,6 +340,7 @@ pub fn ServiceType(comptime Sources: type) type {
                 _ = win.SetEvent(lane.event);
                 subscriber.lane = null;
             }
+            self.reapLanes();
             for (std.enums.values(Kind)) |kind| {
                 if (subscriber.wants.needs(kind)) self.signal(kind);
             }
@@ -837,9 +841,11 @@ const FakeSources = struct {
     audio_polls: std.atomic.Value(u64) = .init(0),
     commands_run: std.atomic.Value(u64) = .init(0),
     outcome: Outcome = .accepted,
-    /// A command with this id waits for `gate` before it returns.
+    /// A command with this id waits for `gate` before it returns, once it
+    /// has said it started.
     blocked_id: u64 = 0,
     gate: win.HANDLE = null,
+    blocked_started: std.atomic.Value(bool) = .init(false),
     started: [kind_count]std.atomic.Value(bool) = @splat(.init(false)),
 
     pub fn prepare(_: *FakeSources, _: Kind) !void {}
@@ -868,7 +874,10 @@ const FakeSources = struct {
         return media_max_wait_ms;
     }
     pub fn command(self: *FakeSources, value: media_commands.Command) Outcome {
-        if (value.id == self.blocked_id) _ = win.WaitForSingleObject(self.gate, 5000);
+        if (value.id == self.blocked_id) {
+            self.blocked_started.store(true, .release);
+            _ = win.WaitForSingleObject(self.gate, 5000);
+        }
         _ = self.commands_run.fetchAdd(1, .acq_rel);
         return self.outcome;
     }
@@ -1066,6 +1075,11 @@ test "one widget's slow command never delays another widget's" {
     try std.testing.expectEqual(@as(u32, 0), slow.acks.load(.acquire));
     // The slow widget leaves mid-command: its answer is dropped, and its
     // thread is reaped once the command returns.
+    try waitFor(&service.sources, struct {
+        fn started(sources: *FakeSources) bool {
+            return sources.blocked_started.load(.acquire);
+        }
+    }.started);
     service.unsubscribe(&slow.subscriber);
     _ = win.SetEvent(gate);
     try waitFor(&service, struct {

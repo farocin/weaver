@@ -320,8 +320,9 @@ const Host = struct {
     provider_report: ProviderReport = .{},
     /// Earlier hosts' last counters.
     provider_totals: ProviderReport.Counters = .{},
-    /// A member used the providers at the last refresh.
-    provider_members_last: bool = false,
+    /// A widget that uses the providers has run in this host: its last
+    /// counters are read before the host stops.
+    provider_host_used: bool = false,
     thread_sample_ms: u64 = 0,
     slot_threads: [max_widgets]u32 = [_]u32{0} ** max_widgets,
     renderer_threads: u32 = 0,
@@ -542,6 +543,7 @@ const Host = struct {
 
     /// Mark the slot running, its cost sampled from `process`.
     fn markSlotRunning(self: *Host, slot: *Slot, process: c.HANDLE, now_ms: u64) void {
+        if (usesProviders(slot)) self.provider_host_used = true;
         supervisor.markRunning(slot, now_ms, self.artifactMtime(slot.source()));
         slot.platform.previous_process_ticks = processTicks(process);
         slot.platform.previous_sample_ms = now_ms;
@@ -874,7 +876,7 @@ const Host = struct {
     /// decides the state of a slot it is stopping.
     fn stopSharedHost(self: *Host, graceful: bool) void {
         const process = self.shared.process.process orelse return;
-        if (graceful and (self.provider_members_last or self.hasProviderMember())) {
+        if (graceful and self.provider_host_used) {
             // Its last counters, before they go with it.
             var scratch: [2 * max_answer_bytes]u8 = undefined;
             _ = self.queryProviders(&scratch);
@@ -904,6 +906,7 @@ const Host = struct {
     }
 
     fn closeSharedHost(self: *Host) void {
+        self.provider_host_used = false;
         self.provider_totals = self.provider_totals.plus(self.provider_report.counters);
         self.provider_report = .{};
         if (self.shared.process.process) |process| _ = c.CloseHandle(process);
@@ -1089,10 +1092,13 @@ const Host = struct {
         supervisor.recordChannelFailure(slot, now_ms);
     }
 
+    fn usesProviders(slot: *const Slot) bool {
+        return slot.wants_cpu or slot.wants_memory or slot.wants_audio or slot.wants_media or slot.wants_media_transport;
+    }
+
     fn hasProviderMember(self: *const Host) bool {
         for (&self.slots, 0..) |*slot, index| {
-            if (!self.running(index)) continue;
-            if (slot.wants_cpu or slot.wants_memory or slot.wants_audio or slot.wants_media or slot.wants_media_transport) return true;
+            if (self.running(index) and usesProviders(slot)) return true;
         }
         return false;
     }
@@ -1100,13 +1106,13 @@ const Host = struct {
     /// Ask the host for its providers' counters, and for the widgets whose
     /// provider channel failed since the last ask: those restart on their
     /// crash budget, as when weaverd ran the providers. It asks while a
-    /// member uses the providers, and once more after the last one goes, so
-    /// status shows them idle.
+    /// member uses the providers, and after the last one goes until the
+    /// host reports audio idle (its audio worker closes the capture a moment
+    /// after the widget leaves), so status never keeps a stale "live".
     fn refreshProviders(self: *Host, now_ms: u64) void {
-        const wanted = self.hasProviderMember();
-        const asked = wanted or self.provider_members_last;
-        self.provider_members_last = wanted;
-        if (!asked) return;
+        const report = &self.provider_report;
+        const settled = !report.audio_capture_active and std.mem.eql(u8, report.availability(), "idle");
+        if (!self.hasProviderMember() and settled) return;
         var scratch: [2 * max_answer_bytes]u8 = undefined;
         const wire = self.queryProviders(&scratch) orelse return;
         for (wire.failed.hosted) |host_slot| {
