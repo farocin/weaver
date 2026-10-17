@@ -19,11 +19,15 @@
 //! processes, and the next backoff deadline, and polls nothing. Status is
 //! written when something changes and when the CLI asks for it
 //! (`contract.status_request_event`), which is when costs are sampled.
-//! Work that reads files through std.Io or runs `node` (registry reads,
-//! bundling, manifests) runs on a short-lived worker (`onWorker`): std.Io's
-//! Windows file calls take 256-512 KiB stack frames, and a thread's stack
-//! stays as deep as it ever went, so the long-lived thread only uses
-//! small_fs.
+//! The management thread itself only waits, answers `weaver down` and
+//! status requests, and hands work to a short-lived worker (`Job`): reading
+//! the registry, reconciling it, and starting widgets. So it answers status
+//! even while a widget's load holds the UI thread. A job holds `state_lock`
+//! while it changes the daemon's state, and lets go of it while it waits on
+//! the UI thread or on `node`, so status can be written meanwhile. The
+//! worker also keeps std.Io's Windows file calls, whose 256-512 KiB stack
+//! frames would stay resident on a long-lived thread, off the management
+//! thread.
 //!
 //! A crash is recorded by crash_record.zig. The next host reads that record
 //! before it opens its own: a crash inside a widget's turn quarantines that
@@ -71,8 +75,8 @@ const apply_poll_ms: u64 = 250;
 /// short turn that happened to be open when the deadline passed.
 const wedged_turn_ms: u64 = apply_timeout_ms / 2;
 /// Handles the management thread waits on: its four events, the renderer,
-/// and a dev widget per registry slot. WaitForMultipleObjects takes at most
-/// 64 (MAXIMUM_WAIT_OBJECTS).
+/// and a dev widget per registry slot (or three while a job runs).
+/// WaitForMultipleObjects takes at most 64 (MAXIMUM_WAIT_OBJECTS).
 const max_wait_handles: usize = 5 + max_widgets;
 comptime {
     std.debug.assert(max_wait_handles <= 64);
@@ -314,6 +318,18 @@ pub const Daemon = struct {
     /// until a load succeeds; empty when the last one did.
     registry_failure: [256]u8 = undefined,
     registry_failure_len: usize = 0,
+    /// Held by whichever thread changes or reads the state below the
+    /// paths: the management thread while it writes status or stops, and
+    /// a job while it runs, except while it waits on the UI thread or on
+    /// `node`.
+    state_lock: win.SRWLOCK = std.mem.zeroes(win.SRWLOCK),
+    /// The job running on the worker, if one is.
+    worker: ?std.Thread = null,
+    job: Job = .tick,
+    job_now_ms: u64 = 0,
+    job_result: anyerror!void = {},
+    /// Auto reset: the job finished.
+    job_done: win.HANDLE,
 
     /// Everything the management thread needs, before it starts. Paths
     /// come from the data directory and this executable's place in the
@@ -340,6 +356,7 @@ pub const Daemon = struct {
             .slots = @splat(.{}),
             .started_ms = win.GetTickCount64(),
             .provider_failure = win.CreateEventW(null, 0, 0, null) orelse return error.CreateEventFailed,
+            .job_done = win.CreateEventW(null, 0, 0, null) orelse return error.CreateEventFailed,
         };
         options.service.setFailureSignal(self.provider_failure);
         self.costs.reset(win.GetCurrentProcess(), self.started_ms);
@@ -356,67 +373,153 @@ pub const Daemon = struct {
     fn run(self: *Daemon) void {
         // It runs no widget's code.
         widget_log.detachThread();
-        const began = onWorker(begin, .{self});
-        if (began) |_| {} else |err| self.noteRegistryFailure(err);
-        // The host before this one died: a reload it took and never
-        // acknowledged (it may have died removing a widget) is answered
-        // here, now that this start has read the registry as it stands and
-        // before any widget starts, so the CLI that sent it, which still
-        // waits on the events weaverd kept alive, hears in time.
-        if (self.predecessorCrashed()) {
-            // A reload signalled since `begin` read the registry may carry a
-            // change that read missed: it is run, and its result is the
-            // answer.
-            const answered = if (win.WaitForSingleObject(self.objects.reload, 0) == win.WAIT_OBJECT_0) onWorker(loadRegistry, .{self}) else began;
-            if (answered) |_| {} else |err| self.noteRegistryFailure(err);
-            _ = win.SetEvent(if (answered) |_| self.objects.reload_success else |_| self.objects.reload_failure);
-        }
+        var begin_due = true;
+        var reload_due = false;
+        var tick_due = false;
         var status_requested = true;
         while (true) {
-            const now = win.GetTickCount64();
-            self.supervise(now);
-            // Something woke the thread, so something may have changed.
+            if (self.worker == null) {
+                const next: ?Job = if (begin_due) .begin else if (reload_due) .reload else if (tick_due) .tick else null;
+                if (next) |job| {
+                    if (self.startJob(job)) |_| {
+                        switch (job) {
+                            .begin => begin_due = false,
+                            .reload => reload_due = false,
+                            .tick => tick_due = false,
+                        }
+                    } else |err| {
+                        // Never expected; retried a tick later, not spun.
+                        note("could not start the management worker: {s}; retrying in {d} ms", .{ @errorName(err), apply_poll_ms });
+                        win.Sleep(@intCast(apply_poll_ms));
+                        continue;
+                    }
+                }
+            }
             if (status_requested) {
+                // Answered now, whatever a job waits on: a widget still
+                // loading shows as starting.
+                self.lockState();
+                const now = win.GetTickCount64();
                 self.sampleCosts(now);
                 self.countThreads();
+                self.writeStatus(now);
+                self.unlockState();
+                _ = win.SetEvent(self.objects.status_written);
+                status_requested = false;
             }
-            self.writeStatus(now);
-            if (status_requested) _ = win.SetEvent(self.objects.status_written);
-            status_requested = false;
 
             var handles: [max_wait_handles]win.HANDLE = undefined;
             const count = self.waitHandles(&handles);
-            const wait = win.WaitForMultipleObjects(@intCast(count), &handles, 0, self.nextDeadlineMs(win.GetTickCount64()));
+            const timeout: win.DWORD = if (self.worker != null) win.INFINITE else self.nextDeadlineMs(win.GetTickCount64());
+            const wait = win.WaitForMultipleObjects(@intCast(count), &handles, 0, timeout);
             if (wait == win.WAIT_OBJECT_0) {
                 // Stopped from here on, whatever the rest of `weaver down`
-                // takes: weaverd stops a host that is slow to go, and that
-                // must read as a stop, not a crash.
+                // takes (a job may hold the state a moment longer): weaverd
+                // stops a host that is slow to go, and that must read as a
+                // stop, not a crash.
                 crash_record.markStopped();
-                break;
+                self.lockState();
+                self.stopAll();
+                crash_record.markStopped();
+                exitProcess(0);
             }
             if (wait == win.WAIT_FAILED) {
                 // Never expected; a wait that keeps failing must not spin.
                 note("the management wait failed: Win32 error {d}; retrying in {d} ms", .{ win.GetLastError(), apply_poll_ms });
                 win.Sleep(@intCast(apply_poll_ms));
+                continue;
             }
             if (wait == win.WAIT_OBJECT_0 + 1) {
-                // Any widget this reload removed is out of the host when
-                // the worker returns: the CLI may delete its directory.
-                if (onWorker(loadRegistry, .{self})) |_| {
+                status_requested = true;
+                // As before: a status request also re-checks sources.
+                tick_due = true;
+                continue;
+            }
+            if (self.worker != null) {
+                // The third handle is the job's.
+                if (wait == win.WAIT_OBJECT_0 + 2) self.finishJob(&reload_due, &tick_due);
+                continue;
+            }
+            if (wait == win.WAIT_OBJECT_0 + 2) {
+                reload_due = true;
+                continue;
+            }
+            // A provider failure, a process that exited, a backoff deadline:
+            // the next supervision pass.
+            tick_due = true;
+        }
+    }
+
+    /// Run `job` on a short-lived worker. The management thread hears of
+    /// its end through `job_done`.
+    fn startJob(self: *Daemon, job: Job) !void {
+        self.job = job;
+        self.job_now_ms = win.GetTickCount64();
+        self.worker = try std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, jobMain, .{self});
+    }
+
+    fn jobMain(self: *Daemon) void {
+        widget_log.detachThread();
+        self.lockState();
+        const result: anyerror!void = switch (self.job) {
+            .begin => self.begin(),
+            .reload => self.loadRegistry(),
+            .tick => self.supervise(self.job_now_ms),
+        };
+        self.unlockState();
+        self.job_result = result;
+        _ = win.SetEvent(self.job_done);
+    }
+
+    /// The job finished: answer what it was for, and write status.
+    fn finishJob(self: *Daemon, reload_due: *bool, tick_due: *bool) void {
+        self.worker.?.join();
+        self.worker = null;
+        self.lockState();
+        defer self.unlockState();
+        const result = self.job_result;
+        switch (self.job) {
+            .begin => {
+                if (result) |_| {} else |err| self.noteRegistryFailure(err);
+                // The host before this one died: a reload it took and never
+                // acknowledged (it may have died removing a widget) is
+                // answered now, before any widget starts, so the CLI that
+                // sent it, which still waits on the events weaverd kept
+                // alive, hears in time. A reload signalled since `begin`
+                // read the registry may carry a change that read missed: it
+                // runs next, and its result is the answer.
+                if (self.predecessorCrashed()) {
+                    if (win.WaitForSingleObject(self.objects.reload, 0) == win.WAIT_OBJECT_0) {
+                        reload_due.* = true;
+                    } else {
+                        _ = win.SetEvent(if (result) |_| self.objects.reload_success else |_| self.objects.reload_failure);
+                    }
+                }
+                tick_due.* = true;
+            },
+            .reload => {
+                // Any widget this reload removed is out of the host: the
+                // CLI may delete its directory.
+                if (result) |_| {
                     self.registry_failure_len = 0;
                     _ = win.SetEvent(self.objects.reload_success);
                 } else |err| {
                     self.noteRegistryFailure(err);
                     _ = win.SetEvent(self.objects.reload_failure);
                 }
-            }
-            if (wait == win.WAIT_OBJECT_0 + 2) status_requested = true;
-            // Anything else (a provider failure, a process that exited, a
-            // backoff deadline) is the next pass of `supervise`.
+                tick_due.* = true;
+            },
+            .tick => {},
         }
-        self.stopAll();
-        crash_record.markStopped();
-        std.process.exit(0);
+        self.writeStatus(win.GetTickCount64());
+    }
+
+    fn lockState(self: *Daemon) void {
+        win.AcquireSRWLockExclusive(&self.state_lock);
+    }
+
+    fn unlockState(self: *Daemon) void {
+        win.ReleaseSRWLockExclusive(&self.state_lock);
     }
 
     /// The previous host's record is still `running`: it did not stop.
@@ -599,6 +702,7 @@ pub const Daemon = struct {
 
     // ---- Supervision ----------------------------------------------------
 
+    /// Runs on the worker (`Job.tick`).
     fn supervise(self: *Daemon, now_ms: u64) void {
         self.superviseRenderer(now_ms);
         self.takeProviderFailures(now_ms);
@@ -616,25 +720,22 @@ pub const Daemon = struct {
                 .launch => launch_due = true,
             }
         }
-        if (launch_due) onWorker(launchDue, .{ self, now_ms }) catch |err| {
-            // No worker to start them on: each due widget backs off with the
-            // cause, rather than staying due and spinning the wait.
-            for (&self.slots, 0..) |*slot, index| {
-                if (!slot.used or !slot.enabled or self.running(index)) continue;
-                const due = slot.state == .starting or (slot.state == .backoff and now_ms >= slot.next_restart_ms);
-                if (due) supervisor.recordLaunchFailure(slot, now_ms, err);
-            }
-        };
+        if (launch_due) self.launchDue(now_ms);
         self.superviseRenderer(now_ms);
     }
 
-    /// What the management thread waits on: shutdown, reload and status
-    /// requests first (WaitForMultipleObjects reports the lowest), then a
-    /// provider failure, the renderer and each running dev widget.
+    /// What the management thread waits on: shutdown and status requests
+    /// first (WaitForMultipleObjects reports the lowest). While a job runs,
+    /// its end; the rest stay signalled until the next pass. Otherwise a
+    /// reload, a provider failure, the renderer and each running dev widget.
     fn waitHandles(self: *Daemon, handles: *[max_wait_handles]win.HANDLE) usize {
         handles[0] = self.objects.shutdown;
-        handles[1] = self.objects.reload;
-        handles[2] = self.objects.status_request;
+        handles[1] = self.objects.status_request;
+        if (self.worker != null) {
+            handles[2] = self.job_done;
+            return 3;
+        }
+        handles[2] = self.objects.reload;
         handles[3] = self.provider_failure;
         var count: usize = 4;
         if (self.renderer.platform.process) |process| {
@@ -664,9 +765,9 @@ pub const Daemon = struct {
         return @intCast(@min(at -| now_ms, win.INFINITE - 1));
     }
 
-    /// Start every widget whose (re)start is due. Runs on a worker: it may
-    /// bundle, and reads each manifest.
-    fn launchDue(self: *Daemon, now_ms: u64) !void {
+    /// Start every widget whose (re)start is due. Runs on the worker: it
+    /// may bundle, and reads each manifest.
+    fn launchDue(self: *Daemon, now_ms: u64) void {
         for (&self.slots, 0..) |*slot, index| {
             if (!slot.used or !slot.enabled or self.running(index)) continue;
             const due = slot.state == .starting or (slot.state == .backoff and now_ms >= slot.next_restart_ms);
@@ -717,6 +818,11 @@ pub const Daemon = struct {
         const bundle_stat = std.Io.Dir.cwd().statFile(self.options.io, bundle_path, .{}) catch null;
         const manifest_stat = std.Io.Dir.cwd().statFile(self.options.io, manifest_path, .{}) catch null;
         if (bundle_stat != null and manifest_stat != null and bundle_stat.?.mtime.nanoseconds >= source_stat.mtime.nanoseconds) return;
+        // Bundling can take seconds: status is answered meanwhile. Nothing
+        // here reads the daemon's state but `source`, which only the job
+        // changes.
+        self.unlockState();
+        defer self.lockState();
         const result = try std.process.run(self.allocator, self.options.io, .{
             .argv = &.{ "node", self.cli_script, "bundle", source },
             .stdout_limit = .limited(max_bundler_output_bytes),
@@ -748,6 +854,9 @@ pub const Daemon = struct {
             return;
         };
         slot.platform.host_slot = host_slot;
+        // What status shows until the load answers.
+        slot.state = .starting;
+        slot.setReason("loading in the widget host", .{});
         self.prepareSlot(slot, now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
         if (self.quarantined(slot)) {
             slot.platform.host_slot = null;
@@ -795,20 +904,15 @@ pub const Daemon = struct {
     /// (in a widget's native code, or in Native itself): the record names
     /// the widget whose turn holds it, if one does, and the host exits for
     /// weaverd to restart it, as weaverd restarted a host that did not
-    /// answer. `weaver down` during the wait stops the host cleanly.
+    /// answer. It runs on the worker, without the state lock, so the
+    /// management thread answers status and `weaver down` meanwhile.
     fn apply(self: *Daemon, command: host_control.Command) !void {
         var pending: host_control.Pending = .{ .command = command };
         self.options.post(&pending);
+        self.unlockState();
+        defer self.lockState();
         const deadline = win.GetTickCount64() + apply_timeout_ms;
         while (!pending.done.isSet()) {
-            if (win.WaitForSingleObject(self.objects.shutdown, 0) == win.WAIT_OBJECT_0) {
-                // The UI thread never runs this command now; the rest of
-                // `weaver down` needs nothing from it.
-                crash_record.markStopped();
-                self.stopAll();
-                crash_record.markStopped();
-                exitProcess(0);
-            }
             const now = win.GetTickCount64();
             if (now >= deadline) {
                 note("the UI thread did not apply a widget {s} within apply_timeout_ms={d}; the host is stuck and exits for weaverd to restart it", .{ @tagName(command), apply_timeout_ms });
@@ -847,6 +951,8 @@ pub const Daemon = struct {
     /// listener and dev reloads touch only it. It runs in the host's job
     /// and gets its providers from the host over its pipe.
     fn launchDev(self: *Daemon, slot: *Slot, now_ms: u64) void {
+        slot.state = .starting;
+        slot.setReason("starting its dev process", .{});
         self.prepareSlot(slot, now_ms) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
         const dist = self.distPath(slot) catch |err| return supervisor.recordLaunchFailure(slot, now_ms, err);
         defer self.allocator.free(dist);
@@ -1144,23 +1250,16 @@ pub const Daemon = struct {
     }
 };
 
-/// Run `function` on a short-lived worker with `worker_stack_bytes`, and
-/// wait for it. The management thread never runs alongside it.
-fn onWorker(comptime function: anytype, args: anytype) !void {
-    const Call = struct {
-        args: @TypeOf(args),
-        result: anyerror!void = {},
-
-        fn run(call: *@This()) void {
-            widget_log.detachThread();
-            call.result = @call(.auto, function, call.args);
-        }
-    };
-    var call: Call = .{ .args = args };
-    const thread = try std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, Call.run, .{&call});
-    thread.join();
-    return call.result;
-}
+/// What the management thread hands its worker.
+const Job = enum {
+    /// The first work of a host start: the ledger, the registry, the
+    /// previous host's crash.
+    begin,
+    /// The registry changed.
+    reload,
+    /// A supervision pass: exits, failures, deadlines, launches.
+    tick,
+};
 
 /// What the slot's manifest asks of the providers, as the daemon read it.
 fn wantsOf(slot: *const Slot) provider_service.Wants {
