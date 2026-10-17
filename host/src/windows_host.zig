@@ -609,6 +609,10 @@ const Host = struct {
             return;
         }
         self.ensureSharedHost(now_ms) catch |err| return self.failLaunch(slot, now_ms, err);
+        // The bundle about to load, noted before it runs: if loading it
+        // crashes the host, this is the bundle quarantined (not the one
+        // before it), and a load that fails stays stopped until a new one.
+        slot.artifact_mtime = self.artifactMtime(slot.source());
         const line = self.addCommand(slot) catch |err| return self.failLaunch(slot, now_ms, err);
         defer self.allocator.free(line);
         const process = self.shared.process.process.?;
@@ -751,12 +755,19 @@ const Host = struct {
         var buffer: [48]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "{{\"remove\":{{\"id\":{d}}}}}\n", .{slot.platform.host_slot.?}) catch unreachable;
         const answer = self.controlRequest(line);
-        self.releaseHostedSlot(slot);
         if (answer) |result| {
+            self.releaseHostedSlot(slot);
             if (!result.ok) std.log.warn("shared widget host could not remove '{s}': {s}", .{ slot.name(), result.errorName() });
         } else |err| {
-            // Gone or wedged: stop it, and the others start again in a new one.
+            // Its teardown runs its code (a storage flush can call its
+            // toJSON), so the host can die removing it. Settle that exit
+            // while it is still a member, so the host's record can name it.
+            if (c.WaitForSingleObject(self.shared.process.process.?, 1000) == c.WAIT_OBJECT_0) {
+                return self.settleSharedHostExit(c.GetTickCount64());
+            }
+            // Wedged: stop it, and the others start again in a new one.
             std.log.warn("shared widget host did not answer removing '{s}': {s}; restarting it", .{ slot.name(), @errorName(err) });
+            self.releaseHostedSlot(slot);
             return self.stopSharedHost(false);
         }
         if (self.hostedCount() == 0) self.stopSharedHost(true);
