@@ -1,0 +1,1 @@
+fix: **Widgets no longer speed up when the mouse moves over them**: on Windows, input over an animating Widget could start extra frame loops that never stopped; a few mouse moves took a 60 fps canvas to ~900 fps and its process from ~2% to ~19% CPU until restart. The pinned Native SDK now emits only the frame that is currently scheduled.
