@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
 import { compileClass, UtilityError, type ClassProps } from "../../sdk/src/class-compiler.js";
+import { iconClass } from "../../sdk/src/icon-class.js";
 import { signalDevReload } from "./dev-reload.js";
 import { createDevRebuildLoop } from "./dev-rebuild-loop.js";
 import { endDevRegistration } from "./dev-registration.js";
@@ -300,10 +301,14 @@ async function bundleWidget(directory: string): Promise<BundleResult> {
   const outputDirectory = join(directory, "dist");
   mkdirSync(outputDirectory, { recursive: true });
   copyWidgetAssets(directory, outputDirectory);
-  const bundle = await compileWidgetBundle(project, join(outputDirectory, "bundle.js"));
+  const { bundle, sdkFallback } = await compileWidgetBundle(project, join(outputDirectory, "bundle.js"));
   if (project.usesIcons) {
     copyFileSync(iconLicenseSource, join(outputDirectory, iconLicenseFile));
   }
+  // Written before the bundle that names it, and never deleted: a widget
+  // still running an earlier bundle (a dev hot swap the runtime rejected
+  // keeps it) loads the fallback that bundle was built with.
+  if (sdkFallback) writeAtomic(join(outputDirectory, sdkFallback.name), sdkFallback.contents);
   writeAtomic(join(outputDirectory, "bundle.js"), bundle);
   const manifest: RuntimeManifest = {
     name: project.config.name,
@@ -774,7 +779,16 @@ function nowMicroseconds(): number {
   return Number(process.hrtime.bigint() / 1000n);
 }
 
-async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<Uint8Array> {
+interface SdkFallback {
+  /** sdk-fallback-<hash>.js beside bundle.js, named by its contents. */
+  name: string;
+  contents: Uint8Array;
+}
+
+async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<{ bundle: Uint8Array; sdkFallback: SdkFallback | null }> {
+  const use = sdkUse(project);
+  const trimmed = use.classes !== null || !use.backgroundProps;
+  const sdkFallback = trimmed ? await compileSdkFallback() : null;
   const built = await build({
     entryPoints: [project.sourcePath],
     outfile,
@@ -787,13 +801,44 @@ async function compileWidgetBundle(project: SourceProject, outfile: string): Pro
     legalComments: "none",
     minify: true,
     plugins: [
+      ...(sdkFallback ? [sdkTrimPlugin(use, sdkFallback.name)] : []),
       iconLoweringPlugin(project.directory, () => { project.usesIcons = true; }),
       weaverResolutionPlugin(project.directory),
     ],
     logLevel: "silent",
     write: false,
   });
-  return built.outputFiles[0].contents;
+  return { bundle: built.outputFiles[0].contents, sdkFallback };
+}
+
+/**
+ * The SDK runtime a trimmed bundle can still reach through a class or a
+ * background the source analysis did not see: the class compiler and the
+ * gradient serializer, as one script whose value is their exports. The
+ * runtime evaluates it only when the bundle first needs it.
+ */
+async function compileSdkFallback(): Promise<SdkFallback> {
+  const built = await build({
+    stdin: {
+      contents: `export { compileClass, classUsesGradientBackground } from "./class-compiler.js";
+export { serializeBackground } from "./gradients.js";
+`,
+      resolveDir: sdkRoot,
+      loader: "ts",
+    },
+    bundle: true,
+    format: "iife",
+    globalName: "__weaverSdkFallback",
+    footer: { js: "__weaverSdkFallback;" },
+    platform: "neutral",
+    target: "es2020",
+    legalComments: "none",
+    minify: true,
+    logLevel: "silent",
+    write: false,
+  });
+  const contents = built.outputFiles[0].contents;
+  return { name: `sdk-fallback-${createHash("sha256").update(contents).digest("hex").slice(0, 16)}.js`, contents };
 }
 
 async function packWidget(directory: string): Promise<void> {
@@ -1034,6 +1079,63 @@ function jsxClassVariants(attribute: ts.JsxAttribute, context: StaticExpressionC
   if (ts.isStringLiteral(initializer)) return [initializer.text];
   if (ts.isJsxExpression(initializer) && initializer.expression) return context.stringVariants(initializer.expression);
   return null;
+}
+
+/** One spelling per class string: the class compiler reads utilities split
+ * on whitespace, so strings that differ only in spacing compile the same. */
+function normalizedClass(className: string): string {
+  return className.trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+/** What of the SDK's runtime a widget's source shows it using. */
+interface SdkUse {
+  /** Every class string the source shows the widget rendering, compiled;
+   * null when the analysis gives up and the class compiler ships. */
+  classes: Map<string, ClassProps> | null;
+  /** Whether a `background={...}` gradient appears in the source. */
+  backgroundProps: boolean;
+}
+
+/**
+ * Read from the source what of the SDK's runtime the widget uses: every
+ * class string a JSX `class` can take (`weaver check` already enumerates
+ * them), and whether a built-in element takes a `background` prop. The
+ * analysis is a guide, not a proof: a class or background it did not see
+ * makes the widget load sdk-fallback.js, so being wrong costs memory, never
+ * correctness. It gives up where it is likely to be wrong anyway: spread
+ * props on a built-in element, a direct `h` call, the JSX runtime imported
+ * by hand.
+ */
+function sdkUse(project: SourceProject): SdkUse {
+  const everything: SdkUse = { classes: null, backgroundProps: true };
+  const bindings = hFactoryBindings(project.directory, project.sourceFiles);
+  if ([...bindings.values()].some((binding) => binding.identifiers.size > 0 || binding.namespaces.size > 0)) return everything;
+  if (project.sourceFiles.some((sourceFile) => sourceFile.text.includes("@weaver/sdk/jsx-runtime") || sourceFile.text.includes("serializeBackground"))) return everything;
+  const classes = new Set<string>([""]);
+  let backgroundProps = false;
+  for (const sourceFile of project.sourceFiles) {
+    const incomplete = walkSourceWithStaticExpressions(sourceFile, (node, context) => {
+      if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && node.tagName.getText(sourceFile) === "icon" &&
+          !node.attributes.properties.some((property) => ts.isJsxAttribute(property) && property.name.getText(sourceFile) === "class")) {
+        classes.add(iconClass(undefined));
+      }
+      if (ts.isJsxSpreadAttribute(node)) return /^[a-z]/.test(node.parent.parent.tagName.getText(sourceFile));
+      if (!ts.isJsxAttribute(node)) return false;
+      const tag = node.parent.parent.tagName.getText(sourceFile);
+      const name = node.name.getText(sourceFile);
+      if (name === "background") backgroundProps = true;
+      if (name !== "class") return false;
+      const variants = jsxClassVariants(node, context);
+      if (variants === null) return true;
+      // The SDK composes an <icon>'s class at run time; compile that string.
+      for (const variant of variants) classes.add(normalizedClass(tag === "icon" ? iconClass(variant) : variant));
+      return false;
+    });
+    if (incomplete) return everything;
+  }
+  const compiled = new Map<string, ClassProps>();
+  for (const className of classes) compiled.set(className, compileClass(className));
+  return { classes: compiled, backgroundProps };
 }
 
 interface HFactoryBindings {
@@ -1354,6 +1456,56 @@ function weaverResolutionPlugin(sourceRoot: string): import("esbuild").Plugin {
         }
         return null;
       });
+    },
+  };
+}
+
+/**
+ * Leave out of the bundle the SDK runtime the source shows no use for: the
+ * class compiler, replaced by a lookup in the classes compiled here, and the
+ * gradient serializer with its color palette. Each costs every widget tens
+ * of KiB of JavaScript heap (about 60 KiB apiece for a clock, 2026-10-15).
+ * A class or background the lookup cannot serve loads sdk-fallback.js once,
+ * so a widget the analysis misread still renders, at the old memory cost.
+ */
+function sdkTrimPlugin(use: SdkUse, fallbackName: string): import("esbuild").Plugin {
+  const modules = new Map<string, string>([["fallback", `let fallback;
+export function sdkFallback() {
+  if (fallback === undefined) fallback = native.loadSdkFallback(${JSON.stringify(fallbackName)});
+  return fallback;
+}
+`]]);
+  if (use.classes) {
+    modules.set("class-compiler.js", `import { sdkFallback } from "weaver-sdk-fallback";
+const classes = new Map(${JSON.stringify([...use.classes])});
+const normalized = (className) => className.trim().split(/\\s+/).filter(Boolean).join(" ");
+const known = (className) => classes.get(className) ?? classes.get(normalized(className));
+export function compileClass(className) {
+  return known(className) ?? sdkFallback().compileClass(className);
+}
+export function classUsesGradientBackground(className) {
+  const compiled = known(className);
+  return compiled !== undefined ? compiled.backgroundGradient !== undefined : sdkFallback().classUsesGradientBackground(className);
+}
+`);
+  }
+  if (!use.backgroundProps) {
+    modules.set("gradients.js", `import { sdkFallback } from "weaver-sdk-fallback";
+export function serializeBackground(background) {
+  return sdkFallback().serializeBackground(background);
+}
+`);
+  }
+  return {
+    name: "weaver-sdk-trim",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /^weaver-sdk-fallback$/ }, () => ({ path: "fallback", namespace: "weaver-sdk-trim" }));
+      pluginBuild.onResolve({ filter: /^\.\/(class-compiler|gradients)\.js$/ }, (args) => {
+        if (!args.importer || !(pathsEqual(args.importer, sdkRoot) || pathInside(sdkRoot, args.importer))) return null;
+        const name = args.path.slice(2);
+        return modules.has(name) ? { path: name, namespace: "weaver-sdk-trim" } : null;
+      });
+      pluginBuild.onLoad({ filter: /.*/, namespace: "weaver-sdk-trim" }, (args) => ({ contents: modules.get(args.path)!, loader: "js" }));
     },
   };
 }

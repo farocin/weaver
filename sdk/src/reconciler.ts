@@ -1,5 +1,6 @@
 import { classUsesGradientBackground, compileClass, type ClassProps } from "./class-compiler.js";
 import { serializeBackground, type BackgroundGradientStack } from "./gradients.js";
+import { iconClass } from "./icon-class.js";
 
 // Storage receipt (2026-07-29): serializing a realistic good notes fixture
 // (100 records with 900-byte bodies and metadata) measured 103,291 bytes.
@@ -241,7 +242,7 @@ export function h(type: ElementType, props: Record<string, unknown> | null, ...c
         typeof source.iconViewBox !== "string" || typeof source.iconStroke !== "number") {
       throw new Error("<icon> must be lowered to path data by weaver bundle");
     }
-    source.class = `w-[24px] h-[24px] ${typeof source.class === "string" ? source.class : ""}`.trim();
+    source.class = iconClass(source.class);
   }
   if (type === "image") {
     if (source.fit !== undefined && source.fit !== "cover" && source.fit !== "contain" && source.fit !== "stretch") {

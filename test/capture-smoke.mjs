@@ -44,6 +44,14 @@ try {
   assert.match(snapshotText(classHoleClicked), /role=group name="" bounds=\(\d+(?:\.\d+)?,\d+(?:\.\d+)? 42x8\)/, "hole fill is 42px after three clicks");
   assert.ok(countPixels(classHoleClicked, [0x5e, 0xea, 0xd4]) > countPixels(classHole, [0x5e, 0xea, 0xd4]), "hole fill painted more accent after clicks");
 
+  // Classes and backgrounds weaver bundle's source analysis cannot see reach
+  // sdk-fallback.js and still paint red-500 (js-import's gradient starts
+  // there).
+  for (const fixture of ["js-import", "alias", "numeric", "shadow", "namespace"]) {
+    const fallback = capture(`sdk-fallback-${fixture}`, `test/fixtures/sdk-fallback-${fixture}`);
+    assert.ok(countPixels(fallback, [0xfb, 0x2c, 0x36]) > 0, `${fixture}: red-500 painted`);
+  }
+
   const images = capture("styling-images", "examples/styling-images");
   assert.equal(images.renderer.images, 3);
   assert.equal(images.pending.images, 0);
