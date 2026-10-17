@@ -6,6 +6,7 @@ const provider_mod = @import("provider.zig");
 const qjs = @import("qjs.zig");
 const storage_mod = @import("storage.zig");
 const widget_diagnostic = @import("widget_diagnostic.zig");
+const weaver_build_options = @import("weaver_build_options");
 const c = qjs.c;
 
 pub const State = struct {
@@ -120,6 +121,7 @@ pub fn install(ctx: *c.JSContext, bridge_state: *State) !void {
     const native = c.JS_NewObject(ctx);
     if (c.JS_IsException(native)) return error.QuickJs;
     errdefer c.JS_FreeValue(ctx, native);
+    if (weaver_build_options.automation_seam) try setFunction(ctx, native, "testCrash", testCrash, 1);
     try setFunction(ctx, native, "createNode", createNode, 1);
     try setFunction(ctx, native, "setProp", setProp, 3);
     try setFunction(ctx, native, "setText", setText, 2);
@@ -232,6 +234,31 @@ fn stringArg(ctx: *c.JSContext, value: c.JSValueConst) !struct { bytes: []const 
     var len: usize = 0;
     const raw = c.JS_ToCStringLen2(ctx, &len, value, false) orelse return error.InvalidArgument;
     return .{ .bytes = raw[0..len], .raw = raw };
+}
+
+/// `native.testCrash("fault" | "panic" | "provider")`, in
+/// `-Dautomation-seam` builds only: crash the host from inside a widget's
+/// turn, as a bug in native code would, or (`provider`, Windows host) on
+/// the system provider's worker at its next sample, so crash attribution
+/// and the OS restart can be tested on a real process.
+fn testCrash(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {
+    const js = ctx orelse return qjs.exceptionValue();
+    var kind: [8]u8 = @splat(0);
+    if (argc > 0) {
+        if (c.JS_ToCString(js, argv[0])) |text| {
+            defer c.JS_FreeCString(js, text);
+            const span = std.mem.span(text);
+            @memcpy(kind[0..@min(span.len, kind.len)], span[0..@min(span.len, kind.len)]);
+        }
+    }
+    if (std.mem.startsWith(u8, &kind, "panic")) @panic("native.testCrash(\"panic\")");
+    if (std.mem.startsWith(u8, &kind, "provider")) {
+        if (@import("builtin").os.tag == .windows) @import("provider_service.zig").test_crash_requested.store(true, .release);
+        return qjs.undefinedValue();
+    }
+    const nowhere: *allowzero volatile u32 = @ptrFromInt(0);
+    nowhere.* = 1;
+    return qjs.undefinedValue();
 }
 
 fn createNode(ctx: ?*c.JSContext, _: c.JSValueConst, argc: c_int, argv: [*c]c.JSValueConst) callconv(.c) c.JSValue {

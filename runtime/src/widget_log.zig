@@ -24,6 +24,16 @@ pub const Sink = struct {
 /// (or after the last one is gone) are dropped, as before `init`.
 var current: ?*Sink = null;
 
+/// Set on a thread that runs no widget's code (the host's provider
+/// threads): `current` belongs to the UI thread, which may switch or free
+/// it at any moment, so this thread's lines are dropped instead.
+threadlocal var detached = false;
+
+/// The calling thread runs no widget's code; see `detached`.
+pub fn detachThread() void {
+    detached = true;
+}
+
 pub fn init(sink: *Sink, runtime_io: std.Io, path: []const u8) !void {
     const allocator = std.heap.page_allocator;
     const next_path = try allocator.dupe(u8, path);
@@ -63,6 +73,7 @@ pub fn logFn(
     // reportError forwards at most 6,000 detail bytes; 8 KiB leaves >2 KiB
     // for timestamp/level/scope and formatting. The stack cost exists only
     // during one log call.
+    if (detached) return;
     const sink = current orelse return;
     var buffer: [8192]u8 = undefined;
     const line = formatLogLine(level, scope, format, args, &buffer) catch |err| return noteFailure(sink, err);

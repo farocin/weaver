@@ -1,33 +1,21 @@
-//! The daemon's line to an anchored widget host (ADR 0022 step 1): which
-//! widgets the host runs. `weaverd` creates a pipe per host launch, names it
-//! in WEAVER_CONTROL_PIPE, and writes one JSON command per line:
+//! How the daemon host's management thread (daemon.zig) has the UI thread
+//! load or unload a widget (ADR 0022 step 4). The management thread reads
+//! the registry, prepares each widget off the UI thread, then posts one
+//! command and waits for the UI thread to apply it between widget turns
+//! (main.zig `applyControl`):
 //!
-//!     {"add":{"id":3,"dir":"...\\dist","pipe":"\\\\.\\pipe\\...","backend":"...backend-..."}}
-//!     {"remove":{"id":3}}
+//!     add    { id, dir, backend }   load the bundle in `dir` into slot `id`
+//!     remove { id }                 unload the widget in slot `id`
 //!
-//! `id` is the daemon's slot for the widget: the host runs it in that slot,
-//! and the crash breadcrumb names it as `id + 1`. The host answers each
-//! command on the same pipe once it has taken effect, or why it did not:
-//!
-//!     {"added":3,"ok":true}   {"added":3,"ok":false,"error":"ManifestInvalid"}
-//!     {"removed":3,"ok":true} {"removed":3,"ok":false,"error":"NoWidgetInSlot"}
-//!     {"ok":false,"error":"InvalidCommand"}   (a line that is not a command)
-//!
-//! When the daemon closes the pipe, the host exits.
-//!
-//! The reader runs on its own thread and never touches widgets; it hands
-//! each command to the UI thread and waits for its outcome.
+//! An `add` id is the widget's slot in the host: it runs in that slot, and
+//! the crash record names it as `id + 1`.
 const std = @import("std");
-const builtin = @import("builtin");
-
-/// Longest command line: three paths of at most 32,767 UTF-16 units each
-/// (Windows' long-path ceiling) as UTF-8, plus the JSON around them.
-pub const max_line_bytes: usize = 3 * 3 * 32 * 1024 + 256;
 
 pub const Add = struct {
     id: u16,
+    /// Its bundle directory (`dist`).
     dir: []const u8,
-    pipe: ?[]const u8 = null,
+    /// Where it reports its renderer, or why it did not load.
     backend: ?[]const u8 = null,
 };
 
@@ -36,36 +24,16 @@ pub const Command = union(enum) {
     remove: struct { id: u16 },
 };
 
-pub const ParseError = error{ InvalidCommand, OutOfMemory };
-
-/// Parse one command line; the strings live in `arena`.
-pub fn parse(arena: std.mem.Allocator, line: []const u8) ParseError!Command {
-    const Wire = struct {
-        add: ?struct { id: u16, dir: []const u8, pipe: ?[]const u8 = null, backend: ?[]const u8 = null } = null,
-        remove: ?struct { id: u16 } = null,
-    };
-    const wire = std.json.parseFromSliceLeaky(Wire, arena, line, .{ .allocate = .alloc_always }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCommand,
-    };
-    if (wire.add != null and wire.remove != null) return error.InvalidCommand;
-    if (wire.add) |add| return .{ .add = .{ .id = add.id, .dir = add.dir, .pipe = add.pipe, .backend = add.backend } };
-    if (wire.remove) |remove| return .{ .remove = .{ .id = remove.id } };
-    return error.InvalidCommand;
-}
-
 /// One command handed to the UI thread, and its outcome handed back.
 pub const Pending = struct {
     command: Command,
-    /// What the reader prepared off the UI thread for an `add`.
-    prepared: ?*anyopaque = null,
     /// Set by the UI thread: null when it took effect, else why not.
     failure: ?anyerror = null,
     done: std.Io.Event = .unset,
 };
 
-/// The command waiting for the UI thread. The reader posts one and waits
-/// for it to be done, so there is never more than one.
+/// The command waiting for the UI thread. The management thread posts one
+/// and waits for it to be done, so there is never more than one.
 pub const Mailbox = struct {
     pending: std.atomic.Value(?*Pending) = .init(null),
 
@@ -83,68 +51,8 @@ pub const Mailbox = struct {
     }
 };
 
-/// Write the answer to `command` (one line).
-pub fn answer(writer: *std.Io.Writer, command: Command, failure: ?anyerror) !void {
-    const verb: []const u8, const id: u16 = switch (command) {
-        .add => |add| .{ "added", add.id },
-        .remove => |remove| .{ "removed", remove.id },
-    };
-    if (failure) |err|
-        try writer.print("{{\"{s}\":{d},\"ok\":false,\"error\":\"{s}\"}}\n", .{ verb, id, @errorName(err) })
-    else
-        try writer.print("{{\"{s}\":{d},\"ok\":true}}\n", .{ verb, id });
-}
-
-/// Answer a line that is not a command (one line).
-pub fn refuse(writer: *std.Io.Writer, err: anyerror) !void {
-    try writer.print("{{\"ok\":false,\"error\":\"{s}\"}}\n", .{@errorName(err)});
-}
-
-/// The client end of the daemon's control pipe (Windows only).
-pub const Pipe = struct {
-    handle: std.os.windows.HANDLE,
-
-    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?std.os.windows.HANDLE) callconv(.winapi) std.os.windows.HANDLE;
-    extern "kernel32" fn ReadFile(handle: std.os.windows.HANDLE, buffer: [*]u8, len: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL;
-    extern "kernel32" fn WriteFile(handle: std.os.windows.HANDLE, buffer: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL;
-    extern "kernel32" fn CloseHandle(handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
-
-    pub fn connect(name: []const u8) !Pipe {
-        if (builtin.os.tag != .windows) return error.Unsupported;
-        var wide: [512:0]u16 = undefined;
-        const length = std.unicode.utf8ToUtf16Le(&wide, name) catch return error.InvalidPipeName;
-        if (length >= wide.len) return error.InvalidPipeName;
-        wide[length] = 0;
-        const generic_read: u32 = 0x80000000;
-        const generic_write: u32 = 0x40000000;
-        const open_existing: u32 = 3;
-        const handle = CreateFileW(&wide, generic_read | generic_write, 0, null, open_existing, 0, null);
-        if (handle == std.os.windows.INVALID_HANDLE_VALUE) return error.ConnectFailed;
-        return .{ .handle = handle };
-    }
-
-    /// Bytes into `buffer`; zero when the daemon closed its end.
-    pub fn read(self: Pipe, buffer: []u8) usize {
-        var read_len: u32 = 0;
-        if (ReadFile(self.handle, buffer.ptr, @intCast(@min(buffer.len, std.math.maxInt(u32))), &read_len, null) == .FALSE) return 0;
-        return read_len;
-    }
-
-    pub fn writeAll(self: Pipe, bytes: []const u8) !void {
-        var remaining = bytes;
-        while (remaining.len > 0) {
-            var written: u32 = 0;
-            if (WriteFile(self.handle, remaining.ptr, @intCast(remaining.len), &written, null) == .FALSE) return error.WriteFailed;
-            remaining = remaining[written..];
-        }
-    }
-
-    pub fn close(self: Pipe) void {
-        _ = CloseHandle(self.handle);
-    }
-};
-
-/// Splits a byte stream into lines no longer than `max_line_bytes`.
+/// Splits a byte stream into lines no longer than its buffer (a dev
+/// widget's provider pipe, dev_widgets.zig).
 pub const LineReader = struct {
     buffer: []u8,
     start: usize = 0,
@@ -174,37 +82,6 @@ pub const LineReader = struct {
         self.end += count;
     }
 };
-
-test "commands parse, and anything else is refused" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const add = try parse(arena, "{\"add\":{\"id\":3,\"dir\":\"C:\\\\w\\\\dist\",\"pipe\":\"\\\\\\\\.\\\\pipe\\\\p\",\"backend\":\"b\"}}");
-    try std.testing.expectEqual(@as(u16, 3), add.add.id);
-    try std.testing.expectEqualStrings("C:\\w\\dist", add.add.dir);
-    try std.testing.expectEqualStrings("\\\\.\\pipe\\p", add.add.pipe.?);
-    const remove = try parse(arena, "{\"remove\":{\"id\":7}}");
-    try std.testing.expectEqual(@as(u16, 7), remove.remove.id);
-    try std.testing.expectError(error.InvalidCommand, parse(arena, "{}"));
-    try std.testing.expectError(error.InvalidCommand, parse(arena, "{\"add\":{\"id\":1,\"dir\":\"d\"},\"remove\":{\"id\":1}}"));
-    try std.testing.expectError(error.InvalidCommand, parse(arena, "not json"));
-}
-
-test "answers name the command and its outcome" {
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try answer(&output.writer, .{ .add = .{ .id = 2, .dir = "d" } }, null);
-    try answer(&output.writer, .{ .add = .{ .id = 4, .dir = "d" } }, error.ManifestInvalid);
-    try answer(&output.writer, .{ .remove = .{ .id = 4 } }, null);
-    try answer(&output.writer, .{ .remove = .{ .id = 5 } }, error.NoWidgetInSlot);
-    try refuse(&output.writer, error.InvalidCommand);
-    try std.testing.expectEqualStrings(
-        "{\"added\":2,\"ok\":true}\n{\"added\":4,\"ok\":false,\"error\":\"ManifestInvalid\"}\n" ++
-            "{\"removed\":4,\"ok\":true}\n{\"removed\":5,\"ok\":false,\"error\":\"NoWidgetInSlot\"}\n" ++
-            "{\"ok\":false,\"error\":\"InvalidCommand\"}\n",
-        output.written(),
-    );
-}
 
 test "the mailbox holds one command until it is taken" {
     var mailbox: Mailbox = .{};
