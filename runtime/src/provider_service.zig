@@ -1,10 +1,12 @@
 //! The anchored host's providers (ADR 0022 step 3). Each provider (system
-//! sampling, audio, media, media commands) runs on a worker thread of its
-//! own, which initialises COM where the provider uses it and creates, polls,
-//! commands and destroys its objects. A worker starts with its first
-//! subscriber and waits, holding no provider objects, while nothing
-//! subscribes. The UI thread only subscribes, unsubscribes and submits
-//! commands; it never runs provider code.
+//! sampling, audio, media) runs on a worker thread of its own, which
+//! initialises COM where the provider uses it and creates, polls and
+//! destroys its objects. A worker starts with its first subscriber and waits,
+//! holding no provider objects, while nothing subscribes. Media commands run
+//! on a thread per widget that sends them, as weaverd ran them, so one
+//! widget's slow command never delays another's. The UI thread only
+//! subscribes, unsubscribes and submits commands; it never runs provider
+//! code.
 //!
 //! Hosted widgets subscribe in process: frames and acknowledgements land in
 //! their provider client's queues (provider_windows.Client.initLocal). Dev
@@ -56,6 +58,11 @@ const audio_interval_ms: u64 = 10;
 /// The longest the media worker sleeps between polls: the media provider
 /// polls SMTC once a second (media.zig) and says when its next poll is due.
 const media_max_wait_ms: u64 = 1000;
+/// Command threads at once: one per widget that commands media, and one
+/// that unsubscribed mid-command keeps its thread until that command
+/// returns (at most 2.5 s, media.zig). Twice the 32 widgets a registry holds
+/// (see max_subscribers) is a tripwire.
+pub const max_command_lanes: usize = max_subscribers;
 /// Initial stack commit of a worker thread, the least Windows grants
 /// (std.Thread). The stack grows on demand within the image's reservation
 /// (16 MiB, runtime/build.zig), which the art cache's file calls need.
@@ -97,7 +104,7 @@ pub const Wants = struct {
             .system => self.cpu or self.memory,
             .audio => self.audio,
             .media => self.media,
-            // The command worker starts with a widget's first command.
+            // A widget's command thread starts with its first command.
             .commands => false,
         };
     }
@@ -126,16 +133,30 @@ pub const Owner = union(enum) {
     }
 };
 
-/// One widget's subscription. Its owner fills the first five fields and
-/// keeps it at a fixed address from `subscribe` to `unsubscribe`.
+/// What became of an acknowledgement a subscriber was given.
+pub const AckStore = enum {
+    stored,
+    /// No command of its waits for it any more (its client gave up on it):
+    /// dropped, as a late ack from a pipe was.
+    unknown,
+    /// No room: the client broke the protocol's bounds, which fails its
+    /// channel.
+    full,
+};
+
+/// One widget's subscription. Its owner fills the first six fields and
+/// keeps it at a fixed address from `subscribe` to `unsubscribe`. The three
+/// callbacks run under the service's lock, on whichever thread delivered,
+/// so they must not block or call back into the service.
 pub const Subscriber = struct {
     wants: Wants,
     owner: Owner,
-    /// Where its frames and acknowledgements land.
+    /// Where its frames land.
     queues: *protocol.Queues,
     context: *anyopaque,
-    /// Told of each delivery. It runs under the service's lock, on whichever
-    /// thread delivered, so it must not block or call back into the service.
+    /// Keep an acknowledgement for it.
+    store_ack: *const fn (context: *anyopaque, id: u64, ok: bool) AckStore,
+    /// Told of each delivery.
     notify: *const fn (context: *anyopaque, delivery: Delivery) void,
 
     // The service's, under its lock.
@@ -145,9 +166,8 @@ pub const Subscriber = struct {
     media_sent: bool = false,
     failed: bool = false,
     rate: media_commands.RateLimiter = .{},
-    commands: [media_commands.queue_capacity]media_commands.Command = undefined,
-    command_head: usize = 0,
-    command_count: usize = 0,
+    /// Its command thread, from its first accepted command.
+    lane: ?*anyopaque = null,
 };
 
 /// The channels that failed since weaverd last asked: a bit per hosted
@@ -218,15 +238,30 @@ pub fn ServiceType(comptime Sources: type) type {
         stopping: bool = false,
         status: Status = .{},
         failures: Failures = .{},
-        /// Where the command worker looks first for its next command, so
-        /// every widget's commands take turns.
-        command_cursor: usize = 0,
+        lanes: [max_command_lanes]?*CommandLane = @splat(null),
 
         const Worker = struct {
             thread: ?std.Thread = null,
-            /// Auto-reset: its subscribers or its queue changed, or the
-            /// service is stopping.
+            /// Auto-reset: its subscribers changed, or the service is
+            /// stopping.
             event: win.HANDLE = null,
+        };
+
+        /// One widget's media commands, run in order on a thread of their
+        /// own (weaverd's MediaCommandExecutor). When the widget
+        /// unsubscribes, the thread finishes the command it is running,
+        /// drops the rest and exits; `reapLanes` joins it.
+        const CommandLane = struct {
+            service: *Self,
+            /// Under the service's lock; null once it unsubscribed.
+            subscriber: ?*Subscriber,
+            thread: std.Thread = undefined,
+            /// Auto-reset: a command arrived, or the lane is ending.
+            event: win.HANDLE,
+            done: std.atomic.Value(bool) = .init(false),
+            commands: [media_commands.queue_capacity]media_commands.Command = undefined,
+            head: usize = 0,
+            count: usize = 0,
         };
 
         /// A service with no subscribers and no threads. It must stay at
@@ -235,17 +270,26 @@ pub fn ServiceType(comptime Sources: type) type {
             return .{ .sources = sources };
         }
 
-        /// Stop every worker, which destroys its provider objects.
+        /// Stop every worker and command thread, which destroys their
+        /// provider objects.
         pub fn deinit(self: *Self) void {
             self.acquire();
             self.stopping = true;
             for (std.enums.values(Kind)) |kind| self.signal(kind);
+            for (self.lanes) |entry| if (entry) |lane| {
+                _ = win.SetEvent(lane.event);
+            };
             self.release();
             for (&self.workers) |*worker| {
                 if (worker.thread) |thread| thread.join();
                 if (worker.event) |event| _ = win.CloseHandle(event);
                 worker.* = .{};
             }
+            for (&self.lanes) |*entry| if (entry.*) |lane| {
+                lane.thread.join();
+                freeLane(lane);
+                entry.* = null;
+            };
         }
 
         /// Start delivering to `subscriber` what its `wants` name. Fails
@@ -273,8 +317,7 @@ pub fn ServiceType(comptime Sources: type) type {
             subscriber.media_sent = false;
             subscriber.failed = false;
             subscriber.rate = .{};
-            subscriber.command_head = 0;
-            subscriber.command_count = 0;
+            subscriber.lane = null;
             self.subscribers[index] = subscriber;
             for (std.enums.values(Kind)) |kind| {
                 if (subscriber.wants.needs(kind)) self.signal(kind);
@@ -289,13 +332,18 @@ pub fn ServiceType(comptime Sources: type) type {
             const index = self.indexOf(subscriber) orelse return;
             self.subscribers[index] = null;
             self.clearFailure(subscriber.owner);
+            if (laneOf(subscriber)) |lane| {
+                lane.subscriber = null;
+                _ = win.SetEvent(lane.event);
+                subscriber.lane = null;
+            }
             for (std.enums.values(Kind)) |kind| {
                 if (subscriber.wants.needs(kind)) self.signal(kind);
             }
         }
 
         /// A media command from `subscriber`. It is acknowledged later by
-        /// the command worker, or at once with `ok:false` when the widget
+        /// its command thread, or at once with `ok:false` when the widget
         /// lacks `media-transport` or is over its rate.
         pub fn submit(self: *Self, subscriber: *Subscriber, command: media_commands.Command) void {
             self.submitAt(subscriber, command, win.GetTickCount64());
@@ -306,16 +354,16 @@ pub fn ServiceType(comptime Sources: type) type {
             defer self.release();
             if (self.indexOf(subscriber) == null) return;
             if (subscriber.failed or !media_commands.authorize(subscriber.wants.media_transport, &subscriber.rate, now_ms)) {
-                return deliverAck(subscriber, command.id, false);
+                return self.deliverAck(subscriber, command.id, false);
             }
-            // The runtime keeps at most four commands pending a widget
-            // (media_pending.capacity), so only a broken client fills this
-            // lane; weaverd's lane failed the channel the same way.
-            if (subscriber.command_count == subscriber.commands.len) return self.failLocked(subscriber);
-            self.ensureWorker(.commands) catch return self.failLocked(subscriber);
-            subscriber.commands[(subscriber.command_head + subscriber.command_count) % subscriber.commands.len] = command;
-            subscriber.command_count += 1;
-            self.signal(.commands);
+            const lane = self.ensureLane(subscriber) catch return self.failLocked(subscriber);
+            // Five accepted a second, each done within 2.5 s: a lane of
+            // eight (weaverd's) fills only when the media session hangs,
+            // and then failed the channel in weaverd too.
+            if (lane.count == lane.commands.len) return self.failLocked(subscriber);
+            lane.commands[(lane.head + lane.count) % lane.commands.len] = command;
+            lane.count += 1;
+            _ = win.SetEvent(lane.event);
         }
 
         /// Fail `subscriber`'s channel: a dev widget's pipe broke, or its
@@ -351,6 +399,82 @@ pub fn ServiceType(comptime Sources: type) type {
             win.ReleaseSRWLockExclusive(&self.lock);
         }
 
+        fn laneOf(subscriber: *const Subscriber) ?*CommandLane {
+            return @ptrCast(@alignCast(subscriber.lane orelse return null));
+        }
+
+        /// `subscriber`'s command thread, started if it has none.
+        fn ensureLane(self: *Self, subscriber: *Subscriber) !*CommandLane {
+            if (laneOf(subscriber)) |lane| return lane;
+            self.reapLanes();
+            const index = for (self.lanes, 0..) |entry, index| {
+                if (entry == null) break index;
+            } else {
+                std.log.warn("media command thread refused: max_command_lanes={d}, asked for {d}", .{ max_command_lanes, max_command_lanes + 1 });
+                return error.CommandLanesFull;
+            };
+            const lane = try std.heap.page_allocator.create(CommandLane);
+            errdefer std.heap.page_allocator.destroy(lane);
+            const event = win.CreateEventW(null, 0, 0, null) orelse return error.ProviderWorkerUnavailable;
+            errdefer _ = win.CloseHandle(event);
+            lane.* = .{ .service = self, .subscriber = subscriber, .event = event };
+            lane.thread = std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, laneMain, .{lane}) catch return error.ProviderWorkerUnavailable;
+            self.lanes[index] = lane;
+            subscriber.lane = lane;
+            return lane;
+        }
+
+        /// Join the command threads that have exited. They exit only once
+        /// their widget unsubscribed, so this never waits on a command.
+        fn reapLanes(self: *Self) void {
+            for (&self.lanes) |*entry| {
+                const lane = entry.* orelse continue;
+                if (!lane.done.load(.acquire)) continue;
+                lane.thread.join();
+                freeLane(lane);
+                entry.* = null;
+            }
+        }
+
+        fn freeLane(lane: *CommandLane) void {
+            _ = win.CloseHandle(lane.event);
+            std.heap.page_allocator.destroy(lane);
+        }
+
+        fn laneMain(lane: *CommandLane) void {
+            const self = lane.service;
+            self.sources.threadStart(.commands);
+            while (true) {
+                self.acquire();
+                if (self.stopping or lane.subscriber == null) {
+                    self.release();
+                    break;
+                }
+                const command: ?media_commands.Command = if (lane.count == 0) null else command: {
+                    const next = lane.commands[lane.head];
+                    lane.head = (lane.head + 1) % lane.commands.len;
+                    lane.count -= 1;
+                    break :command next;
+                };
+                self.release();
+                const value = command orelse {
+                    _ = win.WaitForSingleObject(lane.event, win.INFINITE);
+                    continue;
+                };
+                const outcome = self.sources.command(value);
+                self.acquire();
+                // Its widget may have gone while the command ran.
+                if (lane.subscriber) |subscriber| if (!subscriber.failed) switch (outcome) {
+                    .accepted => self.deliverAck(subscriber, value.id, true),
+                    .declined => self.deliverAck(subscriber, value.id, false),
+                    .channel_failure => self.failLocked(subscriber),
+                };
+                self.release();
+            }
+            self.sources.threadStop(.commands);
+            lane.done.store(true, .release);
+        }
+
         fn indexOf(self: *const Self, subscriber: *const Subscriber) ?usize {
             for (self.subscribers, 0..) |existing, index| {
                 if (existing == subscriber) return index;
@@ -373,7 +497,8 @@ pub fn ServiceType(comptime Sources: type) type {
                 .system => std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, systemMain, .{self}),
                 .audio => std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, audioMain, .{self}),
                 .media => std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, mediaMain, .{self}),
-                .commands => std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, commandsMain, .{self}),
+                // Commands run on their widget's lane (`ensureLane`).
+                .commands => unreachable,
             } catch return error.ProviderWorkerUnavailable;
         }
 
@@ -400,7 +525,7 @@ pub fn ServiceType(comptime Sources: type) type {
         fn failLocked(self: *Self, subscriber: *Subscriber) void {
             if (subscriber.failed) return;
             subscriber.failed = true;
-            subscriber.command_count = 0;
+            if (laneOf(subscriber)) |lane| lane.count = 0;
             switch (subscriber.owner) {
                 .hosted => self.failures.hosted |= subscriber.owner.bit(),
                 .dev => self.failures.dev |= subscriber.owner.bit(),
@@ -463,55 +588,11 @@ pub fn ServiceType(comptime Sources: type) type {
             self.sources.setMediaActive(false, win.GetTickCount64());
         }
 
-        const Job = struct {
-            subscriber: *Subscriber,
-            subscription: u64,
-            command: media_commands.Command,
-        };
-
-        fn commandsMain(self: *Self) void {
-            self.sources.threadStart(.commands);
-            defer self.sources.threadStop(.commands);
-            while (true) {
-                const next = self.takeCommand() orelse return;
-                const job = next orelse {
-                    self.wait(.commands, null);
-                    continue;
-                };
-                self.finishCommand(job, self.sources.command(job.command));
-            }
-        }
-
-        /// The next command, each widget in turn; null once stopping, and
-        /// an empty job when none waits.
-        fn takeCommand(self: *Self) ??Job {
-            self.acquire();
-            defer self.release();
-            if (self.stopping) return null;
-            for (0..max_subscribers) |offset| {
-                const index = (self.command_cursor + offset) % max_subscribers;
-                const subscriber = self.subscribers[index] orelse continue;
-                if (subscriber.failed or subscriber.command_count == 0) continue;
-                const command = subscriber.commands[subscriber.command_head];
-                subscriber.command_head = (subscriber.command_head + 1) % subscriber.commands.len;
-                subscriber.command_count -= 1;
-                self.command_cursor = (index + 1) % max_subscribers;
-                return @as(?Job, .{ .subscriber = subscriber, .subscription = subscriber.subscription, .command = command });
-            }
-            return @as(?Job, null);
-        }
-
-        fn finishCommand(self: *Self, job: Job, outcome: Outcome) void {
-            self.acquire();
-            defer self.release();
-            // It may have unsubscribed, and its memory gone to a new one,
-            // while the command ran.
-            if (self.indexOf(job.subscriber) == null or job.subscriber.subscription != job.subscription) return;
-            if (job.subscriber.failed) return;
-            switch (outcome) {
-                .accepted => deliverAck(job.subscriber, job.command.id, true),
-                .declined => deliverAck(job.subscriber, job.command.id, false),
-                .channel_failure => self.failLocked(job.subscriber),
+        fn deliverAck(self: *Self, subscriber: *Subscriber, id: u64, ok: bool) void {
+            switch (subscriber.store_ack(subscriber.context, id, ok)) {
+                .stored => subscriber.notify(subscriber.context, .ack),
+                .unknown => {},
+                .full => self.failLocked(subscriber),
             }
         }
 
@@ -575,9 +656,10 @@ fn deliverFrame(subscriber: *Subscriber, line: []const u8) void {
     subscriber.notify(subscriber.context, .frame);
 }
 
-fn deliverAck(subscriber: *Subscriber, id: u64, ok: bool) void {
-    if (!subscriber.queues.deliverAck(id, ok)) return;
-    subscriber.notify(subscriber.context, .ack);
+/// `Subscriber.store_ack` for a subscriber whose acknowledgements land in
+/// its `queues` (a widget's provider client), as they did from a pipe.
+pub fn storeQueuedAck(queues: *protocol.Queues, id: u64, ok: bool) AckStore {
+    return if (queues.deliverAck(id, ok)) .stored else .unknown;
 }
 
 extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, flags: u32) callconv(.winapi) i32;
@@ -755,6 +837,9 @@ const FakeSources = struct {
     audio_polls: std.atomic.Value(u64) = .init(0),
     commands_run: std.atomic.Value(u64) = .init(0),
     outcome: Outcome = .accepted,
+    /// A command with this id waits for `gate` before it returns.
+    blocked_id: u64 = 0,
+    gate: win.HANDLE = null,
     started: [kind_count]std.atomic.Value(bool) = @splat(.init(false)),
 
     pub fn prepare(_: *FakeSources, _: Kind) !void {}
@@ -782,7 +867,8 @@ const FakeSources = struct {
     pub fn mediaWaitMs(_: *FakeSources, _: u64) u64 {
         return media_max_wait_ms;
     }
-    pub fn command(self: *FakeSources, _: media_commands.Command) Outcome {
+    pub fn command(self: *FakeSources, value: media_commands.Command) Outcome {
+        if (value.id == self.blocked_id) _ = win.WaitForSingleObject(self.gate, 5000);
         _ = self.commands_run.fetchAdd(1, .acq_rel);
         return self.outcome;
     }
@@ -799,7 +885,12 @@ const Probe = struct {
     failed: std.atomic.Value(u32) = .init(0),
 
     fn init(self: *Probe, wants: Wants, owner: Owner) void {
-        self.subscriber = .{ .wants = wants, .owner = owner, .queues = &self.queues, .context = self, .notify = notify };
+        self.subscriber = .{ .wants = wants, .owner = owner, .queues = &self.queues, .context = self, .store_ack = storeAck, .notify = notify };
+    }
+
+    fn storeAck(context: *anyopaque, id: u64, ok: bool) AckStore {
+        const self: *Probe = @ptrCast(@alignCast(context));
+        return storeQueuedAck(&self.queues, id, ok);
     }
 
     fn notify(context: *anyopaque, delivery: Delivery) void {
@@ -950,6 +1041,79 @@ test "commands need media-transport and stay within five a second" {
     try std.testing.expectEqualDeep(protocol.Ack{ .id = 8, .ok = true }, player.queues.takeAck().?);
     service.unsubscribe(&reader.subscriber);
     service.unsubscribe(&player.subscriber);
+}
+
+test "one widget's slow command never delays another widget's" {
+    const gate = win.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
+    defer _ = win.CloseHandle(gate);
+    var service = TestService.init(.{ .blocked_id = 1000, .gate = gate });
+    defer service.deinit();
+    var slow: Probe = .{};
+    slow.init(.{ .media_transport = true }, .{ .hosted = 0 });
+    var quick: Probe = .{};
+    quick.init(.{ .media_transport = true }, .{ .dev = 1 });
+    try service.subscribe(&slow.subscriber);
+    try service.subscribe(&quick.subscriber);
+    try std.testing.expect(slow.queues.registerAck(1000));
+    service.submitAt(&slow.subscriber, play(1000), 1000);
+    try std.testing.expect(quick.queues.registerAck(2));
+    service.submitAt(&quick.subscriber, play(2), 1000);
+    try waitFor(&quick, struct {
+        fn acked(probe: *Probe) bool {
+            return probe.acks.load(.acquire) == 1;
+        }
+    }.acked);
+    try std.testing.expectEqual(@as(u32, 0), slow.acks.load(.acquire));
+    // The slow widget leaves mid-command: its answer is dropped, and its
+    // thread is reaped once the command returns.
+    service.unsubscribe(&slow.subscriber);
+    _ = win.SetEvent(gate);
+    try waitFor(&service, struct {
+        fn reapable(value: *TestService) bool {
+            for (value.lanes) |entry| if (entry) |lane| if (lane.done.load(.acquire)) return true;
+            return false;
+        }
+    }.reapable);
+    try std.testing.expectEqual(@as(u32, 0), slow.acks.load(.acquire));
+    service.acquire();
+    service.reapLanes();
+    var live: usize = 0;
+    for (service.lanes) |entry| live += @intFromBool(entry != null);
+    service.release();
+    try std.testing.expectEqual(@as(usize, 1), live);
+    service.unsubscribe(&quick.subscriber);
+}
+
+test "an acknowledgement with no room fails the channel; one nobody waits for is dropped" {
+    var service = TestService.init(.{});
+    defer service.deinit();
+    const Bounded = struct {
+        probe: Probe = .{},
+        answer: AckStore = .full,
+        fn storeAck(context: *anyopaque, _: u64, _: bool) AckStore {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.answer;
+        }
+    };
+    var bounded: Bounded = .{};
+    bounded.probe.init(.{ .media = true }, .{ .dev = 3 });
+    bounded.probe.subscriber.context = &bounded;
+    bounded.probe.subscriber.store_ack = Bounded.storeAck;
+    bounded.probe.subscriber.notify = struct {
+        fn notify(context: *anyopaque, delivery: Delivery) void {
+            const self: *Bounded = @ptrCast(@alignCast(context));
+            Probe.notify(&self.probe, delivery);
+        }
+    }.notify;
+    try service.subscribe(&bounded.probe.subscriber);
+    bounded.answer = .unknown;
+    service.submitAt(&bounded.probe.subscriber, play(1), 1000);
+    try std.testing.expectEqual(@as(u32, 0), bounded.probe.failed.load(.acquire));
+    bounded.answer = .full;
+    service.submitAt(&bounded.probe.subscriber, play(2), 1000);
+    try std.testing.expectEqual(@as(u32, 1), bounded.probe.failed.load(.acquire));
+    try std.testing.expectEqual(Failures{ .dev = 1 << 3 }, service.takeFailures());
+    service.unsubscribe(&bounded.probe.subscriber);
 }
 
 test "a declined command is acknowledged false" {

@@ -115,10 +115,21 @@ const DevWidget = struct {
     reader: ?std.Thread = null,
     writer: ?std.Thread = null,
     subscribed: bool = false,
-    /// What the host has for the widget: its frames, and acknowledgements
-    /// of the commands it sent, until the writer sends them.
+    /// The frames the host has for the widget, until the writer sends them.
     queues: protocol.Queues = .{},
+    /// Acknowledgements the writer has yet to send, under `ack_lock`.
+    acks: [max_pending_acks]protocol.Ack = undefined,
+    ack_head: usize = 0,
+    ack_count: usize = 0,
+    ack_lock: win.SRWLOCK = std.mem.zeroes(win.SRWLOCK),
     subscriber: provider_service.Subscriber = undefined,
+
+    /// Acknowledgements owed at once: the commands the host has accepted and
+    /// not yet run (a lane of media_commands.queue_capacity) and refusals
+    /// not yet written (weaverd's lane, media_commands.nack_capacity). The
+    /// widget's own four-pending limit does not bound this: a command it
+    /// gave up on after its 3 s deadline is still owed an answer.
+    const max_pending_acks = media_commands.queue_capacity + media_commands.nack_capacity;
 
     fn start(self: *DevWidget, owner: *DevWidgets, request: Launch) !void {
         const allocator = std.heap.page_allocator;
@@ -167,6 +178,7 @@ const DevWidget = struct {
             .owner = .{ .dev = request.id },
             .queues = &self.queues,
             .context = self,
+            .store_ack = storeAck,
             .notify = notify,
         };
         try self.service.subscribe(&self.subscriber);
@@ -205,14 +217,33 @@ const DevWidget = struct {
         self.shutdown_event = null;
     }
 
+    fn storeAck(context: *anyopaque, id: u64, ok: bool) provider_service.AckStore {
+        const self: *DevWidget = @ptrCast(@alignCast(context));
+        win.AcquireSRWLockExclusive(&self.ack_lock);
+        defer win.ReleaseSRWLockExclusive(&self.ack_lock);
+        if (self.ack_count == self.acks.len) return .full;
+        self.acks[(self.ack_head + self.ack_count) % self.acks.len] = .{ .id = id, .ok = ok };
+        self.ack_count += 1;
+        return .stored;
+    }
+
+    fn takeAck(self: *DevWidget) ?protocol.Ack {
+        win.AcquireSRWLockExclusive(&self.ack_lock);
+        defer win.ReleaseSRWLockExclusive(&self.ack_lock);
+        if (self.ack_count == 0) return null;
+        const ack = self.acks[self.ack_head];
+        self.ack_head = (self.ack_head + 1) % self.acks.len;
+        self.ack_count -= 1;
+        return ack;
+    }
+
     fn notify(context: *anyopaque, _: provider_service.Delivery) void {
         const self: *DevWidget = @ptrCast(@alignCast(context));
         _ = win.SetEvent(self.wake_event);
     }
 
     /// Commands from the widget, one line each. A line that is not a
-    /// command is dropped, as weaverd dropped it; a client past the
-    /// runtime's four pending commands fails its channel.
+    /// command is dropped, as weaverd dropped it.
     fn readerMain(self: *DevWidget) void {
         widget_log.detachThread();
         const event = win.CreateEventW(null, 1, 0, null) orelse return self.service.fail(&self.subscriber);
@@ -230,10 +261,6 @@ const DevWidget = struct {
 
     fn command(self: *DevWidget, line: []const u8) void {
         const value = media_commands.parse(line) catch return;
-        // The runtime holds at most four commands pending and never
-        // repeats an id (media_pending.zig): this ack slot is free unless
-        // the client broke that.
-        if (!self.queues.registerAck(value.id)) return self.service.fail(&self.subscriber);
         self.service.submit(&self.subscriber, value);
     }
 
@@ -272,10 +299,7 @@ const DevWidget = struct {
             const handles = [_]win.HANDLE{ self.wake_event, self.shutdown_event };
             if (win.WaitForMultipleObjects(handles.len, &handles, 0, win.INFINITE) != win.WAIT_OBJECT_0) return;
             if (self.stopping.load(.acquire)) return;
-            while (self.queues.takeAck()) |ack| {
-                // Free its slot before the widget can read it and send its
-                // next command.
-                self.queues.unregisterAck(ack.id);
+            while (self.takeAck()) |ack| {
                 var buffer: [64]u8 = undefined;
                 const line = media_commands.formatAck(ack.id, ack.ok, &buffer) catch unreachable;
                 if (!writePipe(self.pipe, event, line)) return self.service.fail(&self.subscriber);

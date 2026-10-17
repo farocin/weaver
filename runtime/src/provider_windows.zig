@@ -62,6 +62,7 @@ pub const Client = struct {
             .owner = .{ .hosted = slot },
             .queues = &self.queues,
             .context = self,
+            .store_ack = storeLocalAck,
             .notify = notifyLocal,
         };
         self.connected.store(1, .release);
@@ -69,6 +70,11 @@ pub const Client = struct {
         errdefer self.connected.store(0, .release);
         try service.subscribe(&self.subscriber);
         self.local = service;
+    }
+
+    fn storeLocalAck(context: *anyopaque, id: u64, ok: bool) provider_service.AckStore {
+        const self: *Client = @ptrCast(@alignCast(context));
+        return provider_service.storeQueuedAck(&self.queues, id, ok);
     }
 
     /// As from a pipe: frames wait for the widget's provider timer, and an

@@ -320,6 +320,8 @@ const Host = struct {
     provider_report: ProviderReport = .{},
     /// Earlier hosts' last counters.
     provider_totals: ProviderReport.Counters = .{},
+    /// A member used the providers at the last refresh.
+    provider_members_last: bool = false,
     thread_sample_ms: u64 = 0,
     slot_threads: [max_widgets]u32 = [_]u32{0} ** max_widgets,
     renderer_threads: u32 = 0,
@@ -872,6 +874,11 @@ const Host = struct {
     /// decides the state of a slot it is stopping.
     fn stopSharedHost(self: *Host, graceful: bool) void {
         const process = self.shared.process.process orelse return;
+        if (graceful and (self.provider_members_last or self.hasProviderMember())) {
+            // Its last counters, before they go with it.
+            var scratch: [2 * max_answer_bytes]u8 = undefined;
+            _ = self.queryProviders(&scratch);
+        }
         self.closeControl();
         if (!graceful or c.WaitForSingleObject(process, 1500) != c.WAIT_OBJECT_0) _ = c.TerminateProcess(process, 0);
         _ = c.WaitForSingleObject(process, 1000);
@@ -1092,20 +1099,49 @@ const Host = struct {
 
     /// Ask the host for its providers' counters, and for the widgets whose
     /// provider channel failed since the last ask: those restart on their
-    /// crash budget, as when weaverd ran the providers.
+    /// crash budget, as when weaverd ran the providers. It asks while a
+    /// member uses the providers, and once more after the last one goes, so
+    /// status shows them idle.
     fn refreshProviders(self: *Host, now_ms: u64) void {
-        if (self.shared.process.process == null or !self.hasProviderMember()) return;
+        const wanted = self.hasProviderMember();
+        const asked = wanted or self.provider_members_last;
+        self.provider_members_last = wanted;
+        if (!asked) return;
+        var scratch: [2 * max_answer_bytes]u8 = undefined;
+        const wire = self.queryProviders(&scratch) orelse return;
+        for (wire.failed.hosted) |host_slot| {
+            const slot = self.slotInHost(host_slot) orelse continue;
+            self.restartAfterMediaChannelFailure(slot, now_ms);
+        }
+        for (wire.failed.dev) |id| {
+            if (id >= max_widgets) continue;
+            const slot = &self.slots[id];
+            const process = slot.platform.process orelse continue;
+            // A dev widget that exited broke its pipe: that is its crash.
+            if (c.WaitForSingleObject(process, 0) == c.WAIT_OBJECT_0) {
+                self.handleExit(slot, now_ms);
+            } else {
+                self.restartAfterMediaChannelFailure(slot, now_ms);
+            }
+        }
+    }
+
+    /// The host's `providers` answer, its counters taken into
+    /// `provider_report`; null when the host is not running or did not
+    /// answer. The answer's lists live in `scratch`.
+    fn queryProviders(self: *Host, scratch: []u8) ?ProviderReport.Wire {
+        if (self.shared.process.process == null) return null;
         const answer = self.controlRequest("{\"providers\":{}}\n", control_answer_timeout_ms) catch |err| {
             if (err == error.HostTimedOut) {
                 std.log.warn("shared widget host did not answer within {d} ms for its providers; stopping it", .{control_answer_timeout_ms});
                 _ = c.TerminateProcess(self.shared.process.process.?, 1);
             }
-            return;
+            return null;
         };
-        var scratch: [2 * max_answer_bytes]u8 = undefined;
-        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        var fixed = std.heap.FixedBufferAllocator.init(scratch);
         const wire = std.json.parseFromSliceLeaky(ProviderReport.Wire, fixed.allocator(), answer.text(), .{ .ignore_unknown_fields = true }) catch |err| {
-            return std.log.warn("shared widget host's providers answer is invalid: {s}", .{@errorName(err)});
+            std.log.warn("shared widget host's providers answer is invalid: {s}", .{@errorName(err)});
+            return null;
         };
         const value = wire.providers;
         self.provider_report.counters = .{
@@ -1122,21 +1158,7 @@ const Host = struct {
         const label_len = @min(value.audioAvailability.len, self.provider_report.audio_availability_buffer.len);
         @memcpy(self.provider_report.audio_availability_buffer[0..label_len], value.audioAvailability[0..label_len]);
         self.provider_report.audio_availability_len = label_len;
-        for (wire.failed.hosted) |host_slot| {
-            const slot = self.slotInHost(host_slot) orelse continue;
-            self.restartAfterMediaChannelFailure(slot, now_ms);
-        }
-        for (wire.failed.dev) |id| {
-            if (id >= max_widgets) continue;
-            const slot = &self.slots[id];
-            const process = slot.platform.process orelse continue;
-            // A dev widget that exited broke its pipe: that is its crash.
-            if (c.WaitForSingleObject(process, 0) == c.WAIT_OBJECT_0) {
-                self.handleExit(slot, now_ms);
-            } else {
-                self.restartAfterMediaChannelFailure(slot, now_ms);
-            }
-        }
+        return wire;
     }
 
     fn writeStatus(self: *Host, now_ms: u64) void {
