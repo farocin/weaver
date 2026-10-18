@@ -338,8 +338,15 @@ fn up(paths: Paths, own_realms: bool) !Exit {
     lock.release();
     locked = false;
     const deadline = win.GetTickCount64() + up_wait_ms;
+    const child_pid = win.GetProcessId(process);
     while (win.GetTickCount64() < deadline) {
-        if (hostRunning() and objectExists(.event, contract.status_written_event)) return .ok;
+        // The host that comes up is this one's only if its record names
+        // this child: a restart Windows had pending can take the lock
+        // first and come up instead, in the mode it was started with. This
+        // child then exits as already running, which the CLI reports.
+        if (hostRunning() and objectExists(.event, contract.status_written_event)) {
+            if (crash_record.read(paths.record)) |record| if (record.pid == child_pid) return .ok;
+        }
         if (win.WaitForSingleObject(process, poll_ms) == win.WAIT_OBJECT_0) {
             var code: win.DWORD = 0;
             _ = win.GetExitCodeProcess(process, &code);
