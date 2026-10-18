@@ -455,6 +455,14 @@ pub const Engine = struct {
         if (self.crash_slot) |slot| crash_record.beginTurn(slot, self.crash_bundle);
         // Teardown runs its code, so in a shared realm with its globals.
         const entered = self.enterRealm();
+        // ...and under a turn's budget: a storage flush or a settled
+        // callback that loops is interrupted like a turn, instead of holding
+        // the host's UI thread (and every other widget) until its watchdog.
+        const outer_engine = executing_engine;
+        const outer_executing = self.executing;
+        self.deadline_ms = platform.monotonicMilliseconds() + turn_budget_ms;
+        self.executing = true;
+        executing_engine = self;
         self.flushStorage();
         // Settling the bridge's outstanding callbacks can reject promises,
         // so its teardown comes before the rejections are released.
@@ -467,6 +475,8 @@ pub const Engine = struct {
         // Teardown ran widget code outside a turn; the shared exception slot
         // must not keep this realm alive.
         self.drainExceptions();
+        self.executing = outer_executing;
+        executing_engine = outer_engine;
         if (self.globals) |*pair| {
             // Its queued jobs hold its objects; in a shared realm they would
             // otherwise wait forever in the one queue.
@@ -2070,6 +2080,23 @@ test "an endless microtask chain stops at its own widget's budget" {
     try bystander.evaluate("globalThis.ran = true;", "bystander.js");
     try std.testing.expect(platform.monotonicMilliseconds() - before_bystander < turn_budget_ms);
     try std.testing.expect(c.JS_IsContextJobPending(spinner.context));
+}
+
+test "a widget that loops while it unloads stops at its budget" {
+    var widgets: TestWidgets = .{};
+    try widgets.init();
+    defer widgets.deinit();
+    const looper = try widgets.engine(0);
+    looper.bridge_state.emit_error_logs = false;
+    // Teardown calls the storage flush hook.
+    try looper.evaluate("globalThis.__weaverFlushStorage = () => { for (;;) {} };", "loop.js");
+    const started = platform.monotonicMilliseconds();
+    looper.destroy(std.testing.allocator);
+    try std.testing.expect(platform.monotonicMilliseconds() - started < 4 * turn_budget_ms);
+    // A neighbour runs afterwards as usual.
+    const bystander = try widgets.engine(1);
+    defer bystander.destroy(std.testing.allocator);
+    try bystander.evaluate("globalThis.ran = true;", "bystander.js");
 }
 
 test "freed small blocks give their capacity back to the widget" {
