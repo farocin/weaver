@@ -56,8 +56,12 @@ test("dev watcher normalizes atomic saves and ignores Weaver output", async () =
     assert.equal(events.some(([, path]) => path === outputPath), false);
     assert.equal(events.some(([, path]) => path === gitPath), false);
     assert.equal(events.some(([, path]) => path === portPath), false);
-    assert.equal(events.some(([event, path]) => (event === "add" || event === "unlink") && path === sourcePath), false);
-    assert.equal(events.filter(([, path]) => path === sourcePath).length, 1);
+    // The atomic save reads as a change, never as the file going away and
+    // coming back. macOS's file events sometimes report that one rename as
+    // two changes; `weaver dev` coalesces them into one rebuild.
+    const sourceEvents = events.filter(([, path]) => path === sourcePath);
+    assert.ok(sourceEvents.length >= 1);
+    assert.ok(sourceEvents.every(([event]) => event === "change"), JSON.stringify(sourceEvents));
   } finally {
     await watcher.close();
     await rm(directory, { recursive: true, force: true });
