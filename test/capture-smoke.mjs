@@ -13,7 +13,7 @@ const fixedClock = "2026-08-24T17:30:00.000Z";
 
 try {
   const clock = capture("clock", "examples/clock");
-  assert.deepEqual([clock.output.widthPx, clock.output.heightPx], [320, 132]);
+  assert.deepEqual([clock.output.widthPx, clock.output.heightPx], [360, 132]);
 
   const resizedClock = capture("clock-resized", "examples/clock", [
     "--action-file", join(root, "test", "capture", "resize.actions"),

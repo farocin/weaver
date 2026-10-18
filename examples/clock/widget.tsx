@@ -51,7 +51,7 @@ function drawDial(ctx: CanvasCtx, time: TimeData): void {
 
 export default widget({
   name: "Clock",
-  size: [320, 132],
+  size: [360, 132],
   anchor: { corner: "top-right", offset: [24, 24] },
   subscribe: ["time"],
 }, () => {
