@@ -17,6 +17,7 @@ const host_control = @import("host_control.zig");
 const protocol = @import("provider_protocol.zig");
 const provider_service = @import("provider_service.zig");
 const widget_log = @import("widget_log.zig");
+const js_engine = @import("js_engine.zig");
 
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -336,7 +337,9 @@ const DevWidget = struct {
     }
 };
 
-/// `"<this executable>" --dev "<dir>"`, as weaverd launched dev widgets.
+/// `"<this executable>" [--own-realms] --dev "<dir>"`, as weaverd launched
+/// dev widgets: in the host's realm mode, so a dev widget behaves as it
+/// will once installed.
 fn commandLine(allocator: std.mem.Allocator, dir: []const u8) ![:0]u16 {
     // Windows' longest path, on the heap: a thread's stack stays as deep as
     // it ever went.
@@ -346,7 +349,8 @@ fn commandLine(allocator: std.mem.Allocator, dir: []const u8) ![:0]u16 {
     if (length == 0 or length == exe_w.len) return error.ExecutablePathFailed;
     const exe = try std.unicode.utf16LeToUtf8Alloc(allocator, exe_w[0..length]);
     defer allocator.free(exe);
-    const line = try std.fmt.allocPrint(allocator, "\"{s}\" --dev \"{s}\"", .{ exe, dir });
+    const own_realms = if (js_engine.shared_realm_enabled) "" else " --own-realms";
+    const line = try std.fmt.allocPrint(allocator, "\"{s}\"{s} --dev \"{s}\"", .{ exe, own_realms, dir });
     defer allocator.free(line);
     return std.unicode.utf8ToUtf16LeAllocZ(allocator, line);
 }

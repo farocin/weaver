@@ -294,9 +294,11 @@ fn openLive(record: contract.Record, access: win.DWORD) ?win.HANDLE {
 
 // ---- The verbs ------------------------------------------------------------
 
-pub fn run(verb: Verb, io: std.Io, allocator: std.mem.Allocator, paths: Paths) Exit {
+/// `own_realms`: the client was given `--own-realms`, so a host `--up`
+/// starts gives each widget a realm of its own.
+pub fn run(verb: Verb, io: std.Io, allocator: std.mem.Allocator, paths: Paths, own_realms: bool) Exit {
     return switch (verb) {
-        .up => up(paths),
+        .up => up(paths, own_realms),
         .down => down(paths),
         .status => status(io, allocator, paths),
         .reload => reload(paths),
@@ -317,7 +319,7 @@ fn probe() !Exit {
 
 /// The host it starts inherits this process's environment, so `paths` are
 /// the host's too.
-fn up(paths: Paths) !Exit {
+fn up(paths: Paths, own_realms: bool) !Exit {
     const lock = Lock.acquire(client_lock_wait_ms) catch return .busy;
     var locked = true;
     defer if (locked) lock.release();
@@ -330,14 +332,21 @@ fn up(paths: Paths) !Exit {
         while (hostRunning() and win.GetTickCount64() < deadline) win.Sleep(poll_ms);
         if (hostRunning()) return fail("the widget host is shutting down and did not exit within {d} ms; run 'weaver down', then 'weaver up'", .{down_grace_ms + terminate_wait_ms});
     }
-    const process = try startHost();
+    const process = try startHost(own_realms);
     defer _ = win.CloseHandle(process);
     // The host takes the lock itself before it publishes control.
     lock.release();
     locked = false;
     const deadline = win.GetTickCount64() + up_wait_ms;
+    const child_pid = win.GetProcessId(process);
     while (win.GetTickCount64() < deadline) {
-        if (hostRunning() and objectExists(.event, contract.status_written_event)) return .ok;
+        // The host that comes up is this one's only if its record names
+        // this child: a restart Windows had pending can take the lock
+        // first and come up instead, in the mode it was started with. This
+        // child then exits as already running, which the CLI reports.
+        if (hostRunning() and objectExists(.event, contract.status_written_event)) {
+            if (crash_record.read(paths.record)) |record| if (record.pid == child_pid) return .ok;
+        }
         if (win.WaitForSingleObject(process, poll_ms) == win.WAIT_OBJECT_0) {
             var code: win.DWORD = 0;
             _ = win.GetExitCodeProcess(process, &code);
@@ -364,15 +373,17 @@ fn sharingWords(win32_error: u32) []const u8 {
     return if (win32_error == win.ERROR_SHARING_VIOLATION) ": another program holds it open" else "";
 }
 
-/// `"<this executable>" --host`, with this process's environment.
-fn startHost() !win.HANDLE {
+/// `"<this executable>" [--own-realms] --host`, with this process's
+/// environment.
+fn startHost(own_realms: bool) !win.HANDLE {
     var exe: [32768:0]u16 = undefined;
     const length = win.GetModuleFileNameW(null, &exe, exe.len);
     if (length == 0 or length >= exe.len) return error.ExecutablePathFailed;
     exe[length] = 0;
     var line: [32768 + 16:0]u16 = undefined;
     var at: usize = 0;
-    for ([_][]const u16{ std.unicode.utf8ToUtf16LeStringLiteral("\""), exe[0..length], std.unicode.utf8ToUtf16LeStringLiteral("\" --host") }) |part| {
+    const flags = if (own_realms) std.unicode.utf8ToUtf16LeStringLiteral("\" --own-realms --host") else std.unicode.utf8ToUtf16LeStringLiteral("\" --host");
+    for ([_][]const u16{ std.unicode.utf8ToUtf16LeStringLiteral("\""), exe[0..length], flags }) |part| {
         @memcpy(line[at .. at + part.len], part);
         at += part.len;
     }
@@ -605,10 +616,10 @@ const e_invalidarg: u32 = 0x8007_0057;
 /// Ask Windows to restart this host after a crash, with the profile it runs
 /// against (`contract.local_app_data_flag`) and `generation`, the one this
 /// start's record holds; unless the cap says not to (`plan.register`).
-pub fn registerRestart(plan: contract.RestartPlan, generation: u64, local_app_data: []const u8) Registration {
+pub fn registerRestart(plan: contract.RestartPlan, generation: u64, local_app_data: []const u8, own_realms: bool) Registration {
     if (!plan.register) return .{ .request = .capped };
     var line: RestartLine = undefined;
-    const length = restartLine(&line, generation, local_app_data) catch return .{ .request = .failed, .hresult = e_invalidarg };
+    const length = restartLine(&line, generation, local_app_data, own_realms) catch return .{ .request = .failed, .hresult = e_invalidarg };
     if (length >= line.len) return .{ .request = .failed, .hresult = e_invalidarg, .line_len = length };
     const result = RegisterApplicationRestart(&line, contract.restart_flags);
     if (result == 0) return .{ .request = .registered, .line_len = length };
@@ -618,13 +629,14 @@ pub fn registerRestart(plan: contract.RestartPlan, generation: u64, local_app_da
 const RestartLine = [contract.restart_max_command_line:0]u16;
 
 /// The restart command line in `line`, and its length in UTF-16 units. A
-/// length of `line.len` or more did not fit, and left `line` unwritten.
-fn restartLine(line: *RestartLine, generation: u64, local_app_data: []const u8) !u32 {
+/// length of `line.len` or more did not fit, and left `line` unwritten. A
+/// host running with `--own-realms` comes back with it.
+fn restartLine(line: *RestartLine, generation: u64, local_app_data: []const u8, own_realms: bool) !u32 {
     // A trailing backslash would escape the closing quote. The path is not
     // escaped otherwise: Windows refuses `"` in file and directory names.
     const profile = std.mem.trimEnd(u8, local_app_data, "\\");
     var head_buffer: [64]u8 = undefined;
-    const head = std.fmt.bufPrint(&head_buffer, "--host {s} {d} {s} \"", .{ contract.restart_of_flag, generation, contract.local_app_data_flag }) catch unreachable;
+    const head = std.fmt.bufPrint(&head_buffer, "{s}--host {s} {d} {s} \"", .{ if (own_realms) "--own-realms " else "", contract.restart_of_flag, generation, contract.local_app_data_flag }) catch unreachable;
     const length: u32 = @intCast(head.len + try std.unicode.calcUtf16LeLen(profile) + 1);
     if (length >= line.len) return length;
     var at = std.unicode.utf8ToUtf16Le(line, head) catch unreachable;
@@ -635,14 +647,17 @@ fn restartLine(line: *RestartLine, generation: u64, local_app_data: []const u8) 
 }
 
 /// What status's host row says about how this host runs, empty when there
-/// is nothing to say: the crash Windows restarted it from and which restart
-/// that is against the cap, and that Windows refused its restart request.
-/// The last means a crash would leave Weaver down, so it also prints on
-/// `weaver up` (cli/src/index.ts).
-pub fn hostNote(allocator: std.mem.Allocator, previous: ?contract.Record, restarted: bool, plan: contract.RestartPlan, registration: Registration) ![]const u8 {
+/// is nothing to say: that its widgets have realms of their own, the crash
+/// Windows restarted it from and which restart that is against the cap,
+/// and that Windows refused its restart request. The last means a crash
+/// would leave Weaver down, so it also prints on `weaver up`
+/// (cli/src/index.ts).
+pub fn hostNote(allocator: std.mem.Allocator, previous: ?contract.Record, restarted: bool, plan: contract.RestartPlan, registration: Registration, own_realms: bool) ![]const u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     const writer = &output.writer;
+    if (own_realms) try writer.writeAll("each widget has a realm of its own (--own-realms), not the shared frozen one");
     if (restarted) {
+        if (output.written().len > 0) try writer.writeAll("; ");
         const crash = if (previous) |record| record.crash else contract.Crash{};
         if (crash.kind == .none) {
             try writer.writeAll("restarted by Windows after the last host ended without recording a crash");
@@ -805,10 +820,10 @@ test "the host note names a restart request Windows refused" {
     const allocator = std.testing.allocator;
     const plan: contract.RestartPlan = .{};
     // Nothing to say about a fresh host Windows accepted.
-    const quiet = try hostNote(allocator, null, false, plan, .{ .request = .registered, .line_len = 60 });
+    const quiet = try hostNote(allocator, null, false, plan, .{ .request = .registered, .line_len = 60 }, false);
     defer allocator.free(quiet);
     try std.testing.expectEqualStrings("", quiet);
-    const long = try hostNote(allocator, null, false, plan, .{ .request = .failed, .hresult = e_invalidarg, .line_len = 1028 });
+    const long = try hostNote(allocator, null, false, plan, .{ .request = .failed, .hresult = e_invalidarg, .line_len = 1028 }, false);
     defer allocator.free(long);
     try std.testing.expect(std.mem.indexOf(u8, long, "is 1028 UTF-16 units, past RegisterApplicationRestart's limit of 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, long, "at least 5 characters shorter") != null);
@@ -816,7 +831,7 @@ test "the host note names a restart request Windows refused" {
 
 test "the restart command line counts UTF-16 units, and the shortening status asks for fits" {
     var line: RestartLine = undefined;
-    const short = try restartLine(&line, 7, "C:\\Users\\Zoë\\AppData\\Local\\");
+    const short = try restartLine(&line, 7, "C:\\Users\\Zoë\\AppData\\Local\\", false);
     const expected = std.unicode.utf8ToUtf16LeStringLiteral("--host --restart-of 7 --localappdata \"C:\\Users\\Zoë\\AppData\\Local\"");
     try std.testing.expectEqualSlices(u16, expected, line[0..short]);
     try std.testing.expectEqual(@as(u16, 0), line[short]);
@@ -828,12 +843,23 @@ test "the restart command line counts UTF-16 units, and the shortening status as
     defer allocator.free(long_profile);
     @memset(long_profile, 'a');
     @memcpy(long_profile[0..4], "😀");
-    const long = try restartLine(&line, 7, long_profile);
+    const long = try restartLine(&line, 7, long_profile, false);
     try std.testing.expectEqual(@as(u32, 1028), long);
     // hostNote's advice: this many characters shorter.
     const shorter = long - contract.restart_max_command_line + 1;
-    try std.testing.expect(try restartLine(&line, 7, long_profile[0 .. long_profile.len - shorter]) < line.len);
-    try std.testing.expect(try restartLine(&line, 7, long_profile[0 .. long_profile.len - shorter + 1]) >= line.len);
+    try std.testing.expect(try restartLine(&line, 7, long_profile[0 .. long_profile.len - shorter], false) < line.len);
+    try std.testing.expect(try restartLine(&line, 7, long_profile[0 .. long_profile.len - shorter + 1], false) >= line.len);
+}
+
+test "a host with realms of its own comes back with them, and says so" {
+    var line: RestartLine = undefined;
+    const length = try restartLine(&line, 7, "C:\\lad", true);
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("--own-realms --host --restart-of 7 --localappdata \"C:\\lad\"");
+    try std.testing.expectEqualSlices(u16, expected, line[0..length]);
+    const allocator = std.testing.allocator;
+    const own = try hostNote(allocator, null, false, .{}, .{ .request = .registered, .line_len = length }, true);
+    defer allocator.free(own);
+    try std.testing.expectEqualStrings("each widget has a realm of its own (--own-realms), not the shared frozen one", own);
 }
 
 test "a full host.log moves to host.log.old, and stays whole while the archive cannot be written" {

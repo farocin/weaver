@@ -203,10 +203,10 @@ async function main(argv: string[]): Promise<void> {
     if (!argument) throw new WeaverFailure([captureUsage()]);
     return captureWidget(resolve(argument), parseCaptureOptions(rest));
   }
-  if (!command || rest.length > 0 || (directoryCommands.includes(command) && !argument) || (noArgumentCommands.includes(command) && argument) || (command === "install" && !argument) || (command === "uninstall" && !argument) || (command === "status" && argument !== undefined && argument !== "--json") || ![...directoryCommands, ...noArgumentCommands, "install", "uninstall", "status"].includes(command)) {
-    throw new WeaverFailure(["Usage: weaver <init|check|bundle|dev|pack> <name-or-directory> | capture <directory> --out <file.png> [--clock <ISO-8601>] [--action-file <file>] [--provider-fixture <file>] [--session-journal <file>] | inspect <file.weave> | install <directory-or-file.weave> | uninstall <name> | up | down | status [--json] | logs <name> [--follow] | audio authorize"]);
+  if (!command || rest.length > 0 || (directoryCommands.includes(command) && !argument) || (noArgumentCommands.includes(command) && argument && !(command === "up" && argument === "--own-realms")) || (command === "install" && !argument) || (command === "uninstall" && !argument) || (command === "status" && argument !== undefined && argument !== "--json") || ![...directoryCommands, ...noArgumentCommands, "install", "uninstall", "status"].includes(command)) {
+    throw new WeaverFailure(["Usage: weaver <init|check|bundle|dev|pack> <name-or-directory> | capture <directory> --out <file.png> [--clock <ISO-8601>] [--action-file <file>] [--provider-fixture <file>] [--session-journal <file>] | inspect <file.weave> | install <directory-or-file.weave> | uninstall <name> | up [--own-realms] | down | status [--json] | logs <name> [--follow] | audio authorize"]);
   }
-  if (command === "up") return upHost(true);
+  if (command === "up") return upHost(true, argument === "--own-realms");
   if (command === "down") return downHost();
   if (command === "status") return showStatus(argument === "--json");
   if (command === "uninstall") return uninstallWidget(argument!);
@@ -1964,11 +1964,17 @@ function firstFailureLine(error: unknown): string {
   return (details[0] ?? "unknown rebuild failure").split(/\r?\n/, 1)[0];
 }
 
-async function upHost(announce: boolean): Promise<void> {
+/**
+ * `ownRealms` (`weaver up --own-realms`): the host it starts gives each widget
+ * a realm of its own instead of the shared frozen one, and keeps that mode
+ * across a Windows crash restart. A running host keeps the mode it started
+ * with.
+ */
+async function upHost(announce: boolean, ownRealms = false): Promise<void> {
   assertHostLifecycleAvailable("up");
   assertHostBuilt();
   if (process.platform === "win32") {
-    const result = hostClient("--up");
+    const result = hostClient("--up", ownRealms);
     if (result.status === HostClientExit.ok) {
       if (announce) process.stdout.write("widget host started\n");
       warnHostNote();
@@ -1976,11 +1982,13 @@ async function upHost(announce: boolean): Promise<void> {
     }
     if (result.status === HostClientExit.alreadyRunning) {
       if (announce) process.stdout.write("widget host is already running\n");
+      if (ownRealms) process.stderr.write('weaver warning: --own-realms takes effect when a host starts; the running one keeps its mode. Run "weaver down", then "weaver up --own-realms".\n');
       return;
     }
     if (result.status === HostClientExit.timedOut) throw new WeaverFailure(["The widget host did not become reload-ready within 5 seconds.", 'Run "weaver status" to see what its record says.']);
     throw hostClientFailure("up", result);
   }
+  if (ownRealms) throw new WeaverFailure(["weaver up --own-realms applies to the Windows widget host; on this platform weaverd starts each widget's process itself."]);
   if (hostRunning()) {
     assertHostReloadReady();
     if (announce) process.stdout.write("weaverd is already running\n");
@@ -2123,8 +2131,8 @@ const HostClientExit = { ok: 0, failed: 1, alreadyRunning: 2, notRunning: 3, rel
 
 interface HostClientResult { status: number; stdout: string; stderr: string }
 
-function hostClient(verb: "--up" | "--down" | "--status" | "--reload" | "--probe"): HostClientResult {
-  const result = spawnSync(hostExecutable, [verb], { cwd: repoRoot, encoding: "utf8", windowsHide: true, env: hostEnvironment() });
+function hostClient(verb: "--up" | "--down" | "--status" | "--reload" | "--probe", ownRealms = false): HostClientResult {
+  const result = spawnSync(hostExecutable, ownRealms ? ["--own-realms", verb] : [verb], { cwd: repoRoot, encoding: "utf8", windowsHide: true, env: hostEnvironment() });
   if (result.error) throw new WeaverFailure([`Could not run ${hostExecutable} ${verb}: ${result.error.message}`]);
   return { status: result.status ?? HostClientExit.failed, stdout: result.stdout ?? "", stderr: (result.stderr ?? "").trim() };
 }
