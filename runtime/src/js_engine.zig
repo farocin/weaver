@@ -2188,9 +2188,11 @@ test "a shape a widget grows after its maker is gone moves to that widget" {
     maker.destroy(std.testing.allocator);
     const retired = heap().usedBytes(maker_owner);
     try std.testing.expect(retired > 0);
-    // One more property grows the shape in place (its hash size holds):
-    // that must not grow the retired range.
-    try keeper.evaluate("o.d = 4;", "grow.js");
+    // Growing the shape reallocates it, and must not grow the retired range.
+    // Sixteen more properties need 128 more bytes, past any allocation's
+    // slack, so it reallocates on every platform (with one more, a shape
+    // whose block had room grew without moving).
+    try keeper.evaluate("for (let i = 0; i < 16; i += 1) o['p' + i] = i;", "grow.js");
     try std.testing.expect(heap().usedBytes(maker_owner) < retired);
 }
 

@@ -553,16 +553,19 @@ test "a range commits its granule map as far as its granules reach" {
     defer heap.deinit(std.testing.allocator);
     heap.current = 0;
     _ = heap.alloc(24).?;
-    // One granule: one page of a 256 KiB map.
+    // One granule: the map's first page, not the 256 KiB map.
     try std.testing.expectEqual(page_bytes, heap.ranges[0].map_committed);
     try std.testing.expectEqual(commit_step, heap.ranges[0].committed);
-    // 600 more granules reach a second map page (8 bytes each), no further.
+    // 600 more granules: their 8-byte records' pages (two of 4 KiB, one of
+    // 16 KiB), no further.
     const run = heap.alloc(600 * granule_bytes - header_bytes).?;
-    try std.testing.expectEqual(2 * page_bytes, heap.ranges[0].map_committed);
+    const map_used = std.mem.alignForward(usize, 601 * @sizeOf(Granule), page_bytes);
+    try std.testing.expectEqual(map_used, heap.ranges[0].map_committed);
+    try std.testing.expect(map_used < heap.layout.mapBytes());
     @memset(@as([*]u8, @ptrCast(run))[0 .. 600 * granule_bytes - header_bytes], 0xAB);
     // The run at the top comes back; the heap area decommits, the map stays.
     heap.free(run);
-    try std.testing.expectEqual(2 * page_bytes, heap.ranges[0].map_committed);
+    try std.testing.expectEqual(map_used, heap.ranges[0].map_committed);
     try std.testing.expect(heap.ranges[0].committed <= commit_step);
 }
 
