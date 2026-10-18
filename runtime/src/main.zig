@@ -1826,7 +1826,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(@intFromEnum(host_lifecycle.Exit.failed));
         };
         const paths = try host_lifecycle.Paths.of(allocator, data_root);
-        std.process.exit(@intFromEnum(host_lifecycle.run(verb, init.io, allocator, paths)));
+        std.process.exit(@intFromEnum(host_lifecycle.run(verb, init.io, allocator, paths, own_realms)));
     };
     // Shared render host mode: this process becomes the one Metal-owning
     // renderer every macOS widget talks to (weaverd spawns and supervises
@@ -2226,7 +2226,7 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
     GetSystemTimeAsFileTime(&now);
     const plan = host_contract.RestartPlan.of(previous, restart_of != null, now);
     const registration: host_lifecycle.Registration = if (crash_record.generation()) |generation|
-        host_lifecycle.registerRestart(plan, generation, init.environ_map.get("LOCALAPPDATA").?)
+        host_lifecycle.registerRestart(plan, generation, init.environ_map.get("LOCALAPPDATA").?, !js_engine.shared_realm_enabled)
     else
         .{ .request = .none };
     crash_record.noteRestart(plan, registration.request, registration.hresult, registration.line_len);
@@ -2259,7 +2259,7 @@ fn startDaemon(init: std.process.Init, environment: HostEnvironment, restart_of:
         .devs = devs,
         .post = postControl,
         .previous = previous,
-        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration),
+        .host_note = try host_lifecycle.hostNote(allocator, previous, restart_of != null, plan, registration, !js_engine.shared_realm_enabled),
     }, objects);
 }
 
