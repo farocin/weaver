@@ -7,7 +7,7 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const expectedNativeCommit = "464ff65faa02d36179b34e2252fa2a1cf46f7541";
+const expectedNativeCommit = "7912c60b9dc4d79a34133923c7a819196cee8f35";
 
 function filesBelow(root) {
   const output = [];
@@ -103,7 +103,7 @@ for (const required of [
   "cpu-baseline-native-",
   "zig build -Dcpu=baseline -Doptimize=ReleaseFast -Dweb-layer=exclude -Dtrace=off",
   "zig build test -Dcpu=baseline -Doptimize=ReleaseFast -Dweb-layer=exclude -Dtrace=off",
-  "Build and test Windows host",
+  "Test Windows supervisor and host contract",
   "macos-runtime:",
   "macos-native-sdk:",
   "cancel-in-progress: true",

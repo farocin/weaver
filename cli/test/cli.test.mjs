@@ -227,6 +227,57 @@ test("status table is aligned and includes crash reasons", () => {
   assert.match(table, /Broken\s+-\s+-\s+0\.0 MB\s+0\.0%\s+0\s+0s\s+stopped: crashed 3 times/);
 });
 
+test("status shows hosted widgets' costs on the shared host row", () => {
+  const table = hostTools.formatStatus({ hostPid: 1, widgets: [
+    { name: "host", pid: 7, backend: "-", privateMb: 14.6, cpuPercent: 0.4, threads: 4, uptimeSeconds: 65, state: "running", reason: "", host: true },
+    { name: "Clock", pid: 7, backend: "software", privateMb: 0, cpuPercent: 0, uptimeSeconds: 65, state: "running", reason: "", hosted: true },
+  ] });
+  assert.match(table, /host\s+7\s+-\s+14\.6 MB\s+0\.4%\s+4/);
+  assert.match(table, /Clock\s+7\s+software\s+in host\s+in host\s+0\s+1m05s\s+running/);
+});
+
+test("status says why no widget host runs, and what to run", () => {
+  const now = Date.UTC(2026, 9, 17, 14, 0, 0);
+  const base = { stopped: null, recordHeld: null, now, recordPath: "C:\\lad\\weaver\\host.record", restartCap: 3, restartWindowMs: 600_000, minRunMs: 60_000, restartWaitMs: 120_000, restartMeasuredMs: 37_000 };
+  const record = { generation: 4, pid: 70, state: "running", process: "gone", startedAt: now - 300_000, stopReason: "", restart: "registered", restartError: 0, restartLineLength: 60, restartLineLimit: 1024, automaticRestarts: [] };
+  const crash = { kind: "widget", cause: "exception", code: 0xC0000005, at: now - 10_000, widget: "Clock" };
+  const text = (down) => hostTools.describeHostDown(down).join("\n");
+
+  assert.match(text({ ...base, stopped: { at: now - 5_000 }, record: { ...record, crash } }), /"weaver down" stopped it[\s\S]*Run "weaver up"/);
+  assert.match(text({ ...base, record: null }), /holds no record of an earlier run/);
+  // A restart on its way: no "run weaver up" demand, a time to check back.
+  const pending = text({ ...base, record: { ...record, crash } });
+  assert.match(pending, /exception 0xC0000005 in the turn of "Clock"/);
+  assert.match(pending, /"Clock" is quarantined when the host next starts/);
+  assert.match(pending, /Windows restarts it shortly; restarts have come up to 37 s after a crash/);
+  // A crash in its first minute stays down.
+  const early = text({ ...base, record: { ...record, startedAt: now - 40_000, crash: { ...crash, kind: "other", widget: null } } });
+  assert.match(early, /on a provider or management thread, 30 s after it started/);
+  assert.match(early, /Windows restarts only a process that ran 60 s[\s\S]*Run "weaver up"/);
+  // Past the cap it stays down, and says so with the budget.
+  const capped = text({ ...base, record: { ...record, restart: "capped", automaticRestarts: [1, 2, 3], crash: { ...crash, kind: "ui", cause: "panic", code: 0xE0570001 } } });
+  assert.match(capped, /a panic \(0xE0570001\) on its UI thread/);
+  assert.match(capped, /3 times within 10 minutes, the cap \(restart_cap=3\)[\s\S]*fresh restart count/);
+  // Asked, but nothing came back.
+  assert.match(text({ ...base, now: now + 600_000, record: { ...record, crash } }), /nothing came back 610 s after the crash[\s\S]*Run "weaver up"/);
+  assert.match(text({ ...base, record: { ...record, crash: null } }), /ended without recording a crash/);
+  assert.match(text({ ...base, record: { ...record, state: "stopped", stopReason: "RecordInUse" } }), /stopped as it started, with error\.RecordInUse/);
+  assert.match(text({ ...base, record: { ...record, process: "unknown" } }), /state is unknown: its record names pid 70/);
+  // A host still exiting while Windows reports its crash is a crash, not a running host.
+  const dying = text({ ...base, record: { ...record, process: "alive", crash } });
+  assert.match(dying, /crashed at .* in the turn of "Clock"/);
+  assert.match(dying, /pid 70\) is still exiting while Windows reports the crash/);
+  // A record another program holds open: no host can start, whatever the record says.
+  const held = text({ ...base, recordHeld: { error: 32, sharing: true }, record: { ...record, crash } });
+  assert.match(held, /cannot open its record at C:\\lad\\weaver\\host\.record \(another program holds it open\)/);
+  assert.match(held, /Close whatever holds that file, then run "weaver up"/);
+  assert.doesNotMatch(held, /crashed/);
+  assert.match(text({ ...base, recordHeld: { error: 5, sharing: false }, record: null }), /Windows answers Win32 error 5/);
+  // A refused restart request names the limit, the length and the fix.
+  const tooLong = text({ ...base, record: { ...record, restart: "failed", restartError: 0x80070057, restartLineLength: 1028, crash } });
+  assert.match(tooLong, /1028 UTF-16 units, past RegisterApplicationRestart's limit of 1024 with its terminator\. Set LOCALAPPDATA to a path at least 5 characters shorter/);
+});
+
 test("path helpers follow Windows case rules without weakening POSIX containment", () => {
   const root = "C:\\Users\\Dara\\AppData\\Local\\weaver\\widgets";
   assert.equal(hostTools.pathsEqual(`${root}\\Clock`, "c:/users/dara/appdata/local/weaver/widgets/clock", "win32"), true);
@@ -333,6 +384,51 @@ export default widget({ name: "System Card", size: [200, 100], subscribe: ["cpu"
     const unknownProvider = spawnSync(process.execPath, [cli, "check", widget], { encoding: "utf8" });
     assert.equal(unknownProvider.status, 1);
     assert.match(unknownProvider.stderr, /useProviderSignal\("memmory"\) names no known provider; available providers: time, cpu, memory, audio, media/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bundles carry only the SDK runtime the widget can reach", () => {
+  const root = mkdtempSync(join(tmpdir(), "weaver-sdk-trim-"));
+  const bundleOf = (name, body) => {
+    const widget = join(root, name);
+    assert.equal(spawnSync(process.execPath, [fileURLToPath(new URL("../dist/index.js", import.meta.url)), "init", name], { cwd: root, encoding: "utf8" }).status, 0);
+    writeFileSync(join(widget, "widget.tsx"), `import { useState, widget } from "@weaver/sdk";
+export default widget({ name: "${name}", size: [200, 100] }, () => {
+  const [on] = useState(false);
+${body}
+});
+`, "utf8");
+    const result = spawnSync(process.execPath, ["cli/dist/index.js", "bundle", widget], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const bundle = readFileSync(join(widget, "dist", "bundle.js"), "utf8");
+    // A trimmed bundle ships what it left out beside it, for anything the
+    // analysis missed (the capture smoke runs those cases).
+    const fallback = readdirSync(join(widget, "dist")).find((name) => /^sdk-fallback-[0-9a-f]{16}\.js$/.test(name));
+    assert.equal(fallback !== undefined, !bundle.includes(classCompiler) || !bundle.includes(palette));
+    if (fallback) assert.ok(bundle.includes(fallback), "the bundle names the fallback it was built with");
+    return bundle;
+  };
+  const classCompiler = "arrives in M2+";
+  const palette = '"orange-950"';
+  try {
+    // Every class is known: both sides of the conditional arrive compiled,
+    // and neither the class compiler nor the gradient palette ships.
+    const known = bundleOf("known", `  return <column class="p-2 gap-1"><text class={on ? "text-red-500" : "text-zinc-800"}>hi</text></column>;`);
+    assert.ok(known.includes("#FB2C36FF") && known.includes("#27272AFF"));
+    assert.ok(!known.includes(classCompiler));
+    assert.ok(!known.includes(palette));
+
+    // A background prop needs the runtime gradient serializer.
+    const gradient = bundleOf("gradient", `  return <column background={{ type: "linear", stops: [{ offset: 0, color: "red-500" }, { offset: 1, color: "zinc-800" }] }}><text>hi</text></column>;`);
+    assert.ok(gradient.includes(palette));
+    assert.ok(!gradient.includes(classCompiler));
+
+    // Spread props can carry a class the CLI never saw.
+    const spread = bundleOf("spread", `  const props = { class: on ? "p-2" : "p-4" };
+  return <column {...props}><text>hi</text></column>;`);
+    assert.ok(spread.includes(classCompiler));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
