@@ -7,7 +7,8 @@ const media_protocol = @import("media_protocol.zig");
 pub const frame_line_capacity: usize = media_protocol.max_media_frame_bytes;
 // One host publication cycle can contain CPU, memory, audio, and media: four
 // frames. Four slots preserve that complete measured protocol shape; entries
-// reserve 4 * 12,502 = 50,008 bytes, with pages touched as frames arrive.
+// reserve 4 * 12,502 = 50,008 bytes, allocated with the first frame and
+// touched page by page as frames arrive.
 pub const frame_queue_capacity: usize = 4;
 // One acknowledgement slot per live media command. Derivation makes a queue/
 // tracker mismatch impossible; four slots cost only fixed AckSlot metadata.
@@ -79,7 +80,11 @@ const SpinMutex = struct {
 /// their own structurally non-lossy lane sized to the four-pending command cap.
 pub const Queues = struct {
     mutex: SpinMutex = .{},
-    frames: [frame_queue_capacity]FrameEntry = [_]FrameEntry{.{}} ** frame_queue_capacity,
+    /// Allocated with the first frame, not with the queue: a widget that
+    /// never receives a provider frame (a clock: time is local) never pays
+    /// for it. Inline, copying the queue's defaults wrote all 50 KB of every
+    /// widget's slots (2026-10-16).
+    frames: ?*[frame_queue_capacity]FrameEntry = null,
     frame_head: usize = 0,
     frame_count: usize = 0,
     acks: [ack_queue_capacity]AckSlot = [_]AckSlot{.{}} ** ack_queue_capacity,
@@ -149,19 +154,48 @@ pub const Queues = struct {
                 self.ack_protocol_failed.store(1, .release);
                 return;
             }
-            for (&self.acks) |*slot| {
-                if (slot.id != parsed.value.ack) continue;
-                if (slot.value != null or slot.delivered) {
-                    _ = self.unknown_ack_count.fetchAdd(1, .monotonic);
-                    return;
-                }
-                slot.value = .{ .id = parsed.value.ack, .ok = parsed.value.ok };
-                return;
-            }
-            _ = self.unknown_ack_count.fetchAdd(1, .monotonic);
+            _ = self.storeAckLocked(parsed.value.ack, parsed.value.ok);
             return;
         }
         self.pushFrameLocked(line);
+    }
+
+    /// A frame from a provider in this process (the anchored host's
+    /// `provider_service`): what `routeLine` does with a frame line, minus
+    /// the parse.
+    pub fn pushFrame(self: *Queues, line: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.pushFrameLocked(line);
+    }
+
+    /// An acknowledgement from a provider in this process: what `routeLine`
+    /// does with an ack line, minus the parse. False when no command waits
+    /// for `id`; that is counted in `unknown_ack_count`, as from a pipe.
+    pub fn deliverAck(self: *Queues, id: u64, ok: bool) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.wake_generation.fetchAdd(1, .release);
+        return self.storeAckLocked(id, ok);
+    }
+
+    fn storeAckLocked(self: *Queues, id: u64, ok: bool) bool {
+        for (&self.acks) |*slot| {
+            if (slot.id != id) continue;
+            if (slot.value != null or slot.delivered) break;
+            slot.value = .{ .id = id, .ok = ok };
+            return true;
+        }
+        _ = self.unknown_ack_count.fetchAdd(1, .monotonic);
+        return false;
+    }
+
+    /// Free the frame slots; the queue is empty afterwards.
+    pub fn deinit(self: *Queues) void {
+        if (self.frames) |frames| std.heap.page_allocator.destroy(frames);
+        self.frames = null;
+        self.frame_head = 0;
+        self.frame_count = 0;
     }
 
     pub fn wakeGeneration(self: *const Queues) u64 {
@@ -170,13 +204,18 @@ pub const Queues = struct {
 
     fn pushFrameLocked(self: *Queues, line: []const u8) void {
         if (line.len == 0 or line.len > frame_line_capacity) return;
-        if (self.frame_count == self.frames.len) {
-            self.frame_head = (self.frame_head + 1) % self.frames.len;
+        // Fresh pages: an entry is written only when a frame lands in it.
+        // Without memory for them the frame is dropped, as a full queue
+        // drops its oldest.
+        const frames = self.frames orelse (std.heap.page_allocator.create([frame_queue_capacity]FrameEntry) catch return);
+        self.frames = frames;
+        if (self.frame_count == frames.len) {
+            self.frame_head = (self.frame_head + 1) % frames.len;
             self.frame_count -= 1;
         }
-        const index = (self.frame_head + self.frame_count) % self.frames.len;
-        @memcpy(self.frames[index].bytes[0..line.len], line);
-        self.frames[index].len = line.len;
+        const index = (self.frame_head + self.frame_count) % frames.len;
+        @memcpy(frames[index].bytes[0..line.len], line);
+        frames[index].len = line.len;
         self.frame_count += 1;
     }
 
@@ -184,10 +223,11 @@ pub const Queues = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.frame_count == 0) return null;
-        const entry = &self.frames[self.frame_head];
+        const frames = self.frames.?;
+        const entry = &frames[self.frame_head];
         if (entry.len > output.len) return null;
         @memcpy(output[0..entry.len], entry.bytes[0..entry.len]);
-        self.frame_head = (self.frame_head + 1) % self.frames.len;
+        self.frame_head = (self.frame_head + 1) % frames.len;
         self.frame_count -= 1;
         return output[0..entry.len];
     }
@@ -393,6 +433,23 @@ test "reader wake generation advances for acknowledgements but not provider fram
     try std.testing.expect(queues.registerAck(1));
     queues.routeLine("{\"ack\":1,\"ok\":true}");
     try std.testing.expectEqual(initial + 1, queues.wakeGeneration());
+}
+
+test "in-process frames and acknowledgements land as piped lines do" {
+    var queues: Queues = .{};
+    try std.testing.expect(queues.registerAck(3));
+    const initial = queues.wakeGeneration();
+    queues.pushFrame("{\"provider\":\"cpu\",\"value\":{\"percent\":1}}");
+    try std.testing.expectEqual(initial, queues.wakeGeneration());
+    try std.testing.expect(queues.deliverAck(3, false));
+    try std.testing.expectEqual(initial + 1, queues.wakeGeneration());
+    // A second ack for the same command, or one nobody waits for, is counted.
+    try std.testing.expect(!queues.deliverAck(3, true));
+    try std.testing.expect(!queues.deliverAck(9, true));
+    try std.testing.expectEqual(@as(u64, 2), queues.unknown_ack_count.load(.acquire));
+    var output: [frame_line_capacity]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"provider\":\"cpu\",\"value\":{\"percent\":1}}", queues.takeFrame(&output).?);
+    try std.testing.expectEqualDeep(Ack{ .id = 3, .ok = false }, queues.takeAck().?);
 }
 
 test "late acknowledgements cannot crowd out replacement command IDs" {

@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
-import { compileClass, UtilityError } from "../../sdk/src/class-compiler.js";
+import { compileClass, UtilityError, type ClassProps } from "../../sdk/src/class-compiler.js";
+import { iconClass } from "../../sdk/src/icon-class.js";
 import { signalDevReload } from "./dev-reload.js";
 import { createDevRebuildLoop } from "./dev-rebuild-loop.js";
 import { endDevRegistration } from "./dev-registration.js";
@@ -15,7 +16,7 @@ import { watchDevDirectory } from "./dev-watcher.js";
 import { lowerIconSource, resolveIconSpec } from "./icon-transform.js";
 import { originDeclared, originHost, originNotDeclaredMessage, validOriginHost } from "./origin.js";
 import { publishCaptureArtifacts } from "./capture-publish.js";
-import { formatStatus, pathInside, pathsEqual, readRegistry, readStatus, statusPath, weaverLogsPath, widgetsPath, withRegistryLock, writeRegistry, type RegistryDocument } from "./host-tools.js";
+import { describeHostDown, formatStatus, pathInside, pathsEqual, readRegistry, readStatus, statusPath, weaverLogsPath, widgetsPath, withRegistryLock, writeRegistry, type HostDown, type RegistryDocument } from "./host-tools.js";
 import { extractWeave, isWeaveSourceEntryIncluded, MAX_WEAVE_ARCHIVE_BYTES, openWeave, packWeave, type DeclaredSurface, type OpenedWeave, type WeaveManifest } from "./weave.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -25,9 +26,16 @@ const iconLicenseSource = join(sdkAssetsRoot, "LUCIDE-LICENSE.txt");
 const iconLicenseFile = "Lucide-LICENSE.txt";
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const runtimeExecutable = join(repoRoot, "runtime", "zig-out", "bin", `weaver-widget${executableSuffix}`);
+// On Windows the widget host is the daemon, with nothing supervising it
+// (ADR 0022): the CLI starts, stops and asks after it through the runtime's
+// own client verbs (runtime/src/host_lifecycle.zig). macOS keeps weaverd.
 const hostExecutable = process.platform === "darwin"
   ? join(repoRoot, "host", "zig-out", "Weaverd.app", "Contents", "MacOS", "weaverd")
-  : join(repoRoot, "host", "zig-out", "bin", `weaverd${executableSuffix}`);
+  : process.platform === "win32"
+    ? runtimeExecutable
+    : join(repoRoot, "host", "zig-out", "bin", `weaverd${executableSuffix}`);
+/** What the CLI calls the process `weaver up` starts. */
+const hostLabel = process.platform === "win32" ? "widget host" : "weaverd";
 
 class WeaverFailure extends Error {
   constructor(readonly details: string[]) {
@@ -300,10 +308,14 @@ async function bundleWidget(directory: string): Promise<BundleResult> {
   const outputDirectory = join(directory, "dist");
   mkdirSync(outputDirectory, { recursive: true });
   copyWidgetAssets(directory, outputDirectory);
-  const bundle = await compileWidgetBundle(project, join(outputDirectory, "bundle.js"));
+  const { bundle, sdkFallback } = await compileWidgetBundle(project, join(outputDirectory, "bundle.js"));
   if (project.usesIcons) {
     copyFileSync(iconLicenseSource, join(outputDirectory, iconLicenseFile));
   }
+  // Written before the bundle that names it, and never deleted: a widget
+  // still running an earlier bundle (a dev hot swap the runtime rejected
+  // keeps it) loads the fallback that bundle was built with.
+  if (sdkFallback) writeAtomic(join(outputDirectory, sdkFallback.name), sdkFallback.contents);
   writeAtomic(join(outputDirectory, "bundle.js"), bundle);
   const manifest: RuntimeManifest = {
     name: project.config.name,
@@ -774,7 +786,16 @@ function nowMicroseconds(): number {
   return Number(process.hrtime.bigint() / 1000n);
 }
 
-async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<Uint8Array> {
+interface SdkFallback {
+  /** sdk-fallback-<hash>.js beside bundle.js, named by its contents. */
+  name: string;
+  contents: Uint8Array;
+}
+
+async function compileWidgetBundle(project: SourceProject, outfile: string): Promise<{ bundle: Uint8Array; sdkFallback: SdkFallback | null }> {
+  const use = sdkUse(project);
+  const trimmed = use.classes !== null || !use.backgroundProps;
+  const sdkFallback = trimmed ? await compileSdkFallback() : null;
   const built = await build({
     entryPoints: [project.sourcePath],
     outfile,
@@ -787,13 +808,44 @@ async function compileWidgetBundle(project: SourceProject, outfile: string): Pro
     legalComments: "none",
     minify: true,
     plugins: [
+      ...(sdkFallback ? [sdkTrimPlugin(use, sdkFallback.name)] : []),
       iconLoweringPlugin(project.directory, () => { project.usesIcons = true; }),
       weaverResolutionPlugin(project.directory),
     ],
     logLevel: "silent",
     write: false,
   });
-  return built.outputFiles[0].contents;
+  return { bundle: built.outputFiles[0].contents, sdkFallback };
+}
+
+/**
+ * The SDK runtime a trimmed bundle can still reach through a class or a
+ * background the source analysis did not see: the class compiler and the
+ * gradient serializer, as one script whose value is their exports. The
+ * runtime evaluates it only when the bundle first needs it.
+ */
+async function compileSdkFallback(): Promise<SdkFallback> {
+  const built = await build({
+    stdin: {
+      contents: `export { compileClass, classUsesGradientBackground } from "./class-compiler.js";
+export { serializeBackground } from "./gradients.js";
+`,
+      resolveDir: sdkRoot,
+      loader: "ts",
+    },
+    bundle: true,
+    format: "iife",
+    globalName: "__weaverSdkFallback",
+    footer: { js: "__weaverSdkFallback;" },
+    platform: "neutral",
+    target: "es2020",
+    legalComments: "none",
+    minify: true,
+    logLevel: "silent",
+    write: false,
+  });
+  const contents = built.outputFiles[0].contents;
+  return { name: `sdk-fallback-${createHash("sha256").update(contents).digest("hex").slice(0, 16)}.js`, contents };
 }
 
 async function packWidget(directory: string): Promise<void> {
@@ -1034,6 +1086,63 @@ function jsxClassVariants(attribute: ts.JsxAttribute, context: StaticExpressionC
   if (ts.isStringLiteral(initializer)) return [initializer.text];
   if (ts.isJsxExpression(initializer) && initializer.expression) return context.stringVariants(initializer.expression);
   return null;
+}
+
+/** One spelling per class string: the class compiler reads utilities split
+ * on whitespace, so strings that differ only in spacing compile the same. */
+function normalizedClass(className: string): string {
+  return className.trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+/** What of the SDK's runtime a widget's source shows it using. */
+interface SdkUse {
+  /** Every class string the source shows the widget rendering, compiled;
+   * null when the analysis gives up and the class compiler ships. */
+  classes: Map<string, ClassProps> | null;
+  /** Whether a `background={...}` gradient appears in the source. */
+  backgroundProps: boolean;
+}
+
+/**
+ * Read from the source what of the SDK's runtime the widget uses: every
+ * class string a JSX `class` can take (`weaver check` already enumerates
+ * them), and whether a built-in element takes a `background` prop. The
+ * analysis is a guide, not a proof: a class or background it did not see
+ * makes the widget load sdk-fallback.js, so being wrong costs memory, never
+ * correctness. It gives up where it is likely to be wrong anyway: spread
+ * props on a built-in element, a direct `h` call, the JSX runtime imported
+ * by hand.
+ */
+function sdkUse(project: SourceProject): SdkUse {
+  const everything: SdkUse = { classes: null, backgroundProps: true };
+  const bindings = hFactoryBindings(project.directory, project.sourceFiles);
+  if ([...bindings.values()].some((binding) => binding.identifiers.size > 0 || binding.namespaces.size > 0)) return everything;
+  if (project.sourceFiles.some((sourceFile) => sourceFile.text.includes("@weaver/sdk/jsx-runtime") || sourceFile.text.includes("serializeBackground"))) return everything;
+  const classes = new Set<string>([""]);
+  let backgroundProps = false;
+  for (const sourceFile of project.sourceFiles) {
+    const incomplete = walkSourceWithStaticExpressions(sourceFile, (node, context) => {
+      if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && node.tagName.getText(sourceFile) === "icon" &&
+          !node.attributes.properties.some((property) => ts.isJsxAttribute(property) && property.name.getText(sourceFile) === "class")) {
+        classes.add(iconClass(undefined));
+      }
+      if (ts.isJsxSpreadAttribute(node)) return /^[a-z]/.test(node.parent.parent.tagName.getText(sourceFile));
+      if (!ts.isJsxAttribute(node)) return false;
+      const tag = node.parent.parent.tagName.getText(sourceFile);
+      const name = node.name.getText(sourceFile);
+      if (name === "background") backgroundProps = true;
+      if (name !== "class") return false;
+      const variants = jsxClassVariants(node, context);
+      if (variants === null) return true;
+      // The SDK composes an <icon>'s class at run time; compile that string.
+      for (const variant of variants) classes.add(normalizedClass(tag === "icon" ? iconClass(variant) : variant));
+      return false;
+    });
+    if (incomplete) return everything;
+  }
+  const compiled = new Map<string, ClassProps>();
+  for (const className of classes) compiled.set(className, compileClass(className));
+  return { classes: compiled, backgroundProps };
 }
 
 interface HFactoryBindings {
@@ -1358,6 +1467,56 @@ function weaverResolutionPlugin(sourceRoot: string): import("esbuild").Plugin {
   };
 }
 
+/**
+ * Leave out of the bundle the SDK runtime the source shows no use for: the
+ * class compiler, replaced by a lookup in the classes compiled here, and the
+ * gradient serializer with its color palette. Each costs every widget tens
+ * of KiB of JavaScript heap (about 60 KiB apiece for a clock, 2026-10-15).
+ * A class or background the lookup cannot serve loads sdk-fallback.js once,
+ * so a widget the analysis misread still renders, at the old memory cost.
+ */
+function sdkTrimPlugin(use: SdkUse, fallbackName: string): import("esbuild").Plugin {
+  const modules = new Map<string, string>([["fallback", `let fallback;
+export function sdkFallback() {
+  if (fallback === undefined) fallback = native.loadSdkFallback(${JSON.stringify(fallbackName)});
+  return fallback;
+}
+`]]);
+  if (use.classes) {
+    modules.set("class-compiler.js", `import { sdkFallback } from "weaver-sdk-fallback";
+const classes = new Map(${JSON.stringify([...use.classes])});
+const normalized = (className) => className.trim().split(/\\s+/).filter(Boolean).join(" ");
+const known = (className) => classes.get(className) ?? classes.get(normalized(className));
+export function compileClass(className) {
+  return known(className) ?? sdkFallback().compileClass(className);
+}
+export function classUsesGradientBackground(className) {
+  const compiled = known(className);
+  return compiled !== undefined ? compiled.backgroundGradient !== undefined : sdkFallback().classUsesGradientBackground(className);
+}
+`);
+  }
+  if (!use.backgroundProps) {
+    modules.set("gradients.js", `import { sdkFallback } from "weaver-sdk-fallback";
+export function serializeBackground(background) {
+  return sdkFallback().serializeBackground(background);
+}
+`);
+  }
+  return {
+    name: "weaver-sdk-trim",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /^weaver-sdk-fallback$/ }, () => ({ path: "fallback", namespace: "weaver-sdk-trim" }));
+      pluginBuild.onResolve({ filter: /^\.\/(class-compiler|gradients)\.js$/ }, (args) => {
+        if (!args.importer || !(pathsEqual(args.importer, sdkRoot) || pathInside(sdkRoot, args.importer))) return null;
+        const name = args.path.slice(2);
+        return modules.has(name) ? { path: name, namespace: "weaver-sdk-trim" } : null;
+      });
+      pluginBuild.onLoad({ filter: /.*/, namespace: "weaver-sdk-trim" }, (args) => ({ contents: modules.get(args.path)!, loader: "js" }));
+    },
+  };
+}
+
 function iconLoweringPlugin(sourceRoot: string, onIconSource: () => void): import("esbuild").Plugin {
   const canonicalSourceRoot = realpathSync(sourceRoot);
   return {
@@ -1400,10 +1559,10 @@ async function devWidget(directory: string): Promise<void> {
       name: project.config.name, sourcePath: directory, enabled: true, dev: true,
     }] };
     writeRegistry(nextRegistry);
-    try { signalHost("--signal-reload"); }
+    try { reloadHost(); }
     catch (error) {
       writeRegistry(before);
-      try { signalHost("--signal-reload"); }
+      try { reloadHost(); }
       catch { /* Preserve the reload failure after restoring the authoritative registry. */ }
       throw error;
     }
@@ -1428,7 +1587,7 @@ async function devWidget(directory: string): Promise<void> {
       const next = await bundleWidget(directory);
       const configChanged = JSON.stringify(next.manifest) !== JSON.stringify(activeManifest);
       if (configChanged) {
-        signalHost("--signal-reload");
+        reloadHost();
         activeManifest = next.manifest;
         process.stdout.write("weaver dev restarted widget: window config changed\n");
       } else {
@@ -1463,6 +1622,7 @@ async function devWidget(directory: string): Promise<void> {
   const presentationWatch = setInterval(() => {
     if (presentationFailureReported || Date.now() < presentationDeadline) return;
     try {
+      requestStatus();
       const status = readStatus().widgets.find((widget) => widget.name === project.config.name);
       if (status && status.backend !== "-") {
         clearInterval(presentationWatch);
@@ -1508,7 +1668,7 @@ async function devWidget(directory: string): Promise<void> {
               directory,
               existing,
               writeRegistry,
-              () => signalHost("--signal-reload"),
+              () => reloadHost(),
             );
             if (endedRegistry) {
               shutdownWarnings.push(...sweepUnregisteredInstallDirectories(endedRegistry));
@@ -1545,7 +1705,7 @@ function showLogs(name: string, follow: boolean): Promise<void> | void {
       : [];
     const knownLine = known.length > 0 ? `Widgets with logs: ${known.join(", ")}` : `No widget has written a log yet (widgets log to ${weaverLogsPath()} once they start).`;
     if (!follow) {
-      throw new WeaverFailure([`No log for "${name}" at ${path}`, knownLine, `The weaverd host process does not keep a log file; "weaver status" reports its widget states.`]);
+      throw new WeaverFailure([`No log for "${name}" at ${path}`, knownLine, `The ${hostLabel} process does not keep a log file; "weaver status" reports its widget states.`]);
     }
     process.stdout.write(`No log for "${name}" yet at ${path}; waiting for the widget to start.\n`);
   }
@@ -1619,7 +1779,7 @@ async function installWidget(input: string): Promise<void> {
     await bundleWidget(stage);
     await withRegistryLock(async () => {
       const originalRegistry = readRegistry();
-      if (hostLifecycleAvailable() && hostRunning()) assertHostReloadReady();
+      if (hostLifecycleAvailable()) runningHostReloadReady();
       const conflicting = originalRegistry.widgets.find((widget) => widget.name === project.config.name && !ownedInstallPath(widget.sourcePath));
       if (conflicting) {
         throw new WeaverFailure([`Widget name "${project.config.name}" is already registered from ${conflicting.sourcePath}`, `Run "weaver uninstall ${project.config.name}" before replacing a source-linked installation.`]);
@@ -1638,11 +1798,11 @@ async function installWidget(input: string): Promise<void> {
       writeRegistry(nextRegistry);
       if (hostLifecycleAvailable()) {
         try {
-          signalHost("--signal-reload");
+          reloadHost();
         } catch (error) {
           writeRegistry(originalRegistry);
           if (hostRunning()) {
-            try { signalHost("--signal-reload"); }
+            try { reloadHost(); }
             catch { /* Preserve the original failure; the registry is authoritative on the next reload. */ }
           }
           throw error;
@@ -1708,24 +1868,19 @@ async function uninstallWidget(name: string): Promise<void> {
     const document = readRegistry();
     const registration = document.widgets.find((widget) => widget.name === name);
     if (!registration) {
-      const running = hostLifecycleAvailable() && hostRunning();
-      if (running) {
-        assertHostReloadReady();
-        signalHost("--signal-reload");
-      }
+      if (hostLifecycleAvailable() && runningHostReloadReady()) reloadHost();
       warnings.push(...sweepUnregisteredInstallDirectories(document));
       return;
     }
     installed = true;
     const nextRegistry = { widgets: document.widgets.filter((widget) => widget.name !== name) };
-    const running = hostLifecycleAvailable() && hostRunning();
-    if (running) assertHostReloadReady();
+    const running = hostLifecycleAvailable() && runningHostReloadReady();
     writeRegistry(nextRegistry);
     if (running) {
-      try { signalHost("--signal-reload"); }
+      try { reloadHost(); }
       catch (error) {
         writeRegistry(document);
-        try { signalHost("--signal-reload"); }
+        try { reloadHost(); }
         catch { /* Preserve the reload failure after restoring the authoritative registry. */ }
         throw error;
       }
@@ -1785,11 +1940,7 @@ async function removeUnregisteredInstall(candidate: string): Promise<void> {
     await withRegistryLock(() => {
       const document = readRegistry();
       if (!document.widgets.some((widget) => pathsEqual(widget.sourcePath, candidate)) && existsSync(candidate)) {
-        const running = hostLifecycleAvailable() && hostRunning();
-        if (running) {
-          assertHostReloadReady();
-          signalHost("--signal-reload");
-        }
+        if (hostLifecycleAvailable() && runningHostReloadReady()) reloadHost();
         try { rmSync(candidate, { recursive: true, force: true }); }
         catch (error) { warnings.push(`Could not remove unregistered owned source at ${candidate}: ${errorMessage(error)}. A later registry mutation will retry cleanup.`); }
       }
@@ -1816,6 +1967,20 @@ function firstFailureLine(error: unknown): string {
 async function upHost(announce: boolean): Promise<void> {
   assertHostLifecycleAvailable("up");
   assertHostBuilt();
+  if (process.platform === "win32") {
+    const result = hostClient("--up");
+    if (result.status === HostClientExit.ok) {
+      if (announce) process.stdout.write("widget host started\n");
+      warnHostNote();
+      return;
+    }
+    if (result.status === HostClientExit.alreadyRunning) {
+      if (announce) process.stdout.write("widget host is already running\n");
+      return;
+    }
+    if (result.status === HostClientExit.timedOut) throw new WeaverFailure(["The widget host did not become reload-ready within 5 seconds.", 'Run "weaver status" to see what its record says.']);
+    throw hostClientFailure("up", result);
+  }
   if (hostRunning()) {
     assertHostReloadReady();
     if (announce) process.stdout.write("weaverd is already running\n");
@@ -1832,6 +1997,15 @@ async function upHost(announce: boolean): Promise<void> {
 async function downHost(): Promise<void> {
   assertHostLifecycleAvailable("down");
   assertHostBuilt();
+  if (process.platform === "win32") {
+    // The client writes the stop marker, signals the host and waits for it
+    // to exit; a restart Windows has pending finds the marker and exits.
+    const result = hostClient("--down");
+    if (result.status === HostClientExit.ok) process.stdout.write("widget host stopped\n");
+    else if (result.status === HostClientExit.notRunning) process.stdout.write("widget host is not running\n");
+    else throw hostClientFailure("down", result);
+    return;
+  }
   if (!hostRunning()) {
     process.stdout.write("weaverd is not running\n");
     return;
@@ -1845,37 +2019,120 @@ async function downHost(): Promise<void> {
 
 function showStatus(json: boolean): void {
   assertHostLifecycleAvailable("status");
-  if (!hostRunning()) throw new WeaverFailure(['weaverd is not running; run "weaver up"']);
+  if (process.platform === "win32") {
+    // One spawn: it asks a running host to write status, or says why none runs.
+    const result = hostClient("--status");
+    if (result.status === HostClientExit.notRunning) throw new WeaverFailure(describeHostDown(JSON.parse(result.stdout) as HostDown));
+    if (result.status === HostClientExit.legacy) assertHostReloadReady();
+    // A host that did not answer in time (and has not crashed: the client
+    // checks) leaves its last status, shown with a warning.
+    if (result.status === HostClientExit.timedOut) process.stderr.write("weaver status warning: the widget host did not answer the status request within 5 seconds; this is the last status it wrote\n");
+    else if (result.status !== HostClientExit.ok) throw hostClientFailure("status", result);
+  } else {
+    if (!hostRunning()) throw new WeaverFailure(['weaverd is not running; run "weaver up"']);
+    requestStatus();
+  }
   try {
     const document = readStatus();
     process.stdout.write(`${json ? JSON.stringify(document, null, 2) : formatStatus(document)}\n`);
     for (const warning of statusDivergenceWarnings(document)) process.stderr.write(`weaver status warning: ${warning}\n`);
   } catch (error) {
-    throw new WeaverFailure([`weaverd status is unavailable at ${statusPath()}: ${errorMessage(error)}`]);
+    throw new WeaverFailure([`${hostLabel} status is unavailable at ${statusPath()}: ${errorMessage(error)}`]);
   }
+}
+
+/**
+ * After `weaver up` starts a host: anything its status row says about how it
+ * runs (Windows refusing its restart request, an unreadable registry) means
+ * a crash would leave Weaver down. Say so now.
+ */
+function warnHostNote(): void {
+  if (hostClient("--status").status !== HostClientExit.ok) return;
+  try {
+    const host = readStatus().widgets.find((widget) => widget.host);
+    if (host?.reason) process.stderr.write(`weaver warning: ${host.reason}\n`);
+  } catch { /* "weaver status" reports an unreadable status file. */ }
 }
 
 function hostRunning(): boolean {
   if (!hostLifecycleAvailable()) return false;
   if (!existsSync(hostExecutable)) return false;
+  if (process.platform === "win32") return hostClient("--probe").status !== HostClientExit.notRunning;
   return spawnSync(hostExecutable, ["--probe"], { stdio: "ignore", windowsHide: true, env: hostEnvironment() }).status === 0;
 }
 
 function hostReloadReady(): boolean {
   if (!hostLifecycleAvailable()) return false;
   if (!existsSync(hostExecutable)) return false;
+  if (process.platform === "win32") return hostClient("--probe").status === HostClientExit.ok;
   return spawnSync(hostExecutable, ["--probe-reload-ready"], { stdio: "ignore", windowsHide: true, env: hostEnvironment() }).status === 0;
+}
+
+/** Whether a host runs; throws if one runs that cannot acknowledge reloads. One client spawn on Windows. */
+function runningHostReloadReady(): boolean {
+  if (process.platform !== "win32") {
+    if (!hostRunning()) return false;
+    assertHostReloadReady();
+    return true;
+  }
+  if (!existsSync(hostExecutable)) return false;
+  const status = hostClient("--probe").status;
+  if (status === HostClientExit.notRunning) return false;
+  if (status === HostClientExit.ok) return true;
+  throw new WeaverFailure([`The running ${hostLabel} predates acknowledged registry reloads.`, 'Run "weaver down", then retry; Weaver will start the current host automatically.']);
 }
 
 function assertHostReloadReady(): void {
   if (!hostReloadReady()) {
-    throw new WeaverFailure(["The running weaverd predates acknowledged registry reloads.", 'Run "weaver down", then retry; Weaver will start the current host automatically.']);
+    throw new WeaverFailure([`The running ${hostLabel} predates acknowledged registry reloads.`, 'Run "weaver down", then retry; Weaver will start the current host automatically.']);
   }
+}
+
+// The Windows host writes status.json when something changes and when asked,
+// and otherwise sleeps (runtime/src/daemon.zig). Asking is best effort: a host
+// that cannot answer leaves the last status, which the freshness warning in
+// statusDivergenceWarnings reports. macOS weaverd writes status on a timer.
+function requestStatus(): void {
+  if (process.platform !== "win32") return;
+  hostClient("--status");
+}
+
+/** Tell the host the registry changed, and wait until it has applied it. */
+function reloadHost(): void {
+  if (process.platform !== "win32") return signalHost("--signal-reload");
+  const result = hostClient("--reload");
+  if (result.status === HostClientExit.ok) return;
+  if (result.status === HostClientExit.hostCrashed || result.status === HostClientExit.notRunning) {
+    // The registry is what the next host reads, so the change stands.
+    const what = result.status === HostClientExit.hostCrashed ? "crashed while it applied this change" : "is not running";
+    process.stderr.write(`weaver warning: the widget host ${what}; the change takes effect when the host next starts (Windows restarting it, or "weaver up"). "weaver status" says which.\n`);
+    return;
+  }
+  if (result.status === HostClientExit.reloadFailed) throw new WeaverFailure(["The widget host could not read the registry; nothing changed.", 'The reason is on the host row of "weaver status".']);
+  if (result.status === HostClientExit.timedOut) throw new WeaverFailure(["The widget host did not acknowledge the registry reload within 10 seconds."]);
+  throw hostClientFailure("reload", result);
 }
 
 function signalHost(signal: "--signal-down" | "--signal-reload"): void {
   const result = spawnSync(hostExecutable, [signal], { stdio: "ignore", windowsHide: true, env: hostEnvironment() });
   if (result.status !== 0) throw new WeaverFailure([`weaverd rejected ${signal}`]);
+}
+
+/** weaver-widget's client verbs end with these codes (runtime/src/host_lifecycle.zig `Exit`, which this must match). */
+const HostClientExit = { ok: 0, failed: 1, alreadyRunning: 2, notRunning: 3, reloadFailed: 4, timedOut: 5, hostCrashed: 6, busy: 7, legacy: 8 } as const;
+
+interface HostClientResult { status: number; stdout: string; stderr: string }
+
+function hostClient(verb: "--up" | "--down" | "--status" | "--reload" | "--probe"): HostClientResult {
+  const result = spawnSync(hostExecutable, [verb], { cwd: repoRoot, encoding: "utf8", windowsHide: true, env: hostEnvironment() });
+  if (result.error) throw new WeaverFailure([`Could not run ${hostExecutable} ${verb}: ${result.error.message}`]);
+  return { status: result.status ?? HostClientExit.failed, stdout: result.stdout ?? "", stderr: (result.stderr ?? "").trim() };
+}
+
+function hostClientFailure(command: string, result: HostClientResult): WeaverFailure {
+  if (result.status === HostClientExit.busy) return new WeaverFailure([`weaver ${command}: another "weaver up" or "weaver down" held the widget host's lifecycle lock for 10 seconds.`, "Retry when it has finished."]);
+  if (result.status === HostClientExit.legacy) return new WeaverFailure([`The running ${hostLabel} predates acknowledged registry reloads.`, 'Run "weaver down", then retry; Weaver will start the current host automatically.']);
+  return new WeaverFailure([`weaver ${command} failed: ${result.stderr || `the widget host's client exited with code ${result.status}`}`]);
 }
 
 function authorizeAudio(): void {
@@ -1887,7 +2144,7 @@ function authorizeAudio(): void {
     stdio: "inherit",
   });
   if (result.status !== 0) throw new WeaverFailure(["Weaver could not authorize macOS system audio.", "Check System Settings > Privacy & Security > Screen & System Audio Recording, then retry."]);
-  if (hostRunning()) signalHost("--signal-reload");
+  if (hostRunning()) reloadHost();
 }
 
 function hostEnvironment(): NodeJS.ProcessEnv {
@@ -1895,7 +2152,9 @@ function hostEnvironment(): NodeJS.ProcessEnv {
 }
 
 function assertHostBuilt(): void {
-  if (!existsSync(hostExecutable)) throw new WeaverFailure([`Host not found at ${hostExecutable}`, "Build host/ with zig build -Doptimize=ReleaseFast."]);
+  if (existsSync(hostExecutable)) return;
+  if (process.platform === "win32") throw new WeaverFailure([`Widget host not found at ${hostExecutable}`, "Build runtime/ with the platform command in the README Quickstart."]);
+  throw new WeaverFailure([`Host not found at ${hostExecutable}`, "Build host/ with zig build -Doptimize=ReleaseFast."]);
 }
 
 function hostLifecycleAvailable(): boolean {
@@ -2067,7 +2326,12 @@ const nativeWidgetCanvasLimit = 8;
 const nativeWidgetImageLimit = 16;
 
 interface LoweredTreeMetrics {
+  /** Native nodes buildNode emits (painted layouts and <panel> are two). */
   nodes: number;
+  /** Retained-tree nodes the reconciler creates: one per host element and
+   * per text value outside <text>, including leaf descendants Native never
+   * receives. */
+  retainedNodes: number;
   roots: number;
   depth: number;
   maxChildren: number;
@@ -2090,7 +2354,8 @@ function statusDivergenceWarnings(document: ReturnType<typeof readStatus>): stri
   try {
     const registry = readRegistry();
     const registered = new Set(registry.widgets.map((widget) => widget.name));
-    const reported = new Set(document.widgets.map((widget) => widget.name));
+    // The shared host's own row is a process, not a registered widget.
+    const reported = new Set(document.widgets.filter((widget) => !widget.host).map((widget) => widget.name));
     const missing = [...registered].filter((name) => !reported.has(name));
     const extra = [...reported].filter((name) => !registered.has(name));
     if (missing.length > 0) warnings.push(`registry widgets absent from host status: ${missing.join(", ")}; reload did not converge`);
@@ -2105,7 +2370,7 @@ function statusDivergenceWarnings(document: ReturnType<typeof readStatus>): stri
       .filter((entry) => entry.isFile() && entry.name.startsWith(prefix));
     const liveBackends = document.widgets.filter((widget) => widget.backend !== "-").length;
     if (sidecars.length > liveBackends) {
-      warnings.push(`${sidecars.length - liveBackends} orphan renderer status sidecar(s) remain next to ${path}; restart weaverd to reconcile them`);
+      warnings.push(`${sidecars.length - liveBackends} orphan renderer status sidecar(s) remain next to ${path}; run "weaver down", then "weaver up", to reconcile them`);
     }
   } catch (error) {
     warnings.push(`renderer status sidecars could not be reconciled: ${errorMessage(error)}`);
@@ -2238,20 +2503,62 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     if (!attribute) return [""];
     return staticClassVariants.get(attribute) ?? null;
   };
+  // A layout element lowers to a painted panel around its layout node when
+  // the runtime's hasPaintStyle (runtime/src/main.zig) holds for it, read
+  // through the bridge's unset values: empty colors and shadows are null,
+  // unset corner radii and interaction opacity are -1, and an interaction
+  // `shadow-none` is the explicit override "none".
+  const paintsOwnBox = (props: ClassProps): boolean => {
+    const color = (value: string | undefined) => value !== undefined && value !== "";
+    const count = (value: number | undefined) => value !== undefined && value >= 0;
+    return color(props.background) || color(props.backgroundGradient) || color(props.borderColor) ||
+      (props.borderWidth ?? 0) > 0 || (props.radius ?? 0) > 0 ||
+      count(props.radiusTopLeft) || count(props.radiusTopRight) || count(props.radiusBottomRight) || count(props.radiusBottomLeft) ||
+      color(props.shadow) ||
+      color(props.hoverBackground) || color(props.hoverTextColor) || count(props.hoverOpacity) || color(props.hoverBorderColor) || color(props.hoverShadow) ||
+      color(props.pressedBackground) || color(props.pressedTextColor) || count(props.pressedOpacity) || color(props.pressedBorderColor) || color(props.pressedShadow);
+  };
+  // The explicit `background` prop is a gradient (the class form compiles to
+  // backgroundGradient), so any statically present value paints.
+  const hasBackgroundProp = (node: ts.JsxElement | ts.JsxSelfClosingElement): boolean => {
+    const { attributes } = tagAndAttributes(node);
+    const sourceFile = node.getSourceFile();
+    const definitelyAbsent = (expression: ts.Expression): boolean => {
+      let current = expression;
+      while (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isNonNullExpression(current) ||
+        ts.isTypeAssertionExpression(current) || ts.isSatisfiesExpression(current)) {
+        current = current.expression;
+      }
+      // null is not absent: the reconciler serializes it and rejects it.
+      return ts.isVoidExpression(current) || (ts.isIdentifier(current) && current.text === "undefined");
+    };
+    return attributes.properties.some((attribute) => {
+      if (!ts.isJsxAttribute(attribute) || attribute.name.getText(sourceFile) !== "background") return false;
+      const initializer = attribute.initializer;
+      if (!initializer || !ts.isJsxExpression(initializer) || !initializer.expression) return true;
+      return !definitelyAbsent(initializer.expression);
+    });
+  };
+  // Mirrors buildNode: <panel> is always a painted box around a column.
   const isPaintedLayout = (node: ts.JsxElement | ts.JsxSelfClosingElement, tag: string): boolean => {
+    if (tag === "panel") return true;
     if (tag !== "row" && tag !== "column" && tag !== "stack") return false;
+    if (hasBackgroundProp(node)) return true;
     for (const classText of classVariants(node) ?? []) {
       try {
-        const compiled = compileClass(classText);
-        if (Object.keys(compiled).some((key) => key === "background" || key === "radius" || key.startsWith("radius") || key.startsWith("border") || key.toLowerCase().includes("shadow"))) return true;
+        if (paintsOwnBox(compileClass(classText))) return true;
       } catch {
         // The ordinary class validator reports the malformed utility.
       }
     }
     return false;
   };
+  // Leaves draw themselves; buildNode never emits their children, so those
+  // add no Native depth. (They still count as retained nodes below.)
+  const leafTags = new Set(["text", "slider", "icon", "image", "canvas"]);
   const maximum = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: Math.max(0, ...values.map((value) => value.nodes)),
+    retainedNodes: Math.max(0, ...values.map((value) => value.retainedNodes)),
     roots: Math.max(0, ...values.map((value) => value.roots)),
     depth: Math.max(0, ...values.map((value) => value.depth)),
     maxChildren: Math.max(0, ...values.map((value) => value.maxChildren)),
@@ -2270,11 +2577,12 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     return null;
   };
   const emptyMetrics = (): LoweredTreeMetrics => ({
-    nodes: 0, roots: 0, depth: 0, maxChildren: 0, canvases: 0, images: 0, maxTextBytes: 0,
+    nodes: 0, retainedNodes: 0, roots: 0, depth: 0, maxChildren: 0, canvases: 0, images: 0, maxTextBytes: 0,
     opacityCanvas: false,
   });
   const combineSiblings = (values: LoweredTreeMetrics[]): LoweredTreeMetrics => ({
     nodes: values.reduce((sum, value) => sum + value.nodes, 0),
+    retainedNodes: values.reduce((sum, value) => sum + value.retainedNodes, 0),
     roots: values.reduce((sum, value) => sum + value.roots, 0),
     depth: Math.max(0, ...values.map((value) => value.depth)),
     maxChildren: Math.max(0, ...values.map((value) => value.maxChildren)),
@@ -2303,11 +2611,11 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
         if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child) || ts.isJsxFragment(child)) {
           result.push(metrics(child, visiting));
         } else if (parentTag !== "text" && ts.isJsxText(child) && child.getText().trim() !== "") {
-          result.push({ ...emptyMetrics(), nodes: 1, roots: 1, depth: 1 });
+          result.push({ ...emptyMetrics(), nodes: 1, retainedNodes: 1, roots: 1, depth: 1 });
         } else if (parentTag !== "text" && ts.isJsxExpression(child) && child.expression) {
           const roots = expressionRoots(child.expression);
           if (roots.length > 0) result.push(maximum(roots.map((root) => metrics(root, visiting))));
-          else if (staticPrimitiveText(child.expression) !== null) result.push({ ...emptyMetrics(), nodes: 1, roots: 1, depth: 1 });
+          else if (staticPrimitiveText(child.expression) !== null) result.push({ ...emptyMetrics(), nodes: 1, retainedNodes: 1, roots: 1, depth: 1 });
         }
       }
       return result;
@@ -2344,9 +2652,10 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
     const directChildren = combinedChildren.roots;
     const hasOpacityLayer = canvasHasOpacityLayer(node);
     return {
-      nodes: ownDepth + combinedChildren.nodes,
+      nodes: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.nodes),
+      retainedNodes: 1 + combinedChildren.retainedNodes,
       roots: 1,
-      depth: ownDepth + combinedChildren.depth,
+      depth: ownDepth + (leafTags.has(tag) ? 0 : combinedChildren.depth),
       maxChildren: Math.max(combinedChildren.maxChildren, directChildren, ownDepth === 2 ? 1 : 0),
       canvases: combinedChildren.canvases + (tag === "canvas" ? 1 : 0),
       images: combinedChildren.images + (tag === "image" ? 1 : 0),
@@ -2528,11 +2837,14 @@ function validateLoweredTree(project: SourceProject, errors: string[]): void {
   const lowered = maximum(roots.map((root) => metrics(root, new Set())));
   const evidenceNode = roots[0];
   const limitation = " The static estimate follows the exported widget through local components and one level of relative imports; runtime limits remain authoritative for dynamic collections and unresolved component output.";
+  if (lowered.retainedNodes > nativeWidgetNodeLimit) {
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `RetainedWidgetNodeLimit: this tree creates ${lowered.retainedNodes} retained nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.retainedNodes}, headroom=${nativeWidgetNodeLimit - lowered.retainedNodes}. Each host element is one retained node, as is each text value outside a <text> element (a <text> joins its own children); descendants of a <slider> or <image> stay retained even though they are never drawn.${limitation}`));
+  }
   if (lowered.nodes > nativeWidgetNodeLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Painted <row>/<column>/<stack> elements add an inner layout node.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetNodeLimit: this tree lowers to ${lowered.nodes} Native nodes (limit ${nativeWidgetNodeLimit}); node capacity exhausted: max_nodes=${nativeWidgetNodeLimit}, asked for ${lowered.nodes}, headroom=${nativeWidgetNodeLimit - lowered.nodes}. Every <panel>, and each <row>/<column>/<stack> that paints its own box, adds an inner layout node.${limitation}`));
   }
   if (lowered.depth > nativeWidgetDepthLimit) {
-    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); painted <row>/<column>/<stack> elements add one nesting level.${limitation}`));
+    errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetDepthLimit: this tree lowers to depth ${lowered.depth} (Native limit ${nativeWidgetDepthLimit}); every <panel>, and each <row>/<column>/<stack> that paints its own box (background, border, radius, shadow, or a hover:/pressed: style), adds one nesting level.${limitation}`));
   }
   if (lowered.maxChildren > nativeWidgetChildLimit) {
     errors.push(locationMessage(evidenceNode.getSourceFile(), evidenceNode, `LoweredWidgetChildLimit: one authored parent lowers to ${lowered.maxChildren} direct Native children; child capacity exhausted: max_children=${nativeWidgetChildLimit}, asked for ${lowered.maxChildren}, headroom=${nativeWidgetChildLimit - lowered.maxChildren}.${limitation}`));
